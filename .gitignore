@@ -1,0 +1,50 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+node_modules
+dist
+dist-ssr
+*.local
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# Bot run artifacts — screenshots and storage-state.json (LIVE SESSION COOKIES)
+bot/artifacts/
+master/artifacts/
+*artifacts/run-*/
+.env
+# Google service-account key (PRIVATE KEY — never commit)
+fyers-trading-*.json
+*-service-account*.json
+
+# Per-machine node identity. MUST NOT be committed: every node cloning the repo
+# would inherit the same id and start running each other's sheet rows.
+bot/.node-id
+page-*
+
+# Per-machine bot identity and the credentials approval handed back. Committing
+# either would clone one machine's fleet identity onto every other machine.
+bot/.bot-identity.json
+bot/.fleet-credentials.json
+bot/start.bat
+
+# ShardX per-account browser profiles: cookies, localStorage and the
+# fingerprint that IS each account's identity. Never commit these.
+bot/browser-profiles/
+
+bot/.sheet-direct-ledger.json

@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Bot Console</title>
+    <link rel="icon" href="data:," />
+    <link rel="stylesheet" href="./material.css" />
+    <link rel="stylesheet" href="./console.css" />
+  </head>
+  <body>
+    <!--
+      THE BOT'S OWN CONSOLE.
+
+      Served by the manager at http://127.0.0.1:7800, on the machine that runs
+      the browsers. It exists for the moments the control panel cannot help:
+      before this machine has been approved into the fleet, when the master is
+      unreachable, or when a run has parked with its browser open and the
+      person who can fix the sheet cell is sitting right here.
+
+      No framework and no build step — the manager serves these three files off
+      disk exactly as setup.bat left them.
+    -->
+    <header class="top-bar">
+      <span class="brand">
+        <span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i><i></i></span>
+        Bot Console
+      </span>
+      <span class="md-spacer"></span>
+      <span id="link-chip" class="md-chip dot">connecting</span>
+      <span id="bot-chip" class="md-chip">—</span>
+    </header>
+
+    <main class="md-enter">
+      <!-- Enrollment. Present only while this machine is not yet in a fleet:
+           once approved it collapses into the header chip, because it is then
+           just a fact rather than something anyone has to act on. -->
+      <section id="enroll-card" hidden></section>
+
+      <div class="md-section-label md-label-sm">This machine</div>
+      <div class="md-card" id="identity-card"></div>
+
+      <div class="md-section-label md-label-sm">Slots</div>
+      <div class="md-row" id="slot-actions">
+        <label class="md-field compact">
+          <input id="instances" type="number" min="1" max="50" value="1" />
+        </label>
+        <button class="md-btn filled md-state" id="btn-start">Start jobs</button>
+        <button class="md-btn outlined md-state" id="btn-refresh-sheet">
+          Show sheet rows
+        </button>
+        <span class="md-spacer"></span>
+        <button class="md-btn text danger md-state" id="btn-stop-all">Stop all slots</button>
+      </div>
+      <div id="slots"></div>
+    </main>
+
+    <!-- Sheet rows waiting for this machine, and the log viewer. Both are
+         dialogs rather than panels: they are things you open, read and close,
+         not things you watch. -->
+    <div id="dialog-host"></div>
+    <div id="snackbar-host"></div>
+
+    <script src="./console.js" type="module"></script>
+  </body>
+</html>

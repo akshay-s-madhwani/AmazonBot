@@ -1,0 +1,390 @@
+/* ===========================================================================
+   Bot console composition. Generic Material parts live in material.css.
+   ========================================================================= */
+
+.top-bar {
+  position: sticky;
+  top: 0;
+  z-index: 20;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  height: 62px;
+  padding: 0 22px;
+  background: var(--md-surface-container-low);
+  transition: box-shadow var(--md-dur-medium) var(--md-ease-standard);
+}
+.top-bar.scrolled {
+  box-shadow: var(--md-elev-2);
+}
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  font-family: var(--md-font-display);
+  font-size: 17px;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+}
+.brand-mark {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 2.5px;
+  width: 26px;
+  height: 26px;
+  padding: 4px;
+  border-radius: 8px;
+  background: var(--md-primary-container);
+}
+.brand-mark i {
+  border-radius: 2px;
+  background: var(--md-on-primary-container);
+  opacity: 0.32;
+}
+.brand-mark i:first-child {
+  opacity: 1;
+  animation: brand-pulse 2.8s var(--md-ease-standard) infinite;
+}
+@keyframes brand-pulse {
+  0%,
+  70%,
+  100% {
+    opacity: 1;
+  }
+  85% {
+    opacity: 0.35;
+  }
+}
+
+main {
+  max-width: 960px;
+  margin: 0 auto;
+  padding: 24px 22px 90px;
+}
+
+/* ------------------------------------------------------- enrollment card */
+/*
+ * Shown only while this machine is waiting to be let in. The short id is the
+ * entire point of the screen at that moment — someone is going to read it out
+ * or type it into the panel — so it is set as large as a headline and nothing
+ * else on the card competes with it.
+ */
+.enroll {
+  display: flex;
+  gap: 16px;
+  align-items: flex-start;
+  padding: 20px;
+  margin-bottom: 8px;
+  border-radius: var(--md-shape-l);
+  background: var(--md-warning-container);
+  color: var(--md-on-warning-container);
+  box-shadow: var(--md-elev-1);
+}
+.enroll.approved {
+  background: var(--md-success-container);
+  color: var(--md-on-success-container);
+}
+.enroll-icon {
+  display: grid;
+  place-items: center;
+  width: 40px;
+  height: 40px;
+  flex: none;
+  border-radius: var(--md-shape-m);
+  background: color-mix(in srgb, currentColor 14%, transparent);
+}
+.enroll h2 {
+  margin: 0 0 3px;
+}
+.enroll p {
+  margin: 0;
+  opacity: 0.88;
+  max-width: 62ch;
+}
+.short-id {
+  display: inline-block;
+  margin: 12px 0 2px;
+  padding: 10px 18px;
+  border-radius: var(--md-shape-m);
+  background: color-mix(in srgb, currentColor 12%, transparent);
+  font-family: var(--md-font-mono);
+  font-size: 27px;
+  font-weight: 600;
+  letter-spacing: 0.14em;
+  font-variant-numeric: tabular-nums;
+}
+
+/* --------------------------------------------------------- identity rows */
+.kv {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  min-height: 52px;
+  padding: 10px 20px;
+  position: relative;
+}
+.kv + .kv::after {
+  content: "";
+  position: absolute;
+  left: 20px;
+  right: 0;
+  top: 0;
+  height: 1px;
+  background: var(--md-outline-variant);
+  opacity: 0.55;
+}
+.kv > span:first-child {
+  color: var(--md-on-surface-variant);
+  font-size: 13.5px;
+}
+.kv > :last-child {
+  margin-left: auto;
+  text-align: right;
+  font-weight: 600;
+}
+
+/* --------------------------------------------------------------- slots */
+#slots {
+  display: grid;
+  gap: 14px;
+  margin-top: 4px;
+}
+.slot {
+  border-radius: var(--md-shape-l);
+  background: var(--md-surface-container-lowest);
+  box-shadow: var(--md-elev-1);
+  overflow: hidden;
+  transition: box-shadow var(--md-dur-medium) var(--md-ease-standard);
+}
+/* A slot that needs a person gets a coloured edge rather than a whole
+   coloured card — the card still has to be readable, and this reads from
+   across a desk. */
+.slot.attention {
+  box-shadow:
+    inset 4px 0 0 var(--md-tertiary),
+    var(--md-elev-2);
+}
+.slot.failed {
+  box-shadow:
+    inset 4px 0 0 var(--md-error),
+    var(--md-elev-1);
+}
+.slot-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 15px 20px 12px;
+}
+.slot-n {
+  display: grid;
+  place-items: center;
+  width: 30px;
+  height: 30px;
+  flex: none;
+  border-radius: 50%;
+  background: var(--md-surface-container-high);
+  color: var(--md-on-surface-variant);
+  font-size: 13px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+.slot-title {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+}
+.slot-title b {
+  font-size: 14.5px;
+}
+.slot-title span {
+  font-family: var(--md-font-mono);
+  font-size: 11.5px;
+  color: var(--md-on-surface-variant);
+}
+
+/*
+ * The step track: one segment per step, filled up to where the run is. It
+ * replaces "step 4 of 12" with something you can read without counting, and
+ * clicking a segment resumes there — the step list IS the resume address.
+ */
+.track {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 0 20px 12px;
+}
+.track > .step-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 4px 10px;
+  border: 1px solid var(--md-outline-variant, #cdc7d0);
+  border-radius: var(--md-shape-full);
+  background: var(--md-surface-container-highest);
+  color: var(--md-on-surface-variant, #49454f);
+  font-family: var(--md-font-mono);
+  font-size: 11.5px;
+  line-height: 1.5;
+  cursor: pointer;
+  transition:
+    background var(--md-dur-medium) var(--md-ease-standard),
+    color var(--md-dur-medium) var(--md-ease-standard),
+    border-color var(--md-dur-medium) var(--md-ease-standard);
+}
+.track > .step-chip b {
+  color: var(--md-primary);
+  font-weight: 700;
+}
+.track > .step-chip:hover {
+  border-color: var(--md-primary);
+}
+.track > .step-chip.done {
+  background: var(--md-success);
+  border-color: var(--md-success);
+  color: #fff;
+}
+.track > .step-chip.done b {
+  color: #fff;
+}
+.track > .step-chip.here {
+  background: var(--md-primary);
+  border-color: var(--md-primary);
+  color: #fff;
+  font-weight: 700;
+}
+.track > .step-chip.here b {
+  color: #fff;
+}
+.track > .step-chip.here.attention {
+  background: var(--md-tertiary);
+  border-color: var(--md-tertiary);
+}
+.track > .step-chip.here.failed {
+  background: var(--md-error);
+  border-color: var(--md-error);
+}
+
+.slot-meta {
+  display: flex;
+  align-items: baseline;
+  gap: 18px;
+  flex-wrap: wrap;
+  padding: 2px 20px 14px;
+}
+/* Read-only facts, deliberately NOT pills: a chip in this console is something
+   you can click, and these are not. */
+.meta {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 6px;
+  font-size: 12px;
+  line-height: 1.4;
+}
+.meta i {
+  font-style: normal;
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--md-on-surface-variant, #49454f);
+  opacity: 0.75;
+}
+.meta b {
+  font-family: var(--md-font-mono);
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--md-on-surface, #1d1b20);
+}
+
+.slot-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding: 12px 20px;
+  background: var(--md-surface-container-low);
+}
+/* The quiet timer is the watchdog's input, so it gets emphasis when it has
+   climbed past this step's own limit. */
+.meta.quiet.over b,
+.meta.quiet.over i {
+  color: var(--md-error);
+  opacity: 1;
+}
+
+/* -------------------------------------------------------- step reference */
+/* --------------------------------------------------------------- dialogs */
+.dialog-body {
+  overflow: auto;
+  padding: 0 20px 20px;
+}
+.log {
+  margin: 0;
+  padding: 14px 16px;
+  border-radius: var(--md-shape-m);
+  background: var(--md-surface-container);
+  font-family: var(--md-font-mono);
+  font-size: 12px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 58vh;
+  overflow: auto;
+}
+.sheet-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 4px;
+  position: relative;
+}
+.sheet-row + .sheet-row::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 0;
+  height: 1px;
+  background: var(--md-outline-variant);
+  opacity: 0.55;
+}
+
+.shots {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: 12px;
+}
+
+.shots .shot {
+  margin: 0;
+  border: 1px solid var(--md-outline, #cdc7d0);
+  border-radius: 12px;
+  overflow: hidden;
+  background: var(--md-surface-2, #f4f0f5);
+}
+
+.shots .shot.failed {
+  border-color: #b3261e;
+}
+
+.shots .shot img {
+  display: block;
+  width: 100%;
+  height: 150px;
+  object-fit: cover;
+  object-position: top center;
+  background: #fff;
+}
+
+.shots .shot figcaption {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 8px 10px;
+  font-size: 12px;
+  line-height: 1.3;
+}
+
+.shots .shot figcaption span {
+  opacity: 0.7;
+}

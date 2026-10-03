@@ -1,0 +1,586 @@
+/* ===========================================================================
+   MATERIAL DESIGN 3 — the same design system the control panel uses, carried
+   here as a plain stylesheet.
+   ---------------------------------------------------------------------------
+   Duplicated rather than imported, on purpose. This console ships INSIDE the
+   bot package and is served by the manager off disk with no bundler, no npm
+   step and no network — setup.bat must be able to hand a machine a working UI
+   without building an application first. Reaching into apps/panel would make
+   the bot depend on a package that does not travel with it.
+
+   The palette below is the same one the control panel hands to MUI in
+   apps/panel/src/theme.ts, so the two surfaces stay recognisably one thing
+   even though only the panel has a component library behind it.
+   ========================================================================= */
+
+:root {
+  color-scheme: light;
+
+  --md-primary: #1b5fd0;
+  --md-on-primary: #ffffff;
+  --md-primary-container: #d9e2ff;
+  --md-on-primary-container: #00174a;
+
+  --md-secondary-container: #dbe2f9;
+  --md-on-secondary-container: #131c2b;
+
+  --md-tertiary: #6f4bab;
+  --md-tertiary-container: #ebddff;
+  --md-on-tertiary-container: #260059;
+
+  --md-error: #ba1a1a;
+  --md-on-error: #ffffff;
+  --md-error-container: #ffdad6;
+  --md-on-error-container: #410002;
+
+  --md-success: #16652f;
+  --md-success-container: #a4f4ac;
+  --md-on-success-container: #002106;
+  --md-warning: #855300;
+  --md-warning-container: #ffddb1;
+  --md-on-warning-container: #2a1800;
+
+  /* NOT white, on purpose. Large areas of full-brightness cool white are what
+     make a light UI glare, and this console is read for hours next to the
+     browser the bot is driving. The ladder is dimmed a step and warmed off
+     blue; text stays near-black, so only the luminance came down, not the
+     contrast. apps/panel/src/theme.ts carries the same surfaces. */
+  --md-background: #e9e7e2;
+  --md-surface-container-lowest: #f7f5f1;
+  --md-surface-container-low: #f2f0eb;
+  --md-surface-container: #ebe9e3;
+  --md-surface-container-high: #e4e1db;
+  --md-surface-container-highest: #dcd9d2;
+  --md-on-surface: #22232a;
+  --md-on-surface-variant: #55565e;
+  --md-outline: #7b7a80;
+  --md-outline-variant: #d5d2ca;
+  --md-inverse-surface: #2f3036;
+  --md-inverse-on-surface: #f2f0f7;
+
+  --md-state-hover: 0.08;
+  --md-state-focus: 0.1;
+  --md-state-press: 0.12;
+
+  --md-shape-xs: 6px;
+  --md-shape-s: 10px;
+  --md-shape-m: 14px;
+  --md-shape-l: 20px;
+  --md-shape-full: 999px;
+
+  --md-elev-1: 0 1px 2px rgba(16, 18, 27, 0.05), 0 2px 8px rgba(16, 18, 27, 0.04);
+  --md-elev-2: 0 1px 2px rgba(16, 18, 27, 0.06), 0 6px 18px rgba(16, 18, 27, 0.06);
+  --md-elev-3: 0 2px 6px rgba(16, 18, 27, 0.07), 0 12px 32px rgba(16, 18, 27, 0.08);
+
+  --md-ease-emphasized: cubic-bezier(0.2, 0, 0, 1);
+  --md-ease-standard: cubic-bezier(0.2, 0, 0, 1);
+  --md-ease-decelerate: cubic-bezier(0.05, 0.7, 0.1, 1);
+  --md-dur-short: 120ms;
+  --md-dur-medium: 220ms;
+  --md-dur-long: 380ms;
+
+  --md-font: "Segoe UI Variable Text", "Segoe UI", -apple-system, "SF Pro Text",
+    Roboto, "Helvetica Neue", Ubuntu, sans-serif;
+  --md-font-display: "Segoe UI Variable Display", "Segoe UI", -apple-system,
+    "SF Pro Display", Roboto, "Helvetica Neue", Ubuntu, sans-serif;
+  --md-font-mono: "Cascadia Mono", "JetBrains Mono", "SF Mono", ui-monospace,
+    Consolas, monospace;
+}
+
+/* LIGHT ONLY. This console is read on the machine that runs the browsers,
+   next to the Amazon window the bot is driving and the sheet it came from;
+   a surface that flipped with the OS setting would not match either. The
+   control panel (apps/panel) is pinned light for the same reason. */
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--md-background);
+  color: var(--md-on-surface);
+  font-family: var(--md-font);
+  font-size: 14px;
+  line-height: 1.45;
+  -webkit-font-smoothing: antialiased;
+}
+
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--md-outline-variant) transparent;
+}
+*::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+*::-webkit-scrollbar-thumb {
+  background: var(--md-outline-variant);
+  border: 3px solid transparent;
+  background-clip: content-box;
+  border-radius: var(--md-shape-full);
+}
+
+/* ---------------------------------------------------------- type scale */
+.md-headline {
+  font-family: var(--md-font-display);
+  font-size: 23px;
+  line-height: 30px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+.md-title-lg {
+  font-family: var(--md-font-display);
+  font-size: 18px;
+  line-height: 25px;
+  font-weight: 600;
+  letter-spacing: -0.005em;
+}
+.md-title {
+  font-size: 15px;
+  line-height: 21px;
+  font-weight: 600;
+}
+.md-body-sm {
+  font-size: 13px;
+  line-height: 18px;
+}
+.md-label-sm {
+  font-size: 11px;
+  line-height: 15px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+.md-mono {
+  font-family: var(--md-font-mono);
+  font-size: 12.5px;
+  letter-spacing: 0.02em;
+}
+.md-muted {
+  color: var(--md-on-surface-variant);
+}
+
+/* -------------------------------------------------------- state layers */
+.md-state {
+  position: relative;
+  isolation: isolate;
+  overflow: hidden;
+}
+.md-state::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: currentColor;
+  opacity: 0;
+  transition: opacity var(--md-dur-short) var(--md-ease-standard);
+  pointer-events: none;
+  z-index: -1;
+}
+.md-state:hover:not(:disabled)::before {
+  opacity: var(--md-state-hover);
+}
+.md-state:focus-visible::before {
+  opacity: var(--md-state-focus);
+}
+.md-state:active:not(:disabled)::before {
+  opacity: var(--md-state-press);
+}
+:focus-visible {
+  outline: 3px solid var(--md-primary);
+  outline-offset: 2px;
+}
+.md-ripple {
+  position: absolute;
+  border-radius: 50%;
+  background: currentColor;
+  opacity: 0.18;
+  transform: scale(0);
+  animation: md-ripple-in 480ms var(--md-ease-decelerate) forwards;
+  pointer-events: none;
+  z-index: -1;
+}
+@keyframes md-ripple-in {
+  to {
+    transform: scale(1);
+    opacity: 0;
+  }
+}
+
+/* -------------------------------------------------------------- buttons */
+.md-btn {
+  --btn-bg: transparent;
+  --btn-fg: var(--md-primary);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  min-height: 36px;
+  padding: 0 18px;
+  border: none;
+  border-radius: var(--md-shape-full);
+  background: var(--btn-bg);
+  color: var(--btn-fg);
+  font-family: inherit;
+  font-size: 13.5px;
+  font-weight: 600;
+  cursor: pointer;
+  white-space: nowrap;
+  text-decoration: none;
+  transition:
+    box-shadow var(--md-dur-medium) var(--md-ease-standard),
+    transform var(--md-dur-short) var(--md-ease-standard);
+}
+.md-btn:active:not(:disabled) {
+  transform: scale(0.97);
+}
+.md-btn:disabled {
+  cursor: default;
+  opacity: 0.38;
+}
+.md-btn.filled {
+  --btn-bg: var(--md-primary);
+  --btn-fg: var(--md-on-primary);
+  box-shadow: var(--md-elev-1);
+}
+.md-btn.filled:hover:not(:disabled) {
+  box-shadow: var(--md-elev-2);
+}
+.md-btn.tonal {
+  --btn-bg: var(--md-secondary-container);
+  --btn-fg: var(--md-on-secondary-container);
+}
+.md-btn.outlined {
+  box-shadow: inset 0 0 0 1px var(--md-outline-variant);
+}
+.md-btn.outlined:hover:not(:disabled) {
+  box-shadow: inset 0 0 0 1px var(--md-outline);
+}
+.md-btn.text {
+  padding: 0 12px;
+}
+.md-btn.danger {
+  --btn-fg: var(--md-error);
+}
+.md-btn.danger.filled {
+  --btn-bg: var(--md-error);
+  --btn-fg: var(--md-on-error);
+}
+.md-btn.small {
+  min-height: 30px;
+  padding: 0 14px;
+  font-size: 12.5px;
+}
+.md-btn.icon {
+  min-height: 36px;
+  width: 36px;
+  padding: 0;
+}
+
+/* ---------------------------------------------------------------- cards */
+.md-card {
+  background: var(--md-surface-container-lowest);
+  border-radius: var(--md-shape-l);
+  box-shadow: var(--md-elev-1);
+  overflow: hidden;
+}
+.md-card-body {
+  padding: 18px 20px;
+}
+.md-section-label {
+  margin: 26px 4px 10px;
+  color: var(--md-on-surface-variant);
+}
+
+/* ----------------------------------------------------------- list rows */
+/* Inset dividers: the rows belong to one card, and the indent says so. */
+.md-list-item {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  min-height: 54px;
+  padding: 11px 20px;
+  position: relative;
+}
+.md-list-item + .md-list-item::after {
+  content: "";
+  position: absolute;
+  left: 20px;
+  right: 0;
+  top: 0;
+  height: 1px;
+  background: var(--md-outline-variant);
+  opacity: 0.55;
+}
+.md-list-text {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+  flex: 1;
+}
+.md-list-trailing {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--md-on-surface-variant);
+}
+.md-divider {
+  height: 1px;
+  background: var(--md-outline-variant);
+  opacity: 0.55;
+  border: none;
+  margin: 0;
+}
+
+/* ---------------------------------------------------------------- chips */
+.md-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 26px;
+  padding: 0 11px;
+  border-radius: var(--md-shape-s);
+  background: var(--md-surface-container-high);
+  color: var(--md-on-surface-variant);
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+.md-chip.primary {
+  background: var(--md-primary-container);
+  color: var(--md-on-primary-container);
+}
+.md-chip.success {
+  background: var(--md-success-container);
+  color: var(--md-on-success-container);
+}
+.md-chip.warning {
+  background: var(--md-warning-container);
+  color: var(--md-on-warning-container);
+}
+.md-chip.error {
+  background: var(--md-error-container);
+  color: var(--md-on-error-container);
+}
+.md-chip.tertiary {
+  background: var(--md-tertiary-container);
+  color: var(--md-on-tertiary-container);
+}
+.md-chip.dot::before {
+  content: "";
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+  flex: none;
+}
+
+/* ------------------------------------------------------------ controls */
+.md-field {
+  position: relative;
+  display: inline-flex;
+  min-width: 0;
+}
+.md-field > input,
+.md-field > select {
+  width: 100%;
+  min-height: 38px;
+  padding: 0 12px;
+  border: 1px solid var(--md-outline-variant);
+  border-radius: var(--md-shape-s);
+  background: var(--md-surface-container-lowest);
+  color: var(--md-on-surface);
+  font: inherit;
+  font-size: 13.5px;
+}
+.md-field > select {
+  appearance: none;
+  padding-right: 30px;
+  cursor: pointer;
+}
+.md-field.select::after {
+  content: "";
+  position: absolute;
+  right: 13px;
+  top: 50%;
+  width: 7px;
+  height: 7px;
+  margin-top: -5px;
+  border-right: 1.6px solid var(--md-on-surface-variant);
+  border-bottom: 1.6px solid var(--md-on-surface-variant);
+  transform: rotate(45deg);
+  pointer-events: none;
+}
+.md-field > input:focus,
+.md-field > select:focus {
+  outline: none;
+  border-color: var(--md-primary);
+  box-shadow: inset 0 0 0 1px var(--md-primary);
+}
+.md-field.compact > input {
+  width: 62px;
+  text-align: center;
+  padding: 0 6px;
+}
+
+.md-segmented {
+  display: inline-flex;
+  padding: 3px;
+  gap: 2px;
+  background: var(--md-surface-container-high);
+  border-radius: var(--md-shape-full);
+}
+.md-segmented > button {
+  min-height: 30px;
+  padding: 0 16px;
+  border: none;
+  border-radius: var(--md-shape-full);
+  background: transparent;
+  color: var(--md-on-surface-variant);
+  font: inherit;
+  font-size: 12.5px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background var(--md-dur-medium) var(--md-ease-emphasized);
+}
+.md-segmented > button[aria-pressed="true"] {
+  background: var(--md-surface-container-lowest);
+  color: var(--md-on-surface);
+  box-shadow: var(--md-elev-1);
+}
+
+/* ------------------------------------------------------------ progress */
+.md-progress {
+  height: 4px;
+  border-radius: var(--md-shape-full);
+  background: var(--md-primary-container);
+  overflow: hidden;
+}
+.md-progress::after {
+  content: "";
+  display: block;
+  width: 40%;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--md-primary);
+  animation: md-indeterminate 1.6s var(--md-ease-standard) infinite;
+}
+@keyframes md-indeterminate {
+  0% {
+    transform: translateX(-100%);
+  }
+  100% {
+    transform: translateX(320%);
+  }
+}
+
+/* ------------------------------------------------------------ snackbar */
+.md-snackbar {
+  position: fixed;
+  left: 50%;
+  bottom: 24px;
+  z-index: 40;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  max-width: min(90vw, 620px);
+  padding: 13px 18px;
+  border-radius: var(--md-shape-m);
+  background: var(--md-inverse-surface);
+  color: var(--md-inverse-on-surface);
+  box-shadow: var(--md-elev-3);
+  font-size: 13.5px;
+  transform: translateX(-50%);
+  animation: md-snack-in var(--md-dur-long) var(--md-ease-emphasized);
+}
+.md-snackbar.error {
+  background: var(--md-error);
+  color: var(--md-on-error);
+}
+@keyframes md-snack-in {
+  from {
+    opacity: 0;
+    transform: translate(-50%, 20px);
+  }
+  to {
+    opacity: 1;
+    transform: translate(-50%, 0);
+  }
+}
+
+/* ------------------------------------------------------------- dialog */
+.md-scrim {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  display: grid;
+  place-items: center;
+  padding: 20px;
+  background: rgba(0, 0, 0, 0.42);
+  animation: md-fade var(--md-dur-medium) var(--md-ease-standard);
+}
+@keyframes md-fade {
+  from {
+    opacity: 0;
+  }
+}
+.md-dialog {
+  width: min(760px, 100%);
+  max-height: 84vh;
+  display: flex;
+  flex-direction: column;
+  background: var(--md-surface-container-lowest);
+  border-radius: var(--md-shape-l);
+  box-shadow: var(--md-elev-3);
+  overflow: hidden;
+  animation: md-dialog-in var(--md-dur-long) var(--md-ease-emphasized);
+}
+@keyframes md-dialog-in {
+  from {
+    opacity: 0;
+    transform: scale(0.94) translateY(12px);
+  }
+}
+.md-dialog > header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 18px 20px 12px;
+}
+
+/* ---------------------------------------------------------- utilities */
+.md-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.md-spacer {
+  flex: 1;
+}
+.md-empty {
+  padding: 40px 24px;
+  text-align: center;
+  color: var(--md-on-surface-variant);
+}
+.md-enter {
+  animation: md-enter var(--md-dur-long) var(--md-ease-emphasized) both;
+}
+@keyframes md-enter {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 1ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 1ms !important;
+  }
+}

@@ -1,0 +1,30 @@
+{
+  "name": "amazon-login-bot",
+  "version": "0.1.0",
+  "description": "Amazon automation with a master-owned queue and per-account ShardX browser profiles.",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "slot": "npm run build && node dist/slot.js",
+    "start": "npm run build && node dist/index.js",
+    "fetch-browser": "npm run build && node dist/install-browser.js",
+    "test:totp": "npm run build && node dist/totp.test.js",
+    "test:fleet": "npm run build && node dist/fleet.test.js",
+    "test:safety": "npm run build && node --test dist/safety.test.js",
+    "manager": "npm run build && node dist/manager.js"
+  },
+  "dependencies": {
+    "@app/contracts": "file:../packages/contracts",
+    "@app/transport": "file:../packages/transport",
+    "@proxyshard/shardx": "^2.0.1",
+    "express": "^4.22.2",
+    "patchright": "^1.63.0",
+    "playwright-core": "^1.49.0"
+  },
+  "devDependencies": {
+    "@types/express": "^4.17.25",
+    "@types/node": "^20.17.6",
+    "typescript": "^5.5.4"
+  }
+}
