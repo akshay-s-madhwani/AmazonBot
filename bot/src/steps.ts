@@ -3,7 +3,15 @@ import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { productIdentity, type BasketItem } from "./purchase-evidence.js";
 import type { Page } from "./pw.js";
-import type { Credentials, PaymentSpec, ProductSpec, RewardMark, RewardSpec, TargetAddress } from "./config.js";
+import type {
+  Credentials,
+  PaymentSpec,
+  ProductSpec,
+  RewardMark,
+  RewardMarkExtra,
+  RewardSpec,
+  TargetAddress,
+} from "./config.js";
 import { runLogin } from "./login.js";
 import { runCheckReward } from "./reward.js";
 import { runAddresses } from "./address.js";
@@ -36,7 +44,7 @@ export interface StepContext {
   /** The Reward-tab rows this account's reward code points at, in sheet order. */
   rewards: RewardSpec[];
   /** Records a Reward row's status on the master (and from there the sheet). */
-  markReward?: (r: RewardSpec, status: RewardMark) => Promise<void>;
+  markReward?: (r: RewardSpec, status: RewardMark, extra?: RewardMarkExtra) => Promise<void>;
   runId: string;
   artifactsDir: string;
 }
@@ -81,7 +89,8 @@ export interface StepDef {
 export const STEPS: StepDef[] = [
   {
     key: "login",
-    timeoutMs: 180_000,
+    // Covers runLogin's own budget (LOGIN_TIMEOUT_MS, 200s) plus its final signed-in check.
+    timeoutMs: 300_000,
     inactivityMs: 120_000,
     run: async (page, ctx) => {
       const r = await runLogin(page, ctx.creds);
@@ -110,6 +119,7 @@ export const STEPS: StepDef[] = [
         };
       }
       console.log(`[bot] ✓ rewards: ${r.detail}`);
+      // Already claimed / COMPLETED rows are the only "nothing to do" outcomes.
       return r.outcome === "collected" ? { status: "succeeded" } : { status: "skipped" };
     },
   },

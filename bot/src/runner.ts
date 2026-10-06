@@ -237,7 +237,17 @@ async function loadJob(
     addresses: [],
     products: [loadProduct()],
     payment: { method: "none", codes: [] },
-    rewards: rewardType ? [{ row: 0, type: rewardType, url: rewardUrl, status: "" }] : [],
+    rewards: rewardType
+      ? [{
+          row: 0,
+          type: rewardType,
+          url: rewardUrl,
+          status: "",
+          answer: (process.env.REWARD_ANSWER ?? "").trim(),
+          // One per line in the sheet; ";" between them in .env.
+          coupons: (process.env.REWARD_COUPONS ?? "").trim(),
+        }]
+      : [],
   };
 }
 
@@ -246,12 +256,12 @@ async function loadJob(
  * Best effort: a lost mark must not cost the reward itself.
  */
 function rewardMarker(jobId: string, runId: string): NonNullable<StepContext["markReward"]> {
-  return async (r, status) => {
+  return async (r, status, extra) => {
     if (!r.row) return;
     try {
       const { requireJobClient } = await import("./job-client.js");
-      await requireJobClient().markReward(jobId, runId, r.row, status);
-      console.log(`[runner] Reward row ${r.row} -> ${status}`);
+      await requireJobClient().markReward(jobId, runId, r.row, status, extra);
+      console.log(`[runner] Reward row ${r.row} -> ${status}${extra?.notes ? ` (${extra.notes})` : ""}`);
     } catch (err) {
       console.warn(`[runner] could not mark Reward row ${r.row} ${status}: ${(err as Error).message}`);
     }

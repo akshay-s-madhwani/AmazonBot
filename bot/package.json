@@ -7,7 +7,8 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "slot": "npm run build && node dist/slot.js",
-    "start": "npm run build && node dist/index.js",
+    "start": "npm run build && node dist/manager.js",
+    "single": "npm run build && node dist/index.js",
     "fetch-browser": "npm run build && node dist/install-browser.js",
     "test:totp": "npm run build && node dist/totp.test.js",
     "test:fleet": "npm run build && node dist/fleet.test.js",

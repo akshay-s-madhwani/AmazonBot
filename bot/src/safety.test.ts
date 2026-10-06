@@ -8,7 +8,8 @@ import { acceptRun, wasRunAccepted } from "./start-registry.js";
 import { FleetLink, type FleetHooks } from "./fleet.js";
 import { resumeStep, inputsChanged } from "./resume-inputs.js";
 import type { SheetJob } from "./job-client.js";
-import { chooseAnswer } from "./reward.js";
+import { chooseAnswer, planCoupons } from "./reward.js";
+import { couponNumbers, matchCoupon, parseWantedCoupons } from "./coupons.js";
 import { parseRewardType } from "./config.js";
 import { addressKey, targetKey } from "./address.js";
 import { checkoutAddressKey, sheetAddressKey } from "./checkout.js";
@@ -81,25 +82,70 @@ test("start acceptance survives restart and rejects conflicting or corrupt ident
 
 test("A new or edited Reward row resumes from check_reward; one turning COMPLETED does not", () => {
   const base = { credentials: {}, address: {}, items: [], payment: {}, rewards: [] } as unknown as SheetJob;
-  const spin = { row: 4, type: "spin" as const, url: "", status: "PENDING" };
+  const spin = { row: 4, type: "spin" as const, url: "", status: "PENDING", answer: "", coupons: "50-250" };
   const withSpin = { ...base, rewards: [spin] } as SheetJob;
   assert.equal(resumeStep(base, withSpin, 5), 1);
   assert.equal(resumeStep(withSpin, withSpin, 5), 5);
   assert.equal(resumeStep(withSpin, { ...base, rewards: [{ ...spin, status: "BLOCKED" }] } as SheetJob, 5), 5);
   assert.equal(resumeStep(withSpin, { ...base, rewards: [{ ...spin, status: "COMPLETED" }] } as SheetJob, 5), 5);
-  assert.equal(resumeStep(withSpin, { ...base, rewards: [{ ...spin, type: "actions" }] } as SheetJob, 5), 1);
+  assert.equal(resumeStep(withSpin, { ...base, rewards: [{ ...spin, type: "stickers" }] } as SheetJob, 5), 1);
+  assert.equal(resumeStep(withSpin, { ...base, rewards: [{ ...spin, answer: "False" }] } as SheetJob, 5), 1);
+  assert.equal(resumeStep(withSpin, { ...base, rewards: [{ ...spin, coupons: "40-400" }] } as SheetJob, 5), 1);
 });
 
-test("Spin quiz: known answers first, True/False defaults to True, anything else is refused", () => {
-  assert.equal(chooseAnswer("True or false: Your first-ever Amazon order could be eligible for FREE delivery!", ["True", "False"]), "True");
-  assert.equal(chooseAnswer("True or false: Prime members get free delivery", ["False", "True"]), "True");
-  assert.equal(chooseAnswer("Which city hosts the festival?", ["Delhi", "Mumbai", "Pune"]), null);
+test("Spin quiz: the sheet's Answer, case-insensitive; blank takes the first option; a missing one is refused", () => {
+  assert.equal(chooseAnswer(["True", "False"], "true"), "True");
+  assert.equal(chooseAnswer(["False", "True"], " TRUE "), "True");
+  assert.equal(chooseAnswer(["Delhi", "Mumbai", "Pune"], ""), "Delhi");
+  assert.equal(chooseAnswer(["Option A: Delhi", "Option B: Mumbai"], "mumbai"), "Option B: Mumbai");
+  assert.equal(chooseAnswer(["Delhi", "Mumbai"], "Chennai"), null);
+  assert.equal(chooseAnswer([], ""), null);
+});
+
+test("Coupons: the two numbers of a description against the sheet's lines", () => {
+  const wanted = parseWantedCoupons("50-250\n40-400\n 35 - 500 \n5%-100%\n60-\n-999");
+  assert.deepEqual(wanted.map((w) => [w.text, w.first, w.second]), [
+    ["50-250", "50", "250"], ["40-400", "40", "400"], ["35-500", "35", "500"],
+    ["5%-100%", "5%", "100%"], ["60-", "60", ""], ["-999", "", "999"],
+  ]);
+  assert.deepEqual(couponNumbers("Get flat ₹50 off Min order: ₹250 Valid till 31 Oct"), ["50", "250"]);
+  assert.deepEqual(couponNumbers("Get 5% off up to Rs. 1,000"), ["5%", "1000"]);
+  assert.deepEqual(couponNumbers("50 off on 250 order"), ["50", "250"]);
+  const hit = (desc: string) => matchCoupon(couponNumbers(desc), wanted)?.text ?? null;
+  assert.equal(hit("Flat ₹50 off on orders above ₹250"), "50-250");
+  assert.equal(hit("Flat ₹50 off on orders above ₹300"), null);
+  assert.equal(hit("Flat ₹40 off on orders above ₹400"), "40-400");
+  assert.equal(hit("5% off up to 100%"), "5%-100%");
+  assert.equal(hit("5% off up to ₹100"), null);
+  assert.equal(hit("Flat ₹60 off on ₹600"), "60-");
+  assert.equal(hit("Flat ₹60 off"), "60-");
+  assert.equal(hit("Free delivery on ₹999"), "-999");
+  assert.equal(hit("Free delivery on ₹250"), null);
+  assert.equal(hit("Surprise gift"), null);
+});
+
+test("Coupons: collect the wanted open ones, record the wanted claimed ones", () => {
+  const wanted = parseWantedCoupons("50-250\n40-400");
+  const cards = [
+    { state: "open" as const, description: "₹35 off on ₹500" },
+    { state: "open" as const, description: "₹50 off on ₹250" },
+    { state: "claimed" as const, description: "₹40 off on ₹400" },
+    { state: "claimed" as const, description: "₹10 off on ₹100" },
+  ];
+  assert.deepEqual(planCoupons(cards, null, wanted), {
+    open: [1], found: ["40-400"], claimedOther: ["10-100"], offeredOther: ["35-500"], pickFull: false,
+  });
+  // A full pick page collects nothing more.
+  assert.deepEqual(planCoupons(cards, { need: 1, picked: 1 }, wanted).open, []);
+  // A blank Coupons cell takes any coupon.
+  assert.deepEqual(planCoupons(cards, null, []).open, [0, 1]);
 });
 
 test("Reward type parsing", () => {
   assert.equal(parseRewardType("SPIN"), "spin");
   assert.equal(parseRewardType(" Spin wheel "), "spin");
-  assert.equal(parseRewardType("Actions"), "actions");
+  assert.equal(parseRewardType("Stickers"), "stickers");
+  assert.equal(parseRewardType("Actions"), "stickers");
   assert.equal(parseRewardType("", "https://www.amazon.in/rewards/checkoutCoupons?uuid=X"), "url");
   assert.equal(parseRewardType("", ""), null);
   assert.equal(parseRewardType("lottery"), null);

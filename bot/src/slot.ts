@@ -9,7 +9,7 @@ import type { RunnerConfig, RunnerEvent } from "./protocol.js";
 import { STEPS } from "./steps.js";
 import { requireJobClient, type SheetJob } from "./job-client.js";
 import { appendEvent, makeEvent, openLog, tee } from "./logs.js";
-import { launchForAccount, type LaunchedBrowser } from "./shardx.js";
+import { launchForRun, touchProfile, type LaunchedBrowser } from "./shardx.js";
 import { inputsChanged, resumeStep } from "./resume-inputs.js";
 
 
@@ -636,14 +636,18 @@ function resolveAccount(cfg: { credentials: { email: string } }): string {
   const fallback = (cfg.credentials?.email ?? "").trim();
   if (fallback) return fallback;
   throw new Error(
-    "cannot determine which account this run is for — refusing to launch, because " +
-      "guessing would mint a NEW browser identity for an account that already has one",
+    "cannot determine which account this run is for — refusing to launch a browser " +
+      "that would sign in with nobody's credentials",
   );
 }
 
 const WATCH_TICK_MS = 5_000;
 let watchTimer: NodeJS.Timeout | undefined;
 let lastSeenUrl = "";
+/** This run's ShardX profile, touched while the browser is up so pruning skips it. */
+let profileId = "";
+let profileTouchedAt = 0;
+const PROFILE_TOUCH_MS = 10 * 60_000;
 let lastUrlChangeAt = Date.now();
 
 function cdpHttpBase(): string | null {
@@ -656,6 +660,10 @@ function cdpHttpBase(): string | null {
 }
 
 async function watchTick(): Promise<void> {
+  if (profileId && Date.now() - profileTouchedAt > PROFILE_TOUCH_MS) {
+    profileTouchedAt = Date.now();
+    touchProfile(profileId);
+  }
   const base = cdpHttpBase();
   if (!base || !MANAGER_URL) return;
   try {
@@ -728,7 +736,11 @@ async function main(): Promise<void> {
   }
 
   const account = resolveAccount(cfg);
-  const launched = await launchForAccount({ account, headless });
+  // A fresh profile for every run; a relaunch for the same run gets that run's back.
+  const launched = await launchForRun({ runId, headless });
+  profileId = launched.profileId;
+  profileTouchedAt = Date.now();
+  log(`account ${account} on profile ${profileId}`);
   session = launched.session;
   cdpUrl = launched.cdpUrl;
   browserPid = launched.pid;

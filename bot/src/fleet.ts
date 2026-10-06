@@ -21,7 +21,7 @@ import {
   type TelemetryEvent,
 } from "@app/contracts";
 import { connect, ensureStream, type Conn, type Logger } from "@app/transport";
-import type { FleetCredentials } from "./enroll.js";
+import { refreshApiToken, type FleetCredentials } from "./enroll.js";
 import { fromWire, type SheetJob } from "./job-client.js";
 
 
@@ -320,8 +320,8 @@ export class FleetLink {
     step_index?: number | null;
     step_key?: string | null;
   }): Promise<UploadResult> {
-    const { master_url, api_token } = this.cfg;
-    if (!master_url || !api_token) return { ok: false, retriable: false };
+    const { master_url } = this.cfg;
+    if (!master_url || !this.cfg.api_token) return { ok: false, retriable: false };
     let body: Buffer;
     try {
       body = await readFile(input.file);
@@ -341,14 +341,26 @@ export class FleetLink {
     if (input.step_key) q.set("step_key", input.step_key);
 
     try {
-      const res = await fetch(`${master_url}/artifacts?${q.toString()}`, {
-        method: "POST",
-        headers: {
-          authorization: `Bearer ${api_token}`,
-          "content-type": artifactContentType(input.file),
-        },
-        body: new Uint8Array(body),
-      });
+      const send = (): Promise<Response> =>
+        fetch(`${master_url}/artifacts?${q.toString()}`, {
+          method: "POST",
+          headers: {
+            authorization: `Bearer ${this.cfg.api_token}`,
+            "content-type": artifactContentType(input.file),
+          },
+          body: new Uint8Array(body),
+        });
+      let res = await send();
+      // Token refused: pick up a re-issued one and retry once.
+      if (res.status === 401) {
+        const fresh = await refreshApiToken(master_url, this.cfg.api_token as string, (m) =>
+          this.log.warn(m),
+        );
+        if (fresh) {
+          this.cfg.api_token = fresh;
+          res = await send();
+        }
+      }
       if (res.status === 401 || res.status === 403) {
         this.log.error(
           `the master REJECTED this bot's token (${res.status}) — no screenshots or ` +

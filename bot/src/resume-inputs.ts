@@ -6,7 +6,7 @@ import type { SheetJob } from "./job-client.js";
  * the run's own progress, not an operator's change, so it moves nothing.
  */
 function rewardsChanged(previous: SheetJob, current: SheetJob): boolean {
-  const key = (r: SheetJob["rewards"][number]) => `${r.row}|${r.type}|${r.url}`;
+  const key = (r: SheetJob["rewards"][number]) => JSON.stringify([r.row, r.type, r.url, r.answer, r.coupons]);
   const before = new Set((previous.rewards ?? []).map(key));
   return (current.rewards ?? []).some((r) => !rewardDone(r) && !before.has(key(r)));
 }

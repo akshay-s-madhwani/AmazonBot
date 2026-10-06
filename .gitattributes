@@ -1,5 +1,7 @@
 # Shell scripts must keep LF endings even on Windows checkouts — Git Bash fails
 # with `\r: command not found` if they arrive as CRLF.
 *.sh text eol=lf
+# macOS double-click scripts: bash, so LF for the same reason.
+*.command text eol=lf
 # Batch files are run by cmd.exe, which wants CRLF.
 *.bat text eol=crlf

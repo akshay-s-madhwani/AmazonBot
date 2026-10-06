@@ -42,6 +42,9 @@ page-*
 bot/.bot-identity.json
 bot/.fleet-credentials.json
 bot/start.bat
+# Written by setup.bat / setup.command on each machine.
+/start.bat
+/start.command
 
 # ShardX per-account browser profiles: cookies, localStorage and the
 # fingerprint that IS each account's identity. Never commit these.

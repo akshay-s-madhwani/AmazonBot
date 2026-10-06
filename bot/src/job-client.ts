@@ -4,10 +4,11 @@ import {
   type PaymentSpec,
   type ProductSpec,
   type RewardMark,
+  type RewardMarkExtra,
   type RewardSpec,
   type TargetAddress,
 } from "./config.js";
-import { loadCredentials } from "./enroll.js";
+import { loadCredentials, refreshApiToken } from "./enroll.js";
 import { sheetDirectClient, sheetDirectMode } from "./sheet-direct.js";
 
 export interface SheetJob {
@@ -40,15 +41,22 @@ interface WireJob {
   addresses?: TargetAddress[] | null;
   items: ProductSpec[];
   payment: PaymentSpec;
-  rewards?: Array<{ row: number; type: string; url: string; status: string }> | null;
+  rewards?: Array<{ row: number; type: string; url: string; status: string; answer?: string; coupons?: string }> | null;
   orderId?: string;
 }
 
 function rewardsFromWire(rows: WireJob["rewards"]): RewardSpec[] {
   const out: RewardSpec[] = [];
   for (const r of rows ?? []) {
-    const type = parseRewardType(r.type ?? "", r.url ?? "");
-    if (type) out.push({ row: r.row, type, url: r.url ?? "", status: r.status ?? "" });
+    // A type that does not read is kept, so check_reward fails it with a note.
+    out.push({
+      row: r.row,
+      type: parseRewardType(r.type ?? "", r.url ?? "") ?? "unknown",
+      url: r.url ?? "",
+      status: r.status ?? "",
+      answer: r.answer ?? "",
+      coupons: r.coupons ?? "",
+    });
   }
   return out;
 }
@@ -101,7 +109,8 @@ const RESULT_ATTEMPTS = 3;
 export class JobClient {
   private constructor(
     private readonly master_url: string,
-    private readonly api_token: string,
+    /** Replaced in place when the master re-issues it (see call). */
+    private api_token: string,
     readonly node_id: string,
     private readonly log: (msg: string) => void,
   ) {}
@@ -118,15 +127,25 @@ export class JobClient {
     path: string,
     init: RequestInit = {},
   ): Promise<T> {
-    const res = await fetch(`${this.master_url}${path}`, {
-      ...init,
-      headers: {
-        authorization: `Bearer ${this.api_token}`,
-        "content-type": "application/json",
-        ...(init.headers ?? {}),
-      },
-      signal: AbortSignal.timeout(TIMEOUT_MS),
-    });
+    const send = (): Promise<Response> =>
+      fetch(`${this.master_url}${path}`, {
+        ...init,
+        headers: {
+          authorization: `Bearer ${this.api_token}`,
+          "content-type": "application/json",
+          ...(init.headers ?? {}),
+        },
+        signal: AbortSignal.timeout(TIMEOUT_MS),
+      });
+    let res = await send();
+    // Token refused: pick up a re-issued one and retry once.
+    if (res.status === 401) {
+      const fresh = await refreshApiToken(this.master_url, this.api_token, this.log);
+      if (fresh) {
+        this.api_token = fresh;
+        res = await send();
+      }
+    }
     const text = await res.text();
     if (!res.ok) {
       let detail = text.slice(0, 300);
@@ -191,11 +210,20 @@ export class JobClient {
     return false;
   }
 
-  /** BLOCKED while a Reward row is being worked on, COMPLETED once claimed. */
-  async markReward(job_id: string, run_id: string, row: number, status: RewardMark): Promise<void> {
+  /**
+   * BLOCKED while a Reward row is being worked on, COMPLETED once claimed;
+   * `extra` fills the row's "Found coupons" and "notes" cells.
+   */
+  async markReward(
+    job_id: string,
+    run_id: string,
+    row: number,
+    status: RewardMark,
+    extra: RewardMarkExtra = {},
+  ): Promise<void> {
     await this.call(`/node/jobs/${encodeURIComponent(job_id)}/rewards`, {
       method: "POST",
-      body: JSON.stringify({ run_id, row_number: row, status }),
+      body: JSON.stringify({ run_id, row_number: row, status, ...extra }),
     });
   }
 

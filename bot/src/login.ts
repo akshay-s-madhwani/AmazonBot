@@ -11,11 +11,32 @@ const AMAZON_SIGNIN_URL =
 const AMAZON_DOMAIN = "amazon.in";
 const AP_PATHS = ["/ap/signin", "/ap/mfa", "/ap/cvf", "/ax/claim"];
 
-const MAX_TRANSITIONS = 12;
-const OVERALL_TIMEOUT_MS = 120_000;
-const NAV_TIMEOUT_MS = 20_000;
-const STEP_WAIT_MS = 25_000;
-const POLL_MS = 300;
+/**
+ * WAITS. A loaded machine (10 browsers, a slow proxy) can take well over 20s
+ * to move from the OTP page to the home page. The old 25s step wait then read
+ * "still on the OTP page" as stuck and failed a login that went on to succeed
+ * — the failure screenshot showed the account signed in. So:
+ *   - every wait is long and overridable from .env;
+ *   - a page is acted on only once it reads the same twice in a row;
+ *   - "still on the same page" counts as a failure only with a real, visible
+ *     error on a page that has finished loading;
+ *   - and EVERY failure first re-checks, for up to FINAL_CHECK_MS, whether the
+ *     browser is in fact signed in.
+ */
+const envMs = (name: string, fallback: number): number => {
+  const n = Number(process.env[name]);
+  return Number.isFinite(n) && n > 0 ? n : fallback;
+};
+const MAX_TRANSITIONS = 16;
+const OVERALL_TIMEOUT_MS = envMs("LOGIN_TIMEOUT_MS", 200_000);
+const NAV_TIMEOUT_MS = envMs("LOGIN_NAV_TIMEOUT_MS", 45_000);
+const STEP_WAIT_MS = envMs("LOGIN_STEP_WAIT_MS", 45_000);
+const FINAL_CHECK_MS = envMs("LOGIN_FINAL_CHECK_MS", 30_000);
+const POLL_MS = 500;
+/** After submitting, give the navigation a moment to start before reading the page again. */
+const AFTER_SUBMIT_MS = 1_500;
+/** A TOTP code is only typed with at least this long left in its 30s window. */
+const OTP_MIN_REMAINING_S = 8;
 
 export type LoginStep =
   | "email"
@@ -28,12 +49,18 @@ export type LoginStep =
   | "unknown";
 
 const SIDE_EFFECT_STEPS: readonly LoginStep[] = ["passkey_nudge", "continue_shopping"];
-const MAX_REPEATS = (step: LoginStep): number =>
-  SIDE_EFFECT_STEPS.includes(step) ? 3 : 1;
+/**
+ * A step may come back once when the first submit did not take (no error,
+ * the page just never moved). OTP/CVF may also come back after an error: on a
+ * slow machine the code can expire between typing and Amazon checking it, and
+ * the retry always uses a code from a later window.
+ */
+const MAX_REPEATS = (step: LoginStep): number => (SIDE_EFFECT_STEPS.includes(step) ? 3 : 2);
+const CODE_STEPS: readonly LoginStep[] = ["otp", "cvf"];
 
 export type LoginResult = { ok: true } | { ok: false; reason: string };
 
-function isLoggedIn(rawUrl: string): boolean {
+function isLoggedInUrl(rawUrl: string): boolean {
   try {
     const u = new URL(rawUrl);
     if (!u.hostname.endsWith(AMAZON_DOMAIN)) return false;
@@ -45,25 +72,43 @@ function isLoggedIn(rawUrl: string): boolean {
   }
 }
 
+/** The nav greeting, when the page has one: "Hello, sign in" means signed out. */
+async function greetingSaysSignedOut(page: Page): Promise<boolean> {
+  return page
+    .evaluate(() => {
+      const el = document.querySelector("#nav-link-accountList-nav-line-1, #glow-ingress-line1");
+      return !!el && /sign in/i.test((el as HTMLElement).innerText ?? "");
+    })
+    .catch(() => false);
+}
+
+/**
+ * Which sign-in screen is showing. Never throws: a read that fails mid-
+ * navigation ("execution context was destroyed") is "unknown", i.e. still moving.
+ */
 export async function detectStep(page: Page): Promise<LoginStep> {
-  const url = page.url();
+  try {
+    const url = page.url();
 
-  if (url.includes("/webauthn/nudge") || url.includes("passkeyNudgeArb")) return "passkey_nudge";
+    if (url.includes("/webauthn/nudge") || url.includes("passkeyNudgeArb")) return "passkey_nudge";
 
-  if (url.includes("/ap/cvf") || (await anyPresent(page, SEL.cvfCode))) return "cvf";
+    if (url.includes("/ap/cvf") || (await anyPresent(page, SEL.cvfCode))) return "cvf";
 
-  if (await hasContinueShopping(page)) return "continue_shopping";
+    if (await hasContinueShopping(page)) return "continue_shopping";
 
-  const title = await page.title().catch(() => "");
-  if (url.includes("/ap/mfa") || title.includes("Two-Step") || (await anyPresent(page, ["#auth-mfa-otpcode"]))) {
-    return "otp";
+    const title = await page.title().catch(() => "");
+    if (url.includes("/ap/mfa") || title.includes("Two-Step") || (await anyPresent(page, ["#auth-mfa-otpcode"]))) {
+      return "otp";
+    }
+
+    if (await anyPresent(page, ["#ap_password"])) return "password";
+    if (await anyPresent(page, SEL.email)) return "email";
+
+    if (isLoggedInUrl(url) && !(await greetingSaysSignedOut(page))) return "logged_in";
+    return "unknown";
+  } catch {
+    return "unknown";
   }
-
-  if (await anyPresent(page, ["#ap_password"])) return "password";
-  if (await anyPresent(page, SEL.email)) return "email";
-
-  if (isLoggedIn(url)) return "logged_in";
-  return "unknown";
 }
 
 async function hasContinueShopping(page: Page): Promise<boolean> {
@@ -102,12 +147,24 @@ async function handleContinueShopping(page: Page): Promise<void> {
   await pause("through the wall");
 }
 
+/** A visible sign-in error — never an informational alert. */
 async function readError(page: Page): Promise<string | null> {
-  const loc = await firstLocator(page, SEL.error);
-  if (!loc) return null;
-  if (!(await loc.isVisible().catch(() => false))) return null;
-  const text = (await loc.textContent().catch(() => ""))?.trim() ?? "";
-  return text.length > 0 ? text : null;
+  try {
+    for (const sel of SEL.error) {
+      const loc = page.locator(sel).filter({ visible: true }).first();
+      if ((await loc.count()) === 0) continue;
+      const text = ((await loc.textContent().catch(() => "")) ?? "").replace(/\s+/g, " ").trim();
+      if (text) return text;
+    }
+  } catch {
+    // The page navigated mid-read: no error to report.
+  }
+  return null;
+}
+
+/** The document has finished loading — a mid-navigation page does not count as "stuck". */
+async function settled(page: Page): Promise<boolean> {
+  return page.evaluate(() => document.readyState === "complete").catch(() => false);
 }
 
 async function submitEnclosingForm(input: Locator): Promise<void> {
@@ -116,6 +173,21 @@ async function submitEnclosingForm(input: Locator): Promise<void> {
     if (!form) throw new Error("Sign-in form not found");
     (form as HTMLFormElement).submit();
   });
+}
+
+/**
+ * A TOTP code with time left to be typed, submitted and checked on a slow
+ * machine, and never `avoid` (the code already tried: Amazon refuses a reuse).
+ */
+async function freshCode(secret: string, avoid: string | null): Promise<string> {
+  for (let i = 0; i < 3; i++) {
+    const remaining = 30 - ((Date.now() / 1000) % 30);
+    const code = totp(secret);
+    if (remaining >= OTP_MIN_REMAINING_S && code !== avoid) return code;
+    console.log(`[bot] waiting ${Math.ceil(remaining)}s for the next authenticator code`);
+    await sleep(remaining * 1000 + 500);
+  }
+  return totp(secret);
 }
 
 async function handleEmail(page: Page, email: string): Promise<void> {
@@ -136,26 +208,30 @@ async function handlePassword(page: Page, password: string): Promise<void> {
   await submitEnclosingForm(input);
 }
 
-async function handleOtp(page: Page, secret: string): Promise<void> {
+async function handleOtp(page: Page, secret: string, lastCode: string | null): Promise<string> {
   if (!secret) throw new Error("TOTP secret not configured (AMAZON_TOTP_SECRET)");
   await pause("otp step");
   const input = await firstLocator(page, SEL.otp);
   if (!input) throw new Error("OTP field not found");
-  await input.fill(totp(secret));
+  const code = await freshCode(secret, lastCode);
+  await input.fill(code);
   await shortPause();
   const btn = await firstLocator(page, SEL.otpSubmit);
   if (!btn) throw new Error("OTP submit button not found");
   await btn.dispatchEvent("click");
+  return code;
 }
 
-async function handleCvf(page: Page, secret: string): Promise<void> {
+async function handleCvf(page: Page, secret: string, lastCode: string | null): Promise<string> {
   if (!secret) throw new Error("TOTP secret not configured for CVF step");
   await pause("cvf step");
   const input = await firstLocator(page, SEL.cvfCode);
   if (!input) throw new Error("CVF code field not found");
-  await input.fill(totp(secret));
+  const code = await freshCode(secret, lastCode);
+  await input.fill(code);
   await shortPause();
   await submitEnclosingForm(input);
+  return code;
 }
 
 async function handlePasskeyNudge(page: Page): Promise<void> {
@@ -169,53 +245,111 @@ async function handlePasskeyNudge(page: Page): Promise<void> {
   await page.goto(returnTo, { waitUntil: "domcontentloaded", timeout: NAV_TIMEOUT_MS });
 }
 
-async function waitForActionableStep(page: Page, previous: LoginStep | null): Promise<LoginStep> {
+/**
+ * Polls until the page is a NEW actionable step (read twice in a row), is
+ * signed in, or is the same step showing an error once fully loaded. On
+ * timeout returns what it last saw.
+ */
+async function waitForActionableStep(
+  page: Page,
+  previous: LoginStep | null,
+): Promise<{ step: LoginStep; error: string | null }> {
   const deadline = Date.now() + STEP_WAIT_MS;
   let last: LoginStep = "unknown";
+  let candidate: LoginStep | null = null;
   while (Date.now() < deadline) {
     const step = await detectStep(page);
     last = step;
-    if (step === "logged_in") return step;
-    if (step !== previous && step !== "unknown") return step;
-    if (step === previous && step === "email") {
-    } else if (step === previous && (await readError(page))) {
-      return step;
+    if (step === "logged_in") return { step, error: null };
+    if (step !== previous && step !== "unknown") {
+      if (candidate === step) return { step, error: null };
+      candidate = step;
+    } else {
+      candidate = null;
+      if (step === previous && step !== "email" && (await settled(page))) {
+        const error = await readError(page);
+        if (error) return { step, error };
+      }
     }
     await sleep(POLL_MS);
   }
-  return last;
+  return { step: last, error: last === previous ? await readError(page) : null };
+}
+
+/**
+ * Before reporting a failure: is the browser signed in after all? A slow
+ * machine can still be loading the home page when a wait gives up.
+ */
+async function signedInAfterAll(page: Page): Promise<boolean> {
+  const deadline = Date.now() + FINAL_CHECK_MS;
+  while (Date.now() < deadline) {
+    await page.waitForLoadState("domcontentloaded", { timeout: 5_000 }).catch(() => { });
+    if ((await detectStep(page)) === "logged_in") return true;
+    await sleep(1_000);
+  }
+  return false;
+}
+
+async function gotoSignIn(page: Page): Promise<void> {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      await page.goto(AMAZON_SIGNIN_URL, { waitUntil: "domcontentloaded", timeout: NAV_TIMEOUT_MS });
+      return;
+    } catch (err) {
+      // A slow load that still landed on Amazon is good enough: the step poll takes over.
+      if (page.url().includes(AMAZON_DOMAIN)) return;
+      if (attempt >= 2) throw err;
+      console.log(`[bot] sign-in page did not load (${(err as Error).message.split("\n")[0]}) — retrying`);
+      await sleep(3_000);
+    }
+  }
 }
 
 export async function runLogin(page: Page, creds: Credentials): Promise<LoginResult> {
   page.setDefaultTimeout(NAV_TIMEOUT_MS);
-  await page.goto(AMAZON_SIGNIN_URL, { waitUntil: "domcontentloaded", timeout: NAV_TIMEOUT_MS });
+  await gotoSignIn(page);
   await pause("signin page loaded");
 
   const startedAt = Date.now();
   const handled: Partial<Record<LoginStep, number>> = {};
   let previous: LoginStep | null = null;
+  let lastCode: string | null = null;
+
+  const fail = async (reason: string): Promise<LoginResult> => {
+    console.log(`[bot] login looks failed (${reason}) — checking whether it signed in anyway`);
+    if (await signedInAfterAll(page)) {
+      console.log("[bot] signed in after all — the page was just slow");
+      await pause("login complete");
+      return { ok: true };
+    }
+    return { ok: false, reason };
+  };
 
   for (let i = 0; i < MAX_TRANSITIONS; i++) {
     if (Date.now() - startedAt > OVERALL_TIMEOUT_MS) {
-      return { ok: false, reason: `login timed out after ${OVERALL_TIMEOUT_MS}ms on ${page.url()}` };
+      return fail(`login timed out after ${Math.round(OVERALL_TIMEOUT_MS / 1000)}s on ${page.url()}`);
     }
 
-    const step = await waitForActionableStep(page, previous);
-    console.log(`[bot] step: ${step}  (${page.url()})`);
+    const { step, error } = await waitForActionableStep(page, previous);
+    console.log(`[bot] step: ${step}  (${page.url()})${error ? ` — error: ${error}` : ""}`);
 
     if (step === "logged_in") {
       await pause("login complete");
       return { ok: true };
     }
     if (step === "unknown") {
-      const err = await readError(page);
-      return { ok: false, reason: err ?? `unrecognised page: ${page.url()}` };
+      return fail((await readError(page)) ?? `unrecognised page: ${page.url()}`);
+    }
+
+    if (step === previous) {
+      // A wrong password will not get better by typing it again; a code might.
+      if (error && !CODE_STEPS.includes(step)) return fail(error);
+      console.log(`[bot] still on "${step}" — ${error ? "retrying with a new code" : "the submit did not take, retrying"}`);
     }
 
     handled[step] = (handled[step] ?? 0) + 1;
     if (handled[step]! > MAX_REPEATS(step)) {
-      const err = await readError(page);
-      return { ok: false, reason: err ?? `stuck on step "${step}" at ${page.url()}` };
+      return fail(error ?? (await readError(page)) ?? `stuck on step "${step}" at ${page.url()}`);
     }
 
     try {
@@ -227,10 +361,10 @@ export async function runLogin(page: Page, creds: Credentials): Promise<LoginRes
           await handlePassword(page, creds.password);
           break;
         case "otp":
-          await handleOtp(page, creds.totpSecret);
+          lastCode = await handleOtp(page, creds.totpSecret, lastCode);
           break;
         case "cvf":
-          await handleCvf(page, creds.totpSecret);
+          lastCode = await handleCvf(page, creds.totpSecret, lastCode);
           break;
         case "passkey_nudge":
           await handlePasskeyNudge(page);
@@ -240,11 +374,16 @@ export async function runLogin(page: Page, creds: Credentials): Promise<LoginRes
           break;
       }
     } catch (err) {
-      return { ok: false, reason: (err as Error).message };
+      // The page often moved on by itself while the handler was reading it.
+      const message = (err as Error).message.split("\n")[0] ?? "login step failed";
+      await sleep(AFTER_SUBMIT_MS);
+      if ((await detectStep(page)) === step) return fail(message);
+      console.log(`[bot] "${step}" handler gave up (${message}) but the page has moved on — continuing`);
     }
 
     previous = step;
+    await sleep(AFTER_SUBMIT_MS);
   }
 
-  return { ok: false, reason: `login did not complete within ${MAX_TRANSITIONS} steps (last: ${page.url()})` };
+  return fail(`login did not complete within ${MAX_TRANSITIONS} steps (last: ${page.url()})`);
 }

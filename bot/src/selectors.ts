@@ -18,7 +18,9 @@ export const SEL = {
     'button[id*="skip"]',
   ],
 
-  error: ["#auth-error-message-box", ".a-alert-content"],
+  // Errors only: a bare .a-alert-content also matches the info and warning
+  // boxes the OTP page shows, which used to read as "the code was rejected".
+  error: ["#auth-error-message-box .a-alert-content", ".a-alert-error .a-alert-content", ".a-alert-inline-error .a-alert-content"],
 
   continueShopping: [
     'button:has-text("Continue shopping")',

@@ -3,7 +3,7 @@ import { loadAddress, loadConfig } from "./config.js";
 import { pause } from "./human.js";
 import { runLogin } from "./login.js";
 import { chromium, type Browser } from "./pw.js";
-import { launchForAccount } from "./shardx.js";
+import { launchForRun } from "./shardx.js";
 
 async function main(): Promise<number> {
   const cfg = loadConfig();
@@ -12,8 +12,8 @@ async function main(): Promise<number> {
   let browser: Browser | undefined;
   let stop: (() => Promise<void>) | undefined;
   try {
-    const launched = await launchForAccount({
-      account: cfg.credentials.email,
+    const launched = await launchForRun({
+      runId: `diag-${Date.now()}`,
       headless: cfg.headless,
     });
     stop = () => launched.session.stop();

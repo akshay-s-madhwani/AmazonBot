@@ -154,6 +154,64 @@ export async function ensureEnrolled(opts: EnrollOptions): Promise<FleetCredenti
   return null;
 }
 
+let refreshing: Promise<string | null> | null = null;
+let lastRefreshAt = 0;
+/** The master rate-limits /enroll* per address, shared by every process here. */
+const REFRESH_MIN_MS = 30_000;
+
+/**
+ * The master answered 401 to `rejected`. Returns a token worth one retry, or
+ * null: first the credentials file, in case another process on this machine
+ * already refreshed; else a re-poll of enrollment with this machine's
+ * identity. The master re-issues a token there when the one it holds no longer
+ * verifies (approved before tokens were JWTs, or JWT_SECRET changed).
+ */
+export async function refreshApiToken(
+  masterUrl: string,
+  rejected: string,
+  log: (msg: string) => void = (m) => console.log(`[enroll] ${m}`),
+): Promise<string | null> {
+  const onFile = loadCredentials();
+  if (onFile && onFile.api_token !== rejected) return onFile.api_token;
+  if (refreshing) return refreshing;
+  if (Date.now() - lastRefreshAt < REFRESH_MIN_MS) return null;
+  lastRefreshAt = Date.now();
+  refreshing = (async () => {
+    try {
+      const identity = loadIdentity();
+      const res = await fetch(`${masterUrl.replace(/\/+$/, "")}/enroll/poll`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ short_id: identity.short_id, secret: identity.secret }),
+      });
+      if (!res.ok) {
+        log(`token refresh: master returned HTTP ${res.status}`);
+        return null;
+      }
+      const body = (await res.json()) as PollResponse;
+      if (body.status !== "approved") {
+        log(`token refresh: this machine is ${body.status} on the master — approve it in the control panel`);
+        return null;
+      }
+      if (body.api_token === rejected) return null;
+      saveCredentials({
+        bot_id: body.bot_id,
+        api_token: body.api_token,
+        nats_url: body.nats_url,
+        ...(body.nats_token ? { nats_token: body.nats_token } : {}),
+      });
+      log(`the master re-issued this bot's token — saved`);
+      return body.api_token;
+    } catch (err) {
+      log(`token refresh failed: ${(err as Error).message}`);
+      return null;
+    } finally {
+      refreshing = null;
+    }
+  })();
+  return refreshing;
+}
+
 function osName(): string {
   switch (process.platform) {
     case "win32":

@@ -52,22 +52,34 @@ export interface ProductSpec {
 
 /**
  * The Reward tab row an account points at. URL claims a reward link directly;
- * SPIN plays the FunZone spin wheel; ACTIONS is the FunZone "complete actions"
- * card (not automated yet).
+ * SPIN plays the spin wheel; STICKERS (called ACTIONS until 2026-10-06) works
+ * through the sticker task cards. UNKNOWN is a row whose type did not read,
+ * which the step fails with a note.
  */
-export type RewardType = "url" | "spin" | "actions";
+export type RewardType = "url" | "spin" | "stickers" | "unknown";
 
 export interface RewardSpec {
   /** Reward-tab row number, so its status can be written back. 0 = not from the sheet. */
   row: number;
   type: RewardType;
+  /** URL: the reward link. SPIN/STICKERS: overrides the default campaign page. */
   url: string;
   /** Reward-tab status: PENDING (or blank), BLOCKED, COMPLETED. */
   status: string;
+  /** SPIN quiz option to pick (case-insensitive). Blank = the first option. */
+  answer: string;
+  /** Wanted coupons, one per line (see coupons.ts). Blank = any. */
+  coupons: string;
 }
 
 /** What the bot writes to a Reward row: BLOCKED while it works on it, COMPLETED once claimed. */
 export type RewardMark = "BLOCKED" | "COMPLETED";
+
+/** The cells written along with a mark; absent = leave the cell as it is. */
+export interface RewardMarkExtra {
+  found_coupons?: string;
+  notes?: string;
+}
 
 export function rewardDone(r: RewardSpec): boolean {
   return r.status.trim().toUpperCase() === "COMPLETED";
@@ -78,7 +90,7 @@ export function parseRewardType(raw: string, url = ""): RewardType | null {
   const t = raw.trim().toLowerCase().replace(/[\s-]+/g, "_");
   if (t === "url" || t === "link") return "url";
   if (t === "spin" || t === "spin_wheel" || t === "spinwheel") return "spin";
-  if (t === "actions" || t === "action") return "actions";
+  if (t === "stickers" || t === "sticker" || t === "actions" || t === "action") return "stickers";
   if (!t && url.trim()) return "url";
   return null;
 }

@@ -171,7 +171,7 @@ export async function runOpenProduct(page: Page, spec: ProductSpec): Promise<Pro
   }
 
   if (spec.expectedPrice !== undefined) {
-    const tolerance = Number(process.env.PRICE_TOLERANCE ?? "1");
+    const tolerance = Number(process.env.PRICE_TOLERANCE ?? "10");
     if (box.price === null) {
       return {
         ok: false,

@@ -1,6 +1,6 @@
 # amazon-login-bot
 
-Amazon automation using **ShardX**, with a persistent profile per account and
+Amazon automation using **ShardX**, with a fresh browser profile for every run and
 a separate slot process owning each browser. Fleet jobs come from the master;
 standalone diagnostics can read configuration from env. The ordered pipeline is:
 
@@ -60,7 +60,7 @@ All four supported types reduce to Amazon's accordion buy box, confirmed live:
 are always applied when present. Force a specific row with `subscribe_save`,
 `one_time`, or `fresh` — those fail loudly if the listing doesn't offer them.
 
-## Fleet mode (`npm run manager`) — the independent unit
+## Fleet mode (`npm start` / `npm run manager`) — the independent unit
 
 Three tiers, all local. No NATS, no SQLite, no master.
 
@@ -119,11 +119,28 @@ shared packages and this one, downloads the ShardX browser engine, creates the
 per-account profile store, writes a `start.bat` for future starts, and launches
 the bot.
 
+**macOS** (Apple Silicon only — ShardX has no Intel Mac build): double-click
+[`setup.command`](../setup.command) at the AmazonBot root, or run
+`./setup.command http://1.2.3.4:8080`. It does the same steps and writes a
+`start.command`; [`run-manager.command`](../run-manager.command) and
+[`stop-manager.command`](../stop-manager.command) mirror the `.bat` pair. A copy
+that did not come through git (zip, AirDrop) loses the run permission and
+gets quarantined — fix both once with
+`chmod +x *.command && xattr -dr com.apple.quarantine .` in that folder.
+On macOS the engine installs to `~/Library/Application Support/shardx-sdk`.
+
 The engine is a few hundred MB and installs to `%LOCALAPPDATA%\shardx-sdk`, so
 it is shared by every clone on the machine and survives a re-clone. The profile
-store is `browser-profiles/` **inside this folder** — one folder per account,
-each holding that account's fingerprint and session. Deleting it makes every
-account look like a new machine on its next login.
+store is `browser-profiles/` **inside this folder**. Every run gets its own newly
+minted profile (`run-<hash of the run id>`: new fingerprint, empty cookies), so
+every run signs in from scratch; a browser relaunched for the same run gets that
+run's profile back. Run profiles unused for `SHARDX_PROFILE_TTL_HOURS` (default
+24) are deleted at the next launch. Older per-account `acct-*` folders are no
+longer used and can be deleted by hand.
+
+Slow machines: the login waits can be raised in `.env` with `LOGIN_STEP_WAIT_MS`
+(45s), `LOGIN_NAV_TIMEOUT_MS` (45s), `LOGIN_TIMEOUT_MS` (200s) and
+`LOGIN_FINAL_CHECK_MS` (30s).
 
 Nothing else is configured on the machine. No token, no password, no node id.
 
@@ -341,13 +358,15 @@ failed or stuck run keeps it open on the failed page. Cookies are checkpointed t
 Every step is screenshotted to `artifacts/<run-id>/` (proactively — if the runner is
 hard-killed, its context dies with it and nothing can be captured afterwards).
 
-### Single-process mode (`npm start`) — legacy harness
+### Single-process mode (`npm run single`) — legacy harness
 
 ```sh
-npm start      # one process: launch ShardX → login → address → close
+npm run single   # one process: launch ShardX → login → address → close
 ```
 
-Simpler for iterating on step logic; loses the browser on any failure.
+Simpler for iterating on step logic; loses the browser on any failure. This is
+the only mode that reads `AMAZON_EMAIL` / `AMAZON_PASSWORD` (and the product /
+address vars) from `.env`. Fleet mode takes every account from the master.
 
 ## Test
 
@@ -361,7 +380,7 @@ npm run test:fleet    # redaction + job-summary checks (no browser, no network)
 NATS_URL=nats://127.0.0.1:4222 npm run test:fleet
 ```
 
-The real end-to-end test is a live `npm start` — watch the headful window walk
+The real end-to-end test is a live `npm run single` — watch the headful window walk
 the login and confirm success. The selectors are ported from the extension's
 live-confirmed notes; if Amazon's DOM has drifted, fix `src/selectors.ts` and
 re-run.

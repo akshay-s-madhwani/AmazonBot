@@ -1,40 +1,47 @@
 import { pause, shortPause, sleep } from "./human.js";
-import { rewardDone, type RewardMark, type RewardSpec } from "./config.js";
+import { rewardDone, type RewardMark, type RewardMarkExtra, type RewardSpec } from "./config.js";
+import { couponNumbers, describeCoupon, matchCoupon, parseWantedCoupons, type WantedCoupon } from "./coupons.js";
 import type { CDPSession, Page } from "./pw.js";
 
 /**
  * THE REWARD STEP. Three kinds, set per account by the Reward tab's `type`:
  *
- *   URL      open the reward link and press Collect.
- *   SPIN     FunZone -> "Play & win" -> spin -> answer the one quiz question
- *            -> Amazon redirects to the won coupon -> Collect.
- *   ACTIONS  FunZone "Complete actions": a row of task cards, each "add any
- *            item to cart" on a page the card opens, then a Claim card.
+ *   URL       open the reward link and collect its coupon.
+ *   SPIN      open the spin game -> spin -> answer the quiz with the row's
+ *             `answer` -> Amazon redirects to the won coupons -> collect.
+ *   STICKERS  open the sticker task page (called ACTIONS until 2026-10-06):
+ *             a row of task cards, each "add any item to cart" on a page the
+ *             card opens, then a Claim card -> View reward -> collect.
  *
- * An account's reward code can point at several Reward rows; each is done in
- * sheet order, skipping COMPLETED ones, and marked BLOCKED while it is worked
- * on and COMPLETED once its coupon is collected.
+ * SPIN and STICKERS go straight to their page (the row's reward_url, else
+ * the default campaign below); FunZone is no longer searched.
  *
- * FunZone and the coupon pages only render on the MOBILE site (the desktop
- * site shows "Get the app", and a /rewards/checkoutCoupons link renders a bare
- * category page), so all of it runs in a separate tab with phone emulation.
- * The run's own tab never leaves the desktop site: emulation set over CDP does
- * not fully reset when the session detaches (the viewport stays), so the
- * mobile tab is closed rather than switched back.
+ * COUPONS. A coupon page can offer one or several coupons. Each coupon's
+ * description states two numbers ("₹50 off on ₹250") that are matched against
+ * the row's `coupons` cell (see coupons.ts); only matching ones are collected,
+ * and those are written to "Found coupons". A blank cell takes any coupon.
  *
- * Flow verified by hand on 2026-09-30 (campaign gSUN0DE):
- *   search "funzone" -> first card links /b?node=14351766031
- *   -> "Guaranteed rewards" row: two links side by side, left /game/<id>
- *      (Play & win), right /b?node=... (Complete actions)
- *   -> /game/<id>: .sw-tap-to-spin -> POST /game/<id>/state
+ * THE STEP FAILS unless every row ends COMPLETED. A row is COMPLETED when its
+ * coupon is collected, or the page shows it already claimed — the coupon's
+ * button reads "Order now" / "Redeemed" rather than "Collect now" / "Redeem".
+ * Every other outcome fails the row, and its reason goes to the row's notes.
+ * Rows are independent: one failing does not stop the rest.
+ *
+ * The game and coupon pages only render on the MOBILE site, so all of it runs
+ * in a separate tab with phone emulation. The run's own tab never leaves the
+ * desktop site: emulation set over CDP does not fully reset when the session
+ * detaches (the viewport stays), so the mobile tab is closed rather than
+ * switched back.
+ *
+ * SPIN, verified by hand on 2026-09-30 (campaign gSUN0DE):
+ *   /game/<id>: .sw-tap-to-spin -> POST /game/<id>/state
  *   -> "Congratulations" + .sw-claim-your-prize-btn ("Answer now")
  *   -> /game/<id> reloads as a quiz: .mcq-option[data-option-id]
  *   -> correct answer redirects to /rewards/checkoutCoupons?uuid=<rewardId>
  *   -> button[id^="amzn1.rewards.reward."] "Collect now" -> POST /h/coupon-actions
- *   -> the button becomes "AVAILABLE TO USE DURING ...".
  * Once played, the /game/ link goes straight to that coupon page.
  *
- * ACTIONS, verified by hand the same day (task page /b?node=221530152031):
+ * STICKERS, verified by hand the same day (task page /b?node=221530152031):
  *   cards [data-engagement-streak-count=1..3], each with a
  *   #streakActionButtonServerData carrying data-action-type (ADD_ITEM_TO_CART
  *   or SINGLE_CLICK_CHECK_IN), data-action-url and an activeButton /
@@ -45,15 +52,20 @@ import type { CDPSession, Page } from "./pw.js";
  *      link to the same page. The next card turns active.
  *   -> Claim (SINGLE_CLICK_CHECK_IN) updates the card over ajax to
  *      "View reward" -> /rewards/streaks/checkoutCoupons?streakId=... ->
- *      Collect now, the same coupon screen as the spin.
+ *      the same coupon screen as the spin.
  * The items it adds stay in the cart; add_items clears the cart first.
  */
 
-const FUNZONE_SEARCH_URL = "https://www.amazon.in/s?k=funzone&i=specialty-aps&rh=n%3A14351766031&ref=nb_sb_noss";
-const FUNZONE_NODE = "14351766031";
-const FUNZONE_URL = `https://www.amazon.in/b?node=${FUNZONE_NODE}`;
+const SPIN_URL = "https://www.amazon.in/game/gSUN0DE";
+const STICKERS_URL = "https://www.amazon.in/b?node=221530152031";
 
 const REWARD_BUTTON = 'button[id^="amzn1.rewards.reward."]';
+/** Everything a coupon's action can be: Amazon renders some as a-button spans. */
+const CONTROLS = 'button, a, [role="button"], input[type="submit"], input[type="button"], .a-button';
+/** A coupon still to collect. */
+const OPEN_LABEL = /^(collect|collect now|redeem|redeem now)$/i;
+/** A coupon already collected. */
+const CLAIMED_LABEL = /^(order now|redeemed|collected)$|available to use/i;
 const TAP_TO_SPIN = ".sw-tap-to-spin";
 /**
  * "Answer now" after the wheel stops. Campaigns differ: gSUN0DE shows it as
@@ -66,34 +78,34 @@ const TASK_CARD = "[data-engagement-streak-count]";
 const TASK_BUTTON = "#streakActionButtonServerData";
 const VIEW_REWARD = '[data-mix-operations="viewRewardButtonClick"]';
 const ADD_TO_CART = 'button[aria-label="Add to cart" i]';
-/** A task card that does not advance after this many tries fails the step. */
+/** A task card that does not advance after this many tries fails the row. */
 const TASK_ATTEMPTS = 3;
 const MAX_TASK_ROUNDS = 12;
+/** A coupon whose Collect does not take after this many presses fails the row. */
+const COLLECT_ATTEMPTS = 3;
 /** window.name of the tab this step opens, so a retry can close a stale one. */
 const TAB_NAME = "fleet-reward-tab";
+/** Notes cell length cap. */
+const NOTE_MAX = 300;
 
 const NAV_TIMEOUT_MS = 30_000;
 /** How long one screen may take to turn into the next (the wheel spins ~6s). */
 const TRANSITION_MS = 25_000;
-const MAX_TRANSITIONS = 10;
+/** Screens one row may go through: spin, answer, quiz, then a press per coupon. */
+const MAX_TRANSITIONS = 20;
 
-/**
- * Quiz questions with a known answer: [question, option to pick]. A wrong
- * answer forfeits the prize for the day, so an unknown non-True/False question
- * stops the step instead of guessing — add it here once answered.
- */
-const KNOWN_ANSWERS: Array<[RegExp, RegExp]> = [
-  [/first-ever amazon order could be eligible for free delivery/i, /^true$/i],
-];
-
-export type RewardOutcome =
-  | "collected"
-  | "already_redeemed"
-  | "none_available";
+export type RewardOutcome = "collected" | "already_claimed" | "all_completed";
 
 export type RewardResult =
   | { ok: true; outcome: RewardOutcome; detail: string }
   | { ok: false; reason: string; retriable?: boolean };
+
+/** One Reward row's outcome. `note` / `reason` go to the row's notes cell. */
+type RowResult =
+  | { ok: true; outcome: "collected" | "already_claimed"; found: string[]; note: string }
+  | { ok: false; reason: string; retriable?: boolean; /** No point trying the other rows. */ fatal?: boolean };
+
+const SIGNED_OUT: RowResult = { ok: false, reason: "Signed out", fatal: true };
 
 // ---------------------------------------------------------------------------
 // Mobile tab
@@ -176,97 +188,33 @@ function signedOut(tab: Page): boolean {
   return /\/ap\/signin/.test(tab.url());
 }
 
-// ---------------------------------------------------------------------------
-// FunZone
-// ---------------------------------------------------------------------------
-
-interface FunZoneCards {
-  container: string;
-  spin: string;
-  actions: string;
-}
-
-/**
- * The "Guaranteed rewards" row: the first FunZone block holding exactly two
- * wide links side by side, a /game/ one on the left (Play & win) and a
- * non-game one on the right (Complete actions). Every card on the page is an
- * image labelled "Live now", so position and href are all there is to go on.
- */
-async function findGuaranteedRewards(tab: Page): Promise<FunZoneCards | null> {
-  return tab
-    .evaluate(() => {
-      for (const block of document.querySelectorAll("li[id]")) {
-        const links = [...block.querySelectorAll("a[href]")].filter(
-          (a) => a.getBoundingClientRect().width > 50,
-        );
-        if (links.length !== 2) continue;
-        const [left, right] = links.sort(
-          (a, b) => a.getBoundingClientRect().x - b.getBoundingClientRect().x,
-        );
-        const l = left!.getAttribute("href") ?? "";
-        const r = right!.getAttribute("href") ?? "";
-        if (/\/game\//.test(l) && !/\/game\//.test(r)) {
-          return { container: block.id, spin: l, actions: r };
-        }
-      }
-      return null;
-    })
-    .catch(() => null);
-}
-
-async function openFunZone(tab: Page): Promise<FunZoneCards | string> {
-  console.log("[bot] rewards: searching FunZone");
-  if (!(await goto(tab, FUNZONE_SEARCH_URL))) return "could not load the FunZone search page";
-  await pause("letting the search results settle");
-  if (signedOut(tab)) return "rewards page bounced to sign-in — the session is not logged in";
-
-  const card = tab.locator(`a[href*="node=${FUNZONE_NODE}"]`).first();
-  const found = await card
-    .waitFor({ state: "visible", timeout: 15_000 })
-    .then(() => true)
-    .catch(() => false);
-  if (found) {
-    console.log("[bot] rewards: opening the FunZone card");
-    await card.scrollIntoViewIfNeeded().catch(() => {});
-    await shortPause();
-    await card.click({ timeout: 10_000 });
-    await tab.waitForLoadState("domcontentloaded").catch(() => {});
-  } else {
-    console.log("[bot] rewards: no FunZone card in the results — opening FunZone directly");
-    if (!(await goto(tab, FUNZONE_URL))) return "could not load the FunZone page";
-  }
-  await pause("letting FunZone load");
-
-  const deadline = Date.now() + 20_000;
-  while (Date.now() < deadline) {
-    const cards = await findGuaranteedRewards(tab);
-    if (cards) return cards;
-    await sleep(1000);
-  }
-  return `FunZone has no "Guaranteed rewards" row (Play & win / Complete actions) on ${tab.url()}`;
-}
-
-async function clickCard(tab: Page, cards: FunZoneCards, href: string, label: string): Promise<void> {
-  const link = tab.locator(`li[id="${cards.container}"] a[href="${href}"]`).first();
-  await link.scrollIntoViewIfNeeded().catch(() => {});
-  await shortPause();
-  console.log(`[bot] rewards: opening ${label}`);
-  await link.click({ timeout: 10_000 });
-  await tab.waitForLoadState("domcontentloaded").catch(() => {});
+function amazonLink(url: string): boolean {
+  return /^https?:\/\/(www\.)?(amazon\.in|amzn\.in)\//i.test(url);
 }
 
 // ---------------------------------------------------------------------------
 // Game / coupon screens
 // ---------------------------------------------------------------------------
 
+interface CouponCard {
+  /** Index into querySelectorAll(CONTROLS), for clicking it. */
+  idx: number;
+  /** The control's id (a reward id for Collect buttons), "" if none. */
+  id: string;
+  label: string;
+  state: "open" | "claimed";
+  /** The coupon's own text, without its button. */
+  description: string;
+}
+
 type Screen =
   | { kind: "wheel" }
   | { kind: "answer_now" }
   | { kind: "quiz"; question: string; options: string[] }
-  | { kind: "collect"; prize: string }
-  /** "SELECT YOUR COUPONS — Pick any 3 out of 14 · 0/3 selected". */
-  | { kind: "pick"; need: number; offered: number; picked: number; prize: string }
-  | { kind: "collected"; prize: string }
+  /** One or more coupons; `pick` on a "Pick any 3 out of 14 · 0/3 selected" page. */
+  | { kind: "coupons"; cards: CouponCard[]; pick: { need: number; picked: number } | null }
+  /** The page says the reward was already claimed, with no coupon to show. */
+  | { kind: "done"; text: string }
   | { kind: "wrong_answer" }
   | { kind: "unknown"; controls: string[] };
 
@@ -274,14 +222,14 @@ type Screen =
 async function readScreen(tab: Page): Promise<Screen> {
   return tab
     .evaluate(
-      ([tap, answer, mcq, reward]) => {
+      ([tap, answer, mcq, reward, controlSel, openSrc, claimedSrc]) => {
         const shown = (el: Element | null): boolean => {
           if (!el) return false;
           const r = el.getBoundingClientRect();
           return r.width > 0 && r.height > 0;
         };
-        const text = (document.body?.innerText ?? "").replace(/\s+/g, " ");
-        const prize = (text.match(/get flat .{1,60}?min order:?\s*₹\s*[\d,]+/i)?.[0] ?? "").trim();
+        const squash = (s: string) => s.replace(/\s+/g, " ").trim();
+        const text = squash(document.body?.innerText ?? "");
 
         if (/answer you gave was incorrect|not eligible to win the prize/i.test(text)) {
           return { kind: "wrong_answer" as const };
@@ -289,7 +237,7 @@ async function readScreen(tab: Page): Promise<Screen> {
 
         const options = [...document.querySelectorAll(mcq!)].filter(shown);
         if (options.length > 0) {
-          const labels = options.map((o) => (o as HTMLElement).innerText.replace(/\s+/g, " ").trim());
+          const labels = options.map((o) => squash((o as HTMLElement).innerText));
           // The question is the last line of the quiz card that is not an option or boilerplate.
           let box: Element | null = options[0]!.parentElement;
           while (box && box.parentElement && (box as HTMLElement).innerText.split("\n").length < labels.length + 2) {
@@ -304,24 +252,52 @@ async function readScreen(tab: Page): Promise<Screen> {
           return { kind: "quiz" as const, question, options: labels };
         }
 
-        // A choice page: several coupons, collect `need` of them. Its counter,
-        // not the buttons, says when it is done.
-        const pick = text.match(/pick any (\d+) out of (\d+)/i);
-        if (pick) {
-          const need = Number(pick[1]);
-          const picked = Number(text.match(/(\d+)\s*\/\s*\d+\s*selected/i)?.[1] ?? 0);
-          if (picked >= need) return { kind: "collected" as const, prize: `${need} coupons, ${prize}` };
-          return { kind: "pick" as const, need, offered: Number(pick[2]), picked, prize };
-        }
-
-        const collect = [...document.querySelectorAll(reward!)].find(
-          (b) => shown(b) && !(b as HTMLButtonElement).disabled && /collect/i.test((b as HTMLElement).innerText),
-        );
-        if (collect) return { kind: "collect" as const, prize };
-        if (/\/rewards\//.test(location.pathname) || prize) {
-          if (/available to use|collected|already (been )?(claimed|collected|redeemed)/i.test(text)) {
-            return { kind: "collected" as const, prize };
+        // Coupons: every visible control reading Collect/Redeem (open) or
+        // Order now/Redeemed (claimed). Off a rewards page only the reward
+        // buttons themselves count, so a deal's "Order now" is not a coupon.
+        const open = new RegExp(openSrc!, "i");
+        const claimed = new RegExp(claimedSrc!, "i");
+        const rewardPage = /\/rewards\//.test(location.pathname) || !!document.querySelector(reward!);
+        const all = [...document.querySelectorAll(controlSel!)];
+        const hits: Array<{ el: HTMLElement; idx: number; label: string; state: "open" | "claimed" }> = [];
+        all.forEach((el, idx) => {
+          if (!shown(el)) return;
+          const h = el as HTMLElement;
+          const label = squash(h.innerText || (h as HTMLInputElement).value || "");
+          const state = open.test(label) ? "open" : claimed.test(label) ? "claimed" : null;
+          if (!state) return;
+          if (!el.matches(reward!) && !rewardPage) return;
+          if (state === "open" && ((h as HTMLButtonElement).disabled || h.classList.contains("a-button-disabled"))) return;
+          hits.push({ el: h, idx, label, state });
+        });
+        // An a-button span and the button inside it are one control: keep the innermost.
+        const controls = hits.filter((c) => !hits.some((o) => o !== c && c.el.contains(o.el)));
+        const cards = controls.map((c) => {
+          // The coupon card: the widest ancestor holding no other coupon control.
+          let card: HTMLElement = c.el;
+          while (card.parentElement && card.parentElement !== document.body) {
+            const p = card.parentElement;
+            if (controls.some((o) => o !== c && p.contains(o.el))) break;
+            if (squash(p.innerText ?? "").length > 500) break;
+            card = p;
           }
+          return {
+            idx: c.idx,
+            id: c.el.id ?? "",
+            label: c.label,
+            state: c.state,
+            description: squash((card.innerText ?? "").replace(c.el.innerText ?? "", " ")),
+          };
+        });
+        const pickMatch = text.match(/pick any (\d+) out of (\d+)/i);
+        const pick = pickMatch
+          ? { need: Number(pickMatch[1]), picked: Number(text.match(/(\d+)\s*\/\s*\d+\s*selected/i)?.[1] ?? 0) }
+          : null;
+        if (cards.length > 0 || pick) return { kind: "coupons" as const, cards, pick };
+
+        if (/\/(rewards|game)\//.test(location.pathname) &&
+          /already (been )?(claimed|collected|redeemed)|you have already (played|claimed)/i.test(text)) {
+          return { kind: "done" as const, text: text.slice(0, 120) };
         }
 
         // Any VISIBLE match: a campaign can keep a hidden copy of a button in the page.
@@ -332,14 +308,14 @@ async function readScreen(tab: Page): Promise<Screen> {
         if (visible(answer!)) return { kind: "answer_now" as const };
         if (visible(tap!)) return { kind: "wheel" as const };
 
-        const controls = [...document.querySelectorAll("button, .a-button, a[role=button]")]
+        const labels = [...document.querySelectorAll("button, .a-button, a[role=button]")]
           .filter(shown)
-          .map((el) => (el as HTMLElement).innerText.replace(/\s+/g, " ").trim())
+          .map((el) => squash((el as HTMLElement).innerText))
           .filter((l) => l && l.length < 40)
           .slice(0, 8);
-        return { kind: "unknown" as const, controls };
+        return { kind: "unknown" as const, controls: labels };
       },
-      [TAP_TO_SPIN, ANSWER_NOW, MCQ_OPTION, REWARD_BUTTON] as const,
+      [TAP_TO_SPIN, ANSWER_NOW, MCQ_OPTION, REWARD_BUTTON, CONTROLS, OPEN_LABEL.source, CLAIMED_LABEL.source] as const,
     )
     .catch(() => ({ kind: "unknown" as const, controls: [] }));
 }
@@ -370,33 +346,79 @@ async function pressAButton(tab: Page, selector: string): Promise<void> {
   await target.click({ timeout: 10_000 });
 }
 
-export function chooseAnswer(question: string, options: string[]): string | null {
-  for (const [q, answer] of KNOWN_ANSWERS) {
-    if (!q.test(question)) continue;
-    const hit = options.find((o) => answer.test(o));
-    if (hit) return hit;
-  }
-  // FunZone's True/False questions state an Amazon benefit, so they are true.
-  const folded = options.map((o) => o.toLowerCase());
-  if (folded.length === 2 && folded.includes("true") && folded.includes("false")) {
-    return options[folded.indexOf("true")]!;
-  }
-  return null;
+const fold = (s: string): string => s.replace(/\s+/g, " ").trim().toLowerCase();
+
+/**
+ * The quiz option to pick: the row's `answer` matched case-insensitively
+ * (whole option first, else the one option containing it). A blank answer
+ * takes the first option. Null when the answer is not among the options —
+ * a wrong answer forfeits the prize for the day, so nothing is guessed.
+ */
+export function chooseAnswer(options: string[], answer: string): string | null {
+  if (options.length === 0) return null;
+  const want = fold(answer);
+  if (!want) return options[0]!;
+  const exact = options.find((o) => fold(o) === want);
+  if (exact) return exact;
+  const partial = options.filter((o) => fold(o).includes(want));
+  return partial.length === 1 ? partial[0]! : null;
+}
+
+export interface CouponPlan {
+  /** Indexes of the open coupons that match, to collect in order (capped by a pick limit). */
+  open: number[];
+  /** Claimed coupons that match — the row's Found coupons. */
+  found: string[];
+  /** Claimed coupons that do not match. */
+  claimedOther: string[];
+  /** Open coupons that do not match. */
+  offeredOther: string[];
+  pickFull: boolean;
+}
+
+function cardKey(c: CouponCard): string {
+  return `${c.id}|${c.description}`;
+}
+
+export function planCoupons(
+  cards: Array<Pick<CouponCard, "state" | "description">>,
+  pick: { need: number; picked: number } | null,
+  wanted: WantedCoupon[],
+): CouponPlan {
+  const left = pick ? Math.max(0, pick.need - pick.picked) : Infinity;
+  const plan: CouponPlan = { open: [], found: [], claimedOther: [], offeredOther: [], pickFull: left === 0 };
+  cards.forEach((c, i) => {
+    const numbers = couponNumbers(c.description);
+    // A blank Coupons cell takes any coupon, recorded by its own numbers.
+    const hit = wanted.length ? matchCoupon(numbers, wanted)?.text ?? null : numbers.length ? describeCoupon(numbers) : "any";
+    if (c.state === "claimed") {
+      if (hit) {
+        if (!plan.found.includes(hit)) plan.found.push(hit);
+      } else plan.claimedOther.push(describeCoupon(numbers));
+    } else if (hit) {
+      if (plan.open.length < left) plan.open.push(i);
+    } else plan.offeredOther.push(describeCoupon(numbers));
+  });
+  return plan;
 }
 
 /**
- * Drives whatever screen is showing until the coupon is collected: spin,
- * "Answer now", the quiz, then Collect. Also the whole of a URL reward, which
- * is just the last screen.
+ * Drives whatever screen is showing until the row's coupons are collected:
+ * spin, "Answer now", the quiz, then each wanted coupon. Also the whole of a
+ * URL reward, which is just the last screen.
  */
-async function playThrough(tab: Page, label: string): Promise<RewardResult> {
+async function playThrough(tab: Page, label: string, r: RewardSpec): Promise<RowResult> {
+  const wanted = parseWantedCoupons(r.coupons);
+  if (r.coupons.trim() && wanted.length === 0) {
+    return { ok: false, retriable: false, reason: `Coupons cell unreadable: "${r.coupons.slice(0, 60)}"` };
+  }
+  const tries = new Map<string, number>();
+  /** Wanted coupons this row pressed Collect on. */
+  const pressed: string[] = [];
   let s = await nextScreen(tab, "unknown", 15_000);
-  let collectTries = 0;
 
   for (let i = 0; i < MAX_TRANSITIONS; i++) {
-    if (signedOut(tab)) {
-      return { ok: false, reason: "rewards page bounced to sign-in — the session is not logged in" };
-    }
+    if (signedOut(tab)) return SIGNED_OUT;
     console.log(`[bot] rewards: ${label} screen = ${s.kind}`);
 
     switch (s.kind) {
@@ -414,17 +436,16 @@ async function playThrough(tab: Page, label: string): Promise<RewardResult> {
         break;
 
       case "quiz": {
-        const pick = chooseAnswer(s.question, s.options);
+        const pick = chooseAnswer(s.options, r.answer);
         if (!pick) {
+          console.log(`[bot] rewards: quiz "${s.question}" [${s.options.join(" / ")}] has no option "${r.answer}"`);
           return {
             ok: false,
-            retriable: true,
-            reason:
-              `spin quiz has no known answer: "${s.question}" [${s.options.join(" / ")}]. ` +
-              `Answer it in the open browser tab and resume, or add it to KNOWN_ANSWERS in bot/src/reward.ts`,
+            retriable: false,
+            reason: `Answer "${r.answer}" is not an option (${s.options.join(" / ")})`,
           };
         }
-        console.log(`[bot] rewards: quiz "${s.question}" -> ${pick}`);
+        console.log(`[bot] rewards: quiz "${s.question}" -> ${pick}${r.answer ? "" : " (first option)"}`);
         await pause("reading the question");
         const exact = new RegExp(`^\\s*${pick.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*$`, "i");
         const option = tab.locator(MCQ_OPTION, { hasText: exact }).first();
@@ -434,67 +455,96 @@ async function playThrough(tab: Page, label: string): Promise<RewardResult> {
         break;
       }
 
-      case "collect":
-        if (++collectTries > 3) {
-          return { ok: false, reason: `the reward's Collect button did not take after 3 presses on ${tab.url()}` };
+      case "coupons": {
+        const plan = planCoupons(s.cards, s.pick, wanted);
+        console.log(
+          `[bot] rewards: coupons — ${s.cards.map((c) => `${describeCoupon(couponNumbers(c.description))} [${c.label}]`).join(", ") || "none"}` +
+            (s.pick ? ` · picked ${s.pick.picked}/${s.pick.need}` : ""),
+        );
+        const next = plan.open.length ? s.cards[plan.open[0]!] : undefined;
+        if (next) {
+          const key = cardKey(next);
+          const n = (tries.get(key) ?? 0) + 1;
+          tries.set(key, n);
+          const name = describeCoupon(couponNumbers(next.description));
+          if (n > COLLECT_ATTEMPTS) {
+            return { ok: false, reason: `Collect press had no effect on ${name} after ${COLLECT_ATTEMPTS} tries` };
+          }
+          await pause("before collecting");
+          const control = tab.locator(CONTROLS).nth(next.idx);
+          await control.scrollIntoViewIfNeeded().catch(() => {});
+          await control.click({ timeout: 10_000 });
+          console.log(`[bot] rewards: pressed ${next.label} on ${name}`);
+          const hit = wanted.length ? matchCoupon(couponNumbers(next.description), wanted)?.text : name;
+          if (hit && !pressed.includes(hit)) pressed.push(hit);
+          s = await afterCollect(tab, key, s.pick?.picked ?? -1);
+          break;
         }
-        await pause("before collecting");
-        await tab.locator(REWARD_BUTTON, { hasText: /collect/i }).first().click({ timeout: 10_000 });
-        console.log(`[bot] rewards: pressed Collect${s.prize ? ` (${s.prize})` : ""}`);
-        s = await nextScreen(tab, "collect", 15_000);
-        break;
 
-      case "pick": {
-        // The coupons on these pages have read identical so far: take them in order.
-        console.log(`[bot] rewards: pick ${s.need} of ${s.offered} coupons (${s.picked} picked) — ${s.prize}`);
-        const before = s.picked;
-        if (++collectTries > s.need + 3) {
-          return { ok: false, reason: `picked ${before} of ${s.need} coupons; the rest would not collect on ${tab.url()}` };
-        }
-        await pause("before picking a coupon");
-        const next = tab.locator(REWARD_BUTTON, { hasText: /collect/i }).filter({ visible: true }).first();
-        await next.scrollIntoViewIfNeeded().catch(() => {});
-        await next.click({ timeout: 10_000 });
-        // Wait for the counter to move rather than for the screen to change.
-        const deadline = Date.now() + 15_000;
-        do {
-          await sleep(1000);
-          s = await readScreen(tab);
-        } while (Date.now() < deadline && s.kind === "pick" && s.picked === before);
-        break;
-      }
-
-      case "collected":
+        // Nothing left to press: what the page shows now decides the row.
         await pause("after collecting");
-        return collectTries > 0
-          ? { ok: true, outcome: "collected", detail: `${label} collected${s.prize ? `: ${s.prize}` : ""}` }
-          : {
-              ok: true,
-              outcome: "already_redeemed",
-              detail: `${label} already collected${s.prize ? `: ${s.prize}` : ""} — nothing to do`,
-            };
-
-      case "wrong_answer":
+        const outcome = pressed.length ? ("collected" as const) : ("already_claimed" as const);
+        const verb = pressed.length ? "Collected" : "Already claimed";
+        if (plan.found.length) {
+          return { ok: true, outcome, found: plan.found, note: `${verb} ${plan.found.join(", ")}` };
+        }
+        if (pressed.length === 0 && plan.claimedOther.length) {
+          return { ok: true, outcome, found: [], note: `Already claimed ${plan.claimedOther.join(", ")} (not in Coupons)` };
+        }
+        if (pressed.length === 0 && plan.pickFull) {
+          return { ok: true, outcome, found: [], note: "Already claimed (pick limit reached)" };
+        }
+        if (pressed.length) {
+          return { ok: false, reason: `Collected ${pressed.join(", ")} but the page does not show it claimed` };
+        }
+        const offered = plan.offeredOther.length ? plan.offeredOther.join(", ") : "none";
         return {
           ok: false,
           retriable: false,
-          reason: "the spin quiz answer was rejected — this account cannot win the spin prize today",
+          reason: wanted.length ? `No wanted coupon (offered ${offered})` : "No coupon on the page",
         };
+      }
+
+      case "done":
+        console.log(`[bot] rewards: page says "${s.text}"`);
+        return pressed.length
+          ? { ok: true, outcome: "collected", found: pressed, note: `Collected ${pressed.join(", ")}` }
+          : { ok: true, outcome: "already_claimed", found: [], note: "Already claimed" };
+
+      case "wrong_answer":
+        return { ok: false, retriable: false, reason: "Quiz answer rejected — no prize today" };
 
       case "unknown":
+        console.log(`[bot] rewards: ${label}: unrecognised page ${tab.url()} — ${s.controls.join(", ")}`);
         return {
           ok: false,
-          reason:
-            `${label}: unrecognised page ${tab.url()}` +
-            (s.controls.length ? ` — controls: ${s.controls.join(", ")}` : ""),
+          reason: `Unrecognised page${s.controls.length ? ` (${s.controls.slice(0, 4).join(", ")})` : ""}`,
         };
     }
   }
-  return { ok: false, reason: `${label}: still not collected after ${MAX_TRANSITIONS} screens on ${tab.url()}` };
+  return { ok: false, reason: `Still not collected after ${MAX_TRANSITIONS} screens` };
+}
+
+/** After pressing Collect: until that coupon turns claimed, leaves, or the pick counter moves. */
+async function afterCollect(tab: Page, key: string, pickedBefore: number): Promise<Screen> {
+  const deadline = Date.now() + 15_000;
+  let s: Screen;
+  do {
+    await sleep(1000);
+    s = await readScreen(tab);
+    if (s.kind !== "coupons") {
+      if (s.kind !== "unknown") return s;
+      continue;
+    }
+    const card = s.cards.find((c) => cardKey(c) === key);
+    if (!card || card.state === "claimed") return s;
+    if (s.pick && s.pick.picked > pickedBefore) return s;
+  } while (Date.now() < deadline);
+  return s;
 }
 
 // ---------------------------------------------------------------------------
-// ACTIONS
+// STICKERS
 // ---------------------------------------------------------------------------
 
 interface TaskCard {
@@ -612,7 +662,7 @@ async function addAnyItemToCart(tab: Page): Promise<boolean> {
 
 /** Back to the task board and press "Refresh to check status" (an image link to the same page). */
 async function refreshTasks(tab: Page, taskUrl: string): Promise<TaskBoard> {
-  if (!/node=221530152031|streak/i.test(tab.url()) || (await readTasks(tab)).cards.length === 0) {
+  if ((await readTasks(tab)).cards.length === 0) {
     await goto(tab, taskUrl);
     await pause("back on the task page");
   }
@@ -629,23 +679,24 @@ async function refreshTasks(tab: Page, taskUrl: string): Promise<TaskBoard> {
   return waitForTasks(tab);
 }
 
-async function runActions(tab: Page): Promise<RewardResult> {
-  const funzone = await openFunZone(tab);
-  if (typeof funzone === "string") return { ok: false, reason: funzone };
-  await clickCard(tab, funzone, funzone.actions, "Complete actions");
+async function runStickers(tab: Page, r: RewardSpec): Promise<RowResult> {
+  const url = r.url.trim() || STICKERS_URL;
+  if (!amazonLink(url)) return { ok: false, retriable: false, reason: `reward_url is not an amazon.in link` };
+  console.log(`[bot] rewards: opening the sticker tasks ${url}`);
+  if (!(await goto(tab, url))) return { ok: false, reason: "Sticker page did not load" };
   await pause("letting the task page load");
+  if (signedOut(tab)) return SIGNED_OUT;
   const taskUrl = tab.url();
 
   const attempts = new Map<string, number>();
   let board = await waitForTasks(tab);
   if (board.cards.length === 0) {
-    return { ok: false, reason: `Complete actions page has no task cards on ${tab.url()}` };
+    console.log(`[bot] rewards: no task cards on ${tab.url()}`);
+    return { ok: false, reason: "No sticker tasks on the page" };
   }
 
   for (let round = 0; round < MAX_TASK_ROUNDS; round++) {
-    if (signedOut(tab)) {
-      return { ok: false, reason: "rewards page bounced to sign-in — the session is not logged in" };
-    }
+    if (signedOut(tab)) return SIGNED_OUT;
     console.log(`[bot] rewards: tasks ${describeBoard(board)}`);
 
     if (board.viewReward) {
@@ -653,20 +704,21 @@ async function runActions(tab: Page): Promise<RewardResult> {
       await tab.locator(VIEW_REWARD).first().click({ timeout: 10_000 });
       await tab.waitForLoadState("domcontentloaded").catch(() => {});
       await pause("letting the reward page load");
-      return playThrough(tab, "actions reward");
+      return playThrough(tab, "stickers reward", r);
     }
 
     const card = board.cards.find((c) => c.active);
     if (!card) {
-      return { ok: false, reason: `no task to start and no reward to view (${describeBoard(board)})` };
+      // Every task done and no reward left to view: the page says it is completed.
+      if (board.cards.every((c) => c.completed)) {
+        return { ok: true, outcome: "already_claimed", found: [], note: "Already completed" };
+      }
+      return { ok: false, reason: `No sticker task to start (${board.progress || describeBoard(board)})` };
     }
     const tries = (attempts.get(card.index) ?? 0) + 1;
     attempts.set(card.index, tries);
     if (tries > TASK_ATTEMPTS) {
-      return {
-        ok: false,
-        reason: `task "${card.title}" did not complete after ${TASK_ATTEMPTS} tries (${describeBoard(board)})`,
-      };
+      return { ok: false, reason: `Sticker task "${card.title}" not completed after ${TASK_ATTEMPTS} tries` };
     }
     const button = tab.locator(`${TASK_CARD}[data-engagement-streak-count="${card.index}"] ${TASK_BUTTON}`).first();
 
@@ -683,7 +735,7 @@ async function runActions(tab: Page): Promise<RewardResult> {
     }
 
     if (card.type !== "ADD_ITEM_TO_CART") {
-      return { ok: false, reason: `task "${card.title}" is a ${card.type || "unknown"} task, which is not automated` };
+      return { ok: false, retriable: false, reason: `Sticker task "${card.title}" (${card.type || "?"}) is not automated` };
     }
 
     // "Start", or "Try again" when a previous add did not count.
@@ -694,7 +746,8 @@ async function runActions(tab: Page): Promise<RewardResult> {
     await tab.waitForLoadState("domcontentloaded").catch(() => {});
     await pause("letting the task's page load");
     if (!(await addAnyItemToCart(tab))) {
-      return { ok: false, reason: `task "${card.title}": no Add to cart button that worked on ${tab.url()}` };
+      console.log(`[bot] rewards: no working Add to cart on ${tab.url()}`);
+      return { ok: false, reason: `Sticker task "${card.title}": could not add an item to the cart` };
     }
     await pause("after adding to cart");
     board = await refreshTasks(tab, taskUrl);
@@ -704,36 +757,37 @@ async function runActions(tab: Page): Promise<RewardResult> {
       board = await refreshTasks(tab, taskUrl);
     }
   }
-  return { ok: false, reason: `actions reward not reached after ${MAX_TASK_ROUNDS} rounds (${describeBoard(board)})` };
+  return { ok: false, reason: `Sticker reward not reached after ${MAX_TASK_ROUNDS} rounds` };
 }
 
 // ---------------------------------------------------------------------------
 // Entry
 // ---------------------------------------------------------------------------
 
-async function runSpin(tab: Page): Promise<RewardResult> {
-  const cards = await openFunZone(tab);
-  if (typeof cards === "string") return { ok: false, reason: cards };
-  await clickCard(tab, cards, cards.spin, "Play & win (spin wheel)");
+async function runSpin(tab: Page, r: RewardSpec): Promise<RowResult> {
+  const url = r.url.trim() || SPIN_URL;
+  if (!amazonLink(url)) return { ok: false, retriable: false, reason: `reward_url is not an amazon.in link` };
+  console.log(`[bot] rewards: opening the spin game ${url}`);
+  if (!(await goto(tab, url))) return { ok: false, reason: "Spin page did not load" };
   await pause("letting the spin wheel load");
-  return playThrough(tab, "spin reward");
+  return playThrough(tab, "spin reward", r);
 }
 
-async function runUrl(tab: Page, url: string): Promise<RewardResult> {
-  if (!url) return { ok: false, retriable: false, reason: "reward type is URL but reward_url is blank" };
-  if (!/^https?:\/\/(www\.)?(amazon\.in|amzn\.in)\//i.test(url)) {
-    return { ok: false, retriable: false, reason: `reward_url must be an amazon.in link, got "${url}"` };
-  }
+async function runUrl(tab: Page, r: RewardSpec): Promise<RowResult> {
+  const url = r.url.trim();
+  if (!url) return { ok: false, retriable: false, reason: "reward_url is blank" };
+  if (!amazonLink(url)) return { ok: false, retriable: false, reason: `reward_url is not an amazon.in link` };
   console.log(`[bot] rewards: opening ${url}`);
-  if (!(await goto(tab, url))) return { ok: false, reason: `could not load the reward link ${url}` };
+  if (!(await goto(tab, url))) return { ok: false, reason: "Reward page did not load" };
   await pause("letting the reward page load");
-  return playThrough(tab, "reward link");
+  return playThrough(tab, "reward link", r);
 }
 
-function runOne(tab: Page, r: RewardSpec): Promise<RewardResult> {
-  if (r.type === "spin") return runSpin(tab);
-  if (r.type === "actions") return runActions(tab);
-  return runUrl(tab, r.url.trim());
+async function runOne(tab: Page, r: RewardSpec): Promise<RowResult> {
+  if (r.type === "unknown") return { ok: false, retriable: false, reason: "Unknown reward type" };
+  if (r.type === "spin") return runSpin(tab, r);
+  if (r.type === "stickers") return runStickers(tab, r);
+  return runUrl(tab, r);
 }
 
 function describe(r: RewardSpec): string {
@@ -742,48 +796,59 @@ function describe(r: RewardSpec): string {
 
 /**
  * Every Reward row of this account, in sheet order, skipping COMPLETED ones.
- * Stops at the first failure: that row stays BLOCKED until the run is
- * released (which puts it back to PENDING) or resumed.
+ * Each row is marked BLOCKED, then COMPLETED with its found coupons, or left
+ * BLOCKED with the reason in its notes (a release puts it back to PENDING).
+ * A failed row does not stop the others, but fails the step.
  */
 export async function runCheckReward(
   page: Page,
   rewards: RewardSpec[],
-  mark: (r: RewardSpec, status: RewardMark) => Promise<void> = async () => {},
+  mark: (r: RewardSpec, status: RewardMark, extra?: RewardMarkExtra) => Promise<void> = async () => {},
 ): Promise<RewardResult> {
   if (rewards.length === 0) {
-    return { ok: true, outcome: "none_available", detail: "no reward set for this account — skipping" };
+    return { ok: false, retriable: false, reason: "No Reward rows for this account's reward code" };
   }
   const todo = rewards.filter((r) => !rewardDone(r));
   const skipped = rewards.length - todo.length;
   if (todo.length === 0) {
-    return { ok: true, outcome: "already_redeemed", detail: `all ${rewards.length} reward(s) already COMPLETED` };
+    return { ok: true, outcome: "all_completed", detail: `all ${rewards.length} reward(s) already COMPLETED` };
   }
 
   await pause("before checking rewards");
   const mobile = await openMobileTab(page);
   const notes: string[] = skipped ? [`${skipped} already COMPLETED`] : [];
+  const failures: string[] = [];
+  let retriable = false;
   let collected = false;
 
   for (const r of todo) {
     console.log(`[bot] rewards: -- ${describe(r)} --`);
     await mark(r, "BLOCKED");
-    let result: RewardResult;
+    let result: RowResult;
     try {
       result = await runOne(mobile.tab, r);
     } catch (err) {
-      result = { ok: false, reason: `reward step crashed: ${(err as Error).message.split("\n")[0]}` };
+      result = { ok: false, reason: `Reward step crashed: ${(err as Error).message.split("\n")[0]}` };
     }
-    if (!result.ok) {
-      // Left open so the operator can see — and finish — the reward by hand.
-      console.log(`[bot] rewards: leaving the mobile tab open at ${mobile.tab.url()}`);
-      await page.bringToFront().catch(() => {});
-      return { ...result, reason: [`${describe(r)}: ${result.reason}`, ...notes].join("; ") };
+    if (result.ok) {
+      await mark(r, "COMPLETED", { found_coupons: result.found.join("\n"), notes: result.note.slice(0, NOTE_MAX) });
+      collected ||= result.outcome === "collected";
+      notes.push(`${describe(r)}: ${result.note}`);
+      continue;
     }
-    await mark(r, "COMPLETED");
-    collected ||= result.outcome === "collected";
-    notes.push(`${describe(r)}: ${result.detail}`);
+    console.log(`[bot] rewards: ${describe(r)} failed — ${result.reason}`);
+    await mark(r, "BLOCKED", { notes: result.reason.slice(0, NOTE_MAX) });
+    failures.push(`${describe(r)}: ${result.reason}`);
+    retriable ||= result.retriable !== false;
+    if (result.fatal) break;
   }
 
+  if (failures.length) {
+    // Left open so the operator can see — and finish — the reward by hand.
+    console.log(`[bot] rewards: leaving the mobile tab open at ${mobile.tab.url()}`);
+    await page.bringToFront().catch(() => {});
+    return { ok: false, retriable, reason: [...failures, ...notes].join("; ") };
+  }
   await closeMobileTab(page, mobile);
-  return { ok: true, outcome: collected ? "collected" : "already_redeemed", detail: notes.join("; ") };
+  return { ok: true, outcome: collected ? "collected" : "already_claimed", detail: notes.join("; ") };
 }
