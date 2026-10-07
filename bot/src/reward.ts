@@ -1,5 +1,5 @@
 import { pause, shortPause, sleep } from "./human.js";
-import { rewardDone, type RewardMark, type RewardMarkExtra, type RewardSpec } from "./config.js";
+import { rewardActionable, rewardDone, type RewardMark, type RewardMarkExtra, type RewardSpec } from "./config.js";
 import { couponNumbers, describeCoupon, matchCoupon, parseWantedCoupons, type WantedCoupon } from "./coupons.js";
 import type { CDPSession, Page } from "./pw.js";
 
@@ -66,6 +66,11 @@ const CONTROLS = 'button, a, [role="button"], input[type="submit"], input[type="
 const OPEN_LABEL = /^(collect|collect now|redeem|redeem now)$/i;
 /** A coupon already collected. */
 const CLAIMED_LABEL = /^(order now|redeemed|collected)$|available to use/i;
+/**
+ * A claimed coupon whose card shows a plain label, not a button: "AVAILABLE TO
+ * USE DURING GREAT INDIAN FESTIVAL" on /rewards/checkoutCoupons.
+ */
+const CLAIMED_TEXT = /^available to use\b/i;
 const TAP_TO_SPIN = ".sw-tap-to-spin";
 /**
  * "Answer now" after the wheel stops. Campaigns differ: gSUN0DE shows it as
@@ -222,7 +227,7 @@ type Screen =
 async function readScreen(tab: Page): Promise<Screen> {
   return tab
     .evaluate(
-      ([tap, answer, mcq, reward, controlSel, openSrc, claimedSrc]) => {
+      ([tap, answer, mcq, reward, controlSel, openSrc, claimedSrc, claimedTextSrc]) => {
         const shown = (el: Element | null): boolean => {
           if (!el) return false;
           const r = el.getBoundingClientRect();
@@ -257,6 +262,7 @@ async function readScreen(tab: Page): Promise<Screen> {
         // buttons themselves count, so a deal's "Order now" is not a coupon.
         const open = new RegExp(openSrc!, "i");
         const claimed = new RegExp(claimedSrc!, "i");
+        const claimedText = new RegExp(claimedTextSrc!, "i");
         const rewardPage = /\/rewards\//.test(location.pathname) || !!document.querySelector(reward!);
         const all = [...document.querySelectorAll(controlSel!)];
         const hits: Array<{ el: HTMLElement; idx: number; label: string; state: "open" | "claimed" }> = [];
@@ -270,6 +276,18 @@ async function readScreen(tab: Page): Promise<Screen> {
           if (state === "open" && ((h as HTMLButtonElement).disabled || h.classList.contains("a-button-disabled"))) return;
           hits.push({ el: h, idx, label, state });
         });
+        // Claimed cards labelled by text alone: the innermost element saying so.
+        // idx -1: a claimed coupon is never pressed.
+        if (rewardPage) {
+          for (const el of document.querySelectorAll("div, span, p")) {
+            const h = el as HTMLElement;
+            const label = squash(h.innerText ?? "");
+            if (label.length > 80 || !claimedText.test(label) || !shown(el)) continue;
+            if ([...h.children].some((ch) => squash((ch as HTMLElement).innerText ?? "") === label)) continue;
+            if (hits.some((o) => o.el.contains(h) || h.contains(o.el))) continue;
+            hits.push({ el: h, idx: -1, label, state: "claimed" });
+          }
+        }
         // An a-button span and the button inside it are one control: keep the innermost.
         const controls = hits.filter((c) => !hits.some((o) => o !== c && c.el.contains(o.el)));
         const cards = controls.map((c) => {
@@ -315,7 +333,7 @@ async function readScreen(tab: Page): Promise<Screen> {
           .slice(0, 8);
         return { kind: "unknown" as const, controls: labels };
       },
-      [TAP_TO_SPIN, ANSWER_NOW, MCQ_OPTION, REWARD_BUTTON, CONTROLS, OPEN_LABEL.source, CLAIMED_LABEL.source] as const,
+      [TAP_TO_SPIN, ANSWER_NOW, MCQ_OPTION, REWARD_BUTTON, CONTROLS, OPEN_LABEL.source, CLAIMED_LABEL.source, CLAIMED_TEXT.source] as const,
     )
     .catch(() => ({ kind: "unknown" as const, controls: [] }));
 }
@@ -415,6 +433,9 @@ async function playThrough(tab: Page, label: string, r: RewardSpec): Promise<Row
   const tries = new Map<string, number>();
   /** Wanted coupons this row pressed Collect on. */
   const pressed: string[] = [];
+  /** The coupon page of the last Collect press, and whether it was reopened to check it. */
+  let couponUrl = "";
+  let rechecked = false;
   let s = await nextScreen(tab, "unknown", 15_000);
 
   for (let i = 0; i < MAX_TRANSITIONS; i++) {
@@ -471,6 +492,7 @@ async function playThrough(tab: Page, label: string, r: RewardSpec): Promise<Row
             return { ok: false, reason: `Collect press had no effect on ${name} after ${COLLECT_ATTEMPTS} tries` };
           }
           await pause("before collecting");
+          couponUrl = tab.url();
           const control = tab.locator(CONTROLS).nth(next.idx);
           await control.scrollIntoViewIfNeeded().catch(() => {});
           await control.click({ timeout: 10_000 });
@@ -515,6 +537,17 @@ async function playThrough(tab: Page, label: string, r: RewardSpec): Promise<Row
         return { ok: false, retriable: false, reason: "Quiz answer rejected — no prize today" };
 
       case "unknown":
+        // After a Collect the coupon page can re-render as a store page with
+        // no coupon on it (seen 2026-10-07 on gSUN0DE). Reopen it once: a
+        // collected coupon then shows "Order Now".
+        if (pressed.length && couponUrl && !rechecked) {
+          rechecked = true;
+          console.log(`[bot] rewards: ${label}: coupon gone after Collect (${tab.url()}) — reopening ${couponUrl}`);
+          if (!(await goto(tab, couponUrl))) return { ok: false, reason: "Coupon page did not reload after Collect" };
+          await pause("letting the coupon page reload");
+          s = await nextScreen(tab, "unknown", 15_000);
+          break;
+        }
         console.log(`[bot] rewards: ${label}: unrecognised page ${tab.url()} — ${s.controls.join(", ")}`);
         return {
           ok: false,
@@ -587,6 +620,34 @@ async function readTasks(tab: Page): Promise<TaskBoard> {
       [TASK_CARD, TASK_BUTTON, VIEW_REWARD] as const,
     )
     .catch(() => ({ cards: [], viewReward: false, progress: "" }));
+}
+
+/**
+ * The "Day N — Congratulations! Task completed." check-in popup (#checkInDialog)
+ * that can open over the task board once a task is done, covering View
+ * reward. Closed with its X rather than "Claim your prize": the board's View
+ * reward leads to the coupon page, where only the wanted coupons are taken.
+ */
+const CHECKIN_DIALOG = "#checkInDialog";
+const CHECKIN_CLOSE = '[data-mix-operations="closeCheckInDialog"]';
+
+/** True when the popup was showing and is now closed. */
+async function dismissCheckInDialog(tab: Page): Promise<boolean> {
+  const close = tab.locator(`${CHECKIN_DIALOG} ${CHECKIN_CLOSE}`).first();
+  if (!(await close.isVisible().catch(() => false))) return false;
+  console.log("[bot] rewards: closing the check-in popup over the task board");
+  await shortPause();
+  await close.click({ timeout: 10_000 }).catch(() => tab.keyboard.press("Escape").catch(() => {}));
+  for (const deadline = Date.now() + 5_000; Date.now() < deadline; ) {
+    if (!(await close.isVisible().catch(() => false))) break;
+    await sleep(500);
+  }
+  if (await close.isVisible().catch(() => false)) {
+    await tab.keyboard.press("Escape").catch(() => {});
+    await sleep(1000);
+  }
+  await pause("check-in popup closed");
+  return !(await close.isVisible().catch(() => false));
 }
 
 async function waitForTasks(tab: Page, budgetMs = 20_000): Promise<TaskBoard> {
@@ -666,6 +727,7 @@ async function refreshTasks(tab: Page, taskUrl: string): Promise<TaskBoard> {
     await goto(tab, taskUrl);
     await pause("back on the task page");
   }
+  await dismissCheckInDialog(tab);
   const refresh = tab.locator('a:has(img[src*="refresh" i])').first();
   if (await refresh.count()) {
     await refresh.scrollIntoViewIfNeeded().catch(() => {});
@@ -697,6 +759,8 @@ async function runStickers(tab: Page, r: RewardSpec): Promise<RowResult> {
 
   for (let round = 0; round < MAX_TASK_ROUNDS; round++) {
     if (signedOut(tab)) return SIGNED_OUT;
+    // Before anything on the board is pressed: the popup covers it.
+    if (await dismissCheckInDialog(tab)) board = await readTasks(tab);
     console.log(`[bot] rewards: tasks ${describeBoard(board)}`);
 
     if (board.viewReward) {
@@ -784,7 +848,6 @@ async function runUrl(tab: Page, r: RewardSpec): Promise<RowResult> {
 }
 
 async function runOne(tab: Page, r: RewardSpec): Promise<RowResult> {
-  if (r.type === "unknown") return { ok: false, retriable: false, reason: "Unknown reward type" };
   if (r.type === "spin") return runSpin(tab, r);
   if (r.type === "stickers") return runStickers(tab, r);
   return runUrl(tab, r);
@@ -808,15 +871,28 @@ export async function runCheckReward(
   if (rewards.length === 0) {
     return { ok: false, retriable: false, reason: "No Reward rows for this account's reward code" };
   }
-  const todo = rewards.filter((r) => !rewardDone(r));
-  const skipped = rewards.length - todo.length;
+  const open = rewards.filter((r) => !rewardDone(r));
+  const skipped = rewards.length - open.length;
+  // No type the bot knows and no url: nothing to do on that row.
+  const todo = open.filter(rewardActionable);
+  const ignored = open.length - todo.length;
   if (todo.length === 0) {
-    return { ok: true, outcome: "all_completed", detail: `all ${rewards.length} reward(s) already COMPLETED` };
+    return {
+      ok: true,
+      outcome: "all_completed",
+      detail: [
+        skipped && `${skipped} already COMPLETED`,
+        ignored && `${ignored} with no type or reward_url ignored`,
+      ].filter(Boolean).join("; "),
+    };
   }
 
   await pause("before checking rewards");
   const mobile = await openMobileTab(page);
-  const notes: string[] = skipped ? [`${skipped} already COMPLETED`] : [];
+  const notes: string[] = [
+    ...(skipped ? [`${skipped} already COMPLETED`] : []),
+    ...(ignored ? [`${ignored} with no type or reward_url ignored`] : []),
+  ];
   const failures: string[] = [];
   let retriable = false;
   let collected = false;

@@ -1,30 +1,49 @@
-import { rewardDone } from "./config.js";
+import { STEP_KEYS, type StepKey } from "@app/contracts";
 import type { SheetJob } from "./job-client.js";
 
 /**
- * An unfinished Reward row that is new or edited. A row turning COMPLETED is
- * the run's own progress, not an operator's change, so it moves nothing.
+ * RESUME STARTS WHERE THE OPERATOR ASKED (decided 2026-10-07). Sheet edits are
+ * still adopted — the runner gets the fresh job — but they only take effect in
+ * the steps that run from there. The one exception is the basket: changed
+ * Items (or an address's ItemsQuantity split) go back to clear_cart, because
+ * the cart already holds the old basket.
  */
-function rewardsChanged(previous: SheetJob, current: SheetJob): boolean {
-  const key = (r: SheetJob["rewards"][number]) => JSON.stringify([r.row, r.type, r.url, r.answer, r.coupons]);
-  const before = new Set((previous.rewards ?? []).map(key));
-  return (current.rewards ?? []).some((r) => !rewardDone(r) && !before.has(key(r)));
+
+/** By key, so inserting a step cannot point an edit at the wrong one. */
+const at = (key: StepKey): number => STEP_KEYS.indexOf(key);
+
+/** What the cart is built from: the items and how they split over the addresses. */
+function basketKey(job: SheetJob): string {
+  return JSON.stringify([job.items ?? [], (job.addresses ?? []).map((a) => a.itemsQuantity ?? "")]);
+}
+
+/**
+ * Everything an operator can edit, without the run's own progress (a Reward
+ * turning COMPLETED, a voucher turning USED) or the address rows' sheet row
+ * numbers, which are where order ids go, not edits.
+ */
+function editKey(job: SheetJob): string {
+  const address = (a: SheetJob["address"] | undefined) => {
+    if (!a) return null;
+    const { row: _row, ...rest } = a;
+    return rest;
+  };
+  return JSON.stringify([
+    job.credentials,
+    address(job.address),
+    (job.addresses ?? []).map(address),
+    job.items ?? [],
+    (job.rewards ?? []).map(({ status: _status, ...r }) => r),
+    job.payment?.method,
+    (job.payment?.codes ?? []).map(({ status: _status, ...c }) => c),
+  ]);
 }
 
 export function resumeStep(previous: SheetJob, current: SheetJob, requested: number): number {
-  const changed = (key: "credentials" | "address" | "items" | "payment") =>
-    JSON.stringify(previous[key]) !== JSON.stringify(current[key]);
-  let from = requested;
-  if (changed("credentials")) from = 0;
-  if (rewardsChanged(previous, current)) from = Math.min(from, 1);
-  if (changed("address") || JSON.stringify(previous.addresses ?? []) !== JSON.stringify(current.addresses ?? [])) {
-    from = Math.min(from, 2);
-  }
-  if (changed("items")) from = Math.min(from, 3);
-  if (changed("payment")) from = Math.min(from, 7);
-  return from;
+  return basketKey(previous) !== basketKey(current) ? Math.min(requested, at("clear_cart")) : requested;
 }
 
+/** Did the operator edit anything this run's runner should be handed? */
 export function inputsChanged(previous: SheetJob, current: SheetJob): boolean {
-  return resumeStep(previous, current, 10) !== 10;
+  return editKey(previous) !== editKey(current);
 }

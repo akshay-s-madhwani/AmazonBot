@@ -26,6 +26,8 @@ export interface SheetJob {
   payment: PaymentSpec;
   rewards: RewardSpec[];
   orderId: string;
+  /** Accounts.Proxy; the browser is launched through it. Blank = direct. */
+  proxy: string;
 }
 
 interface WireJob {
@@ -43,6 +45,7 @@ interface WireJob {
   payment: PaymentSpec;
   rewards?: Array<{ row: number; type: string; url: string; status: string; answer?: string; coupons?: string }> | null;
   orderId?: string;
+  proxy?: string | null;
 }
 
 function rewardsFromWire(rows: WireJob["rewards"]): RewardSpec[] {
@@ -77,6 +80,7 @@ export function fromWire(w: WireJob): SheetJob {
     payment: w.payment,
     rewards: rewardsFromWire(w.rewards),
     orderId: w.orderId ?? "",
+    proxy: (w.proxy ?? "").trim(),
   };
 }
 
@@ -224,6 +228,22 @@ export class JobClient {
     await this.call(`/node/jobs/${encodeURIComponent(job_id)}/rewards`, {
       method: "POST",
       body: JSON.stringify({ run_id, row_number: row, status, ...extra }),
+    });
+  }
+
+  /** A Vouchers row this run has used; the master writes "Used" to its status cell. */
+  async markVoucherUsed(job_id: string, run_id: string, row: number): Promise<void> {
+    await this.call(`/node/jobs/${encodeURIComponent(job_id)}/vouchers`, {
+      method: "POST",
+      body: JSON.stringify({ run_id, row_number: row, status: "USED" }),
+    });
+  }
+
+  /** Each Address row's order id(s); the master writes them to the Address tab's order id cells. */
+  async markAddressOrders(job_id: string, run_id: string, orders: Array<{ row_number: number; order_id: string }>): Promise<void> {
+    await this.call(`/node/jobs/${encodeURIComponent(job_id)}/address-orders`, {
+      method: "POST",
+      body: JSON.stringify({ run_id, orders }),
     });
   }
 

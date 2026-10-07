@@ -340,9 +340,14 @@ async function dismissAvsSuggestion(page: Page): Promise<void> {
  */
 export const ADDRESS_LINE_MAX = 60;
 
+/** Amazon collapses runs of spaces before it cuts, so "a  b" counts as "a b". */
+const cutLine = (v: string): string => v.replace(/\s+/g, " ").trim().slice(0, ADDRESS_LINE_MAX);
+
+/** Already-cut text -> key. Never re-cut: name + lines together run past 60. */
+const keyOf = (text: string, pincode: string): string => `${norm(text)}|${pincode.trim()}`;
+
 export function addressKey(parts: { name: string; line1: string; line2: string; pincode: string }): string {
-  const cut = (v: string) => v.trim().slice(0, ADDRESS_LINE_MAX);
-  return `${norm(`${cut(parts.name)} ${cut(parts.line1)} ${cut(parts.line2)}`)}|${parts.pincode.trim()}`;
+  return keyOf(`${cutLine(parts.name)} ${cutLine(parts.line1)} ${cutLine(parts.line2)}`, parts.pincode);
 }
 
 export function targetKey(t: TargetAddress): string {
@@ -360,14 +365,12 @@ export function checkoutAddressKey(text: string): string | null {
   if (parts.length < 5) return null;
   const pin = parts[parts.length - 2]!;
   if (!/^\d{6}$/.test(pin)) return null;
-  const head = parts.slice(0, -4).join(" ");
-  return addressKey({ name: head, line1: "", line2: "", pincode: pin });
+  return keyOf(parts.slice(0, -4).join(" "), pin);
 }
 
 /** The sheet address keyed the same way: name, line 1 and line 2 joined, each cut to Amazon's 60. */
 export function sheetAddressKey(t: TargetAddress): string {
-  const cut = (v: string) => v.trim().slice(0, ADDRESS_LINE_MAX);
-  return addressKey({ name: `${cut(t.fullName)} ${cut(t.line1)} ${cut(t.line2)}`, line1: "", line2: "", pincode: t.pincode });
+  return addressKey({ name: t.fullName, line1: t.line1, line2: t.line2, pincode: t.pincode });
 }
 
 function tileKey(t: Tile): string {

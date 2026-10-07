@@ -1,10 +1,11 @@
 import { createHash } from "node:crypto";
-import { writeFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { productIdentity, type BasketItem } from "./purchase-evidence.js";
 import type { Page } from "./pw.js";
 import type {
   Credentials,
+  PaymentCode,
   PaymentSpec,
   ProductSpec,
   RewardMark,
@@ -13,6 +14,7 @@ import type {
   TargetAddress,
 } from "./config.js";
 import { runLogin } from "./login.js";
+import { proxyUnreachable, type Proxy } from "./proxy.js";
 import { runCheckReward } from "./reward.js";
 import { runAddresses } from "./address.js";
 import { runApplyCoupon, runOpenProduct, runSetQuantity } from "./product.js";
@@ -26,6 +28,8 @@ import {
   runSelectAddresses,
 } from "./checkout.js";
 import { classifyFailure, type StepResult } from "./protocol.js";
+import { allocate } from "./allocation.js";
+import { runAddVouchers } from "./vouchers.js";
 
 /**
  * A hard stop for local debugging only. Keep it null in anything the panel
@@ -45,6 +49,10 @@ export interface StepContext {
   rewards: RewardSpec[];
   /** Records a Reward row's status on the master (and from there the sheet). */
   markReward?: (r: RewardSpec, status: RewardMark, extra?: RewardMarkExtra) => Promise<void>;
+  /** Records a Vouchers row as Used on the master (and from there the sheet). */
+  markVoucher?: (v: PaymentCode) => Promise<void>;
+  /** The proxy the browser was launched through; login checks it answers first. */
+  proxy?: Proxy | null;
   runId: string;
   artifactsDir: string;
 }
@@ -71,12 +79,10 @@ export function deliveryAddresses(ctx: Pick<StepContext, "address" | "addresses"
   return ctx.addresses.length > 0 ? ctx.addresses : [ctx.address];
 }
 
-/**
- * The cart quantity: every address receives the item's sheet quantity, so a
- * multi-address account needs quantity x addresses in the cart.
- */
-export function cartQuantity(item: ProductSpec, addressCount: number): ProductSpec {
-  return addressCount > 1 ? { ...item, quantity: item.quantity * addressCount } : item;
+/** What add_items put in the cart, with each item's per-address shares; null before add_items ran. */
+function readBasket(artifactsDir: string): BasketItem[] | null {
+  const path = join(artifactsDir, "expected-basket.json");
+  return existsSync(path) ? (JSON.parse(readFileSync(path, "utf8")) as BasketItem[]) : null;
 }
 
 export interface StepDef {
@@ -93,6 +99,12 @@ export const STEPS: StepDef[] = [
     timeoutMs: 300_000,
     inactivityMs: 120_000,
     run: async (page, ctx) => {
+      // Before the first Amazon page: a dead proxy fails here, by name.
+      if (ctx.proxy) {
+        const why = await proxyUnreachable(ctx.proxy);
+        if (why) return toResult({ ok: false, reason: `proxy ${ctx.proxy.label} unreachable: ${why}` });
+        console.log(`[bot] proxy ${ctx.proxy.label} answers`);
+      }
       const r = await runLogin(page, ctx.creds);
       return r.ok
         ? { status: "succeeded" }
@@ -159,19 +171,31 @@ export const STEPS: StepDef[] = [
         };
       }
 
+      const plan = allocate(ctx.products, deliveryAddresses(ctx));
+      if (typeof plan === "string") {
+        return { status: "failed", failure_code: "missing_field", detail: plan, retriable: false };
+      }
+
       const cleared = await runClearCart(page);
       if (!cleared.ok) return toResult(cleared);
 
       const expected: BasketItem[] = [];
-      const addressCount = deliveryAddresses(ctx).length;
-      for (const [i, sheetItem] of ctx.products.entries()) {
-        const item = cartQuantity(sheetItem, addressCount);
+      for (const [i, item] of ctx.products.entries()) {
+        // The Items quantity, with several addresses too: allocate() checked
+        // the addresses add up to it, and select_address spreads it.
         const label = `item ${i + 1}/${ctx.products.length}`;
-        console.log(`[bot] -- ${label}: ${item.url} x${item.quantity} --`);
+        console.log(
+          `[bot] -- ${label}: ${item.url} x${item.quantity}` +
+            (plan.multi ? ` (${plan.totals[i]} over ${plan.shares[i]!.join("/")})` : "") + " --",
+        );
 
         const opened = await runOpenProduct(page, item);
         if (!opened.ok) return toResult({ ok: false, reason: `${label}: ${opened.reason}` });
-        expected.push(await productIdentity(page, item));
+        expected.push({
+          ...(await productIdentity(page, item)),
+          quantity: plan.totals[i]!,
+          ...(plan.multi ? { shares: plan.shares[i]! } : {}),
+        });
 
         const qty = await runSetQuantity(page, item);
         if (!qty.ok) return toResult({ ok: false, reason: `${label}: ${qty.reason}` });
@@ -193,10 +217,30 @@ export const STEPS: StepDef[] = [
     run: async (page) => toResult(await runProceedToBuy(page)),
   },
   {
+    key: "add_vouchers",
+    // Each code waits on the page's verdict, with human pauses around it.
+    timeoutMs: 600_000,
+    inactivityMs: 120_000,
+    run: async (page, ctx) => {
+      const r = await runAddVouchers(page, ctx.payment.codes, ctx.artifactsDir, ctx.markVoucher);
+      if (r.status === "failed") return toResult({ ok: false, reason: r.reason });
+      console.log(`[bot] ✓ ${r.detail}`);
+      return { status: r.status === "done" ? "succeeded" : "skipped" };
+    },
+  },
+  {
     key: "select_address",
     timeoutMs: 120_000,
     inactivityMs: 60_000,
-    run: async (page, ctx) => toResult(await runSelectAddresses(page, deliveryAddresses(ctx))),
+    run: async (page, ctx) => {
+      const targets = deliveryAddresses(ctx);
+      if (targets.length < 2) return toResult(await runSelectAddresses(page, targets, []));
+      const basket = readBasket(ctx.artifactsDir);
+      if (!basket?.length || basket.some((b) => b.shares?.length !== targets.length)) {
+        return toResult({ ok: false, reason: "no per-address basket from add_items - run add_items again" });
+      }
+      return toResult(await runSelectAddresses(page, targets, basket));
+    },
   },
   {
     key: "select_payment",
@@ -205,18 +249,16 @@ export const STEPS: StepDef[] = [
     run: async (page, ctx) => toResult(await runApplyPayment(page, ctx.payment)),
   },
   {
-    key: "confirm_order",
-    timeoutMs: 180_000,
-    inactivityMs: 180_000,
-    run: async (page, ctx) =>
-      toResult(await runPlaceOrder(page, idempotencyKey(ctx), ctx.artifactsDir, deliveryAddresses(ctx))),
-  },
-  {
+    // Pay Now (skipped when this run already pressed it), then the ids from
+    // Your Orders. Was confirm_order + note_order_id until 2026-10-07.
     key: "note_order_id",
-    timeoutMs: 120_000,
-    inactivityMs: 60_000,
-    run: async (page, ctx) =>
-      toResult(await runNoteOrderId(page, idempotencyKey(ctx), ctx.artifactsDir, deliveryAddresses(ctx))),
+    timeoutMs: 300_000,
+    inactivityMs: 180_000,
+    run: async (page, ctx) => {
+      const placed = await runPlaceOrder(page, idempotencyKey(ctx), ctx.artifactsDir, deliveryAddresses(ctx));
+      if (!placed.ok) return toResult(placed);
+      return toResult(await runNoteOrderId(page, idempotencyKey(ctx), ctx.artifactsDir, deliveryAddresses(ctx)));
+    },
   },
 ];
 

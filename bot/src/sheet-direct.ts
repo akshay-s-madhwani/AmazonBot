@@ -395,6 +395,8 @@ function toJob(row: string[], rowNumber: number, snap: Snapshot): SheetJob {
     addresses: [],
     rewards: [],
     orderId: cell(row, col.order_id),
+    // The old single-tab layout has no Proxy column.
+    proxy: "",
   };
 }
 

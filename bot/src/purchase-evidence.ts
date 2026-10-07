@@ -3,7 +3,14 @@ import type { ProductSpec, TargetAddress } from "./config.js";
 import { PRODUCT_TITLE } from "./product.js";
 import { checkoutAddressKey, sheetAddressKey } from "./address.js";
 
-export interface BasketItem { sku: string; quantity: number; title: string }
+export interface BasketItem {
+  sku: string;
+  /** Units over every address. */
+  quantity: number;
+  title: string;
+  /** Multi-address: units per delivery address, in address order. Absent = an even split. */
+  shares?: number[];
+}
 export interface CheckoutEvidence { items: BasketItem[]; address: string }
 export interface OrderEvidence { id: string; placedAt: string | null; items: BasketItem[]; cancelled: boolean }
 const normalized = (text: string) => text.toLowerCase().replace(/[^a-z0-9]/g, "");
@@ -118,9 +125,9 @@ export async function readReviewShipments(page: Page): Promise<Shipment[]> {
 const sameTitle = (a: string, b: string) => normalized(a).slice(0, 40) === normalized(b).slice(0, 40);
 
 /**
- * Before buying: every sheet address gets every basket item at its share of
- * the quantity (each address receives the item's sheet quantity), and nothing
- * ships anywhere else.
+ * Before buying: every sheet address gets each basket item at its share (the
+ * item's `shares`, else an even split of the quantity), and nothing ships
+ * anywhere else.
  */
 export function reviewError(expected: BasketItem[], targets: TargetAddress[], shipments: Shipment[]): string | null {
   if (!expected.length || expected.some((i) => !i.title || !Number.isInteger(i.quantity) || i.quantity < 1)) {
@@ -131,14 +138,21 @@ export function reviewError(expected: BasketItem[], targets: TargetAddress[], sh
   const want = new Map(targets.map((t) => [sheetAddressKey(t), t]));
   const stray = shipments.find((s) => !s.key || !want.has(s.key));
   if (stray) return `checkout ships to an address that is not in the sheet: ${stray.name}`;
-  for (const [key, t] of want) {
+  for (const [a, t] of targets.entries()) {
+    const key = sheetAddressKey(t);
     const here = shipments.filter((s) => s.key === key).flatMap((s) => s.items);
     if (!here.length) return `nothing ships to ${t.fullName}`;
     const extra = here.find((it) => !expected.some((e) => sameTitle(e.title, it.title)));
     if (extra) return `${t.fullName} gets an item that was not requested: ${extra.title.slice(0, 50)}`;
     for (const e of expected) {
-      if (e.quantity % targets.length !== 0) return `${e.title.slice(0, 40)}: quantity ${e.quantity} does not split over ${targets.length} addresses`;
-      const per = e.quantity / targets.length;
+      let per: number;
+      if (e.shares) {
+        if (e.shares.length !== targets.length) return "expected basket does not match the delivery addresses";
+        per = e.shares[a]!;
+      } else {
+        if (e.quantity % targets.length !== 0) return `${e.title.slice(0, 40)}: quantity ${e.quantity} does not split over ${targets.length} addresses`;
+        per = e.quantity / targets.length;
+      }
       const got = here.filter((it) => sameTitle(e.title, it.title)).reduce((n, it) => n + it.quantity, 0);
       if (got !== per) return `${t.fullName}: ${e.title.slice(0, 40)} x${got}, expected x${per}`;
     }
@@ -165,6 +179,17 @@ export async function readOrderCards(page: Page): Promise<OrderCard[]> {
 }
 
 /**
+ * Does this Your Orders card ship to this address? By Ship to name: exact, so
+ * "suresh 1" is not "suresh 10"; a prefix only when Amazon cut the name with "…".
+ */
+export function shipsTo(c: Pick<OrderCard, "shipTo">, t: Pick<TargetAddress, "fullName">): boolean {
+  const nameOf = (v: string) => normalized(v.replace(/\.{3}|…/g, ""));
+  const ship = nameOf(c.shipTo);
+  if (!ship) return false;
+  return /\.{3}|…/.test(c.shipTo) ? nameOf(t.fullName).startsWith(ship) : nameOf(t.fullName) === ship;
+}
+
+/**
  * The orders this purchase made: the ones on Your Orders that were not there
  * just before it was placed. Each must ship to a sheet address, and every
  * sheet address must have one (Amazon makes one order per address, sometimes
@@ -178,14 +203,9 @@ export function newOrdersFor(
   const known = new Set(knownIds);
   const fresh = cards.filter((c) => !known.has(c.id) && !c.cancelled);
   if (!fresh.length) return { ok: false, reason: "no new order on Your Orders" };
-  const nameOf = (v: string) => normalized(v.replace(/\.{3}|…/g, ""));
-  const matches = (c: OrderCard, t: TargetAddress) => {
-    const ship = nameOf(c.shipTo);
-    return !!ship && nameOf(t.fullName).startsWith(ship);
-  };
-  const stray = fresh.find((c) => !targets.some((t) => matches(c, t)));
+  const stray = fresh.find((c) => !targets.some((t) => shipsTo(c, t)));
   if (stray) return { ok: false, reason: `new order ${stray.id} ships to "${stray.shipTo}", not a sheet address` };
-  const missing = targets.filter((t) => !fresh.some((c) => matches(c, t)));
+  const missing = targets.filter((t) => !fresh.some((c) => shipsTo(c, t)));
   if (missing.length) return { ok: false, reason: `no new order for ${missing.map((t) => t.fullName).join(", ")}` };
   return { ok: true, orders: fresh };
 }

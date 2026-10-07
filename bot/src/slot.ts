@@ -11,6 +11,7 @@ import { requireJobClient, type SheetJob } from "./job-client.js";
 import { appendEvent, makeEvent, openLog, tee } from "./logs.js";
 import { launchForRun, touchProfile, type LaunchedBrowser } from "./shardx.js";
 import { inputsChanged, resumeStep } from "./resume-inputs.js";
+import { parseAccountProxy, type Proxy } from "./proxy.js";
 
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -506,11 +507,31 @@ const http = createServer(async (req, res) => {
       if (!fresh.job) return json(res, 409, { error: "latest sheet row is unavailable" });
       const file = join(artifactsDir, "job.json");
       const previous = JSON.parse(readFileSync(file, "utf8")) as SheetJob;
-      from = resumeStep(previous, fresh.job, from);
+      // The browser was launched through the old proxy and cannot switch:
+      // a new proxy is a new attempt in a new browser, like a new account.
+      if ((previous.proxy ?? "") !== (fresh.job.proxy ?? "")) {
+        await requireJobClient().requestRetry(runId);
+        json(res, 202, { ok: true, mode: "fresh-attempt", detail: "proxy changed; new attempt queued, closing the previous browser" });
+        await shutdown(0);
+        return;
+      }
+      const asked = from;
+      // An order placed by this run is final: a sheet edit cannot send it back
+      // to rebuild the cart. Only a New attempt buys again.
+      const placed = existsSync(join(artifactsDir, "orders-placed.json")) &&
+        readFileSync(join(artifactsDir, "orders-placed.json"), "utf8").trim().length > 2;
+      if (!placed) from = resumeStep(previous, fresh.job, from);
+      // Says what the master answered, so "the sheet edit was not picked up" can be told
+      // apart from "the master had not seen the edit yet".
+      log(
+        inputsChanged(previous, fresh.job)
+          ? `sheet inputs changed since this browser started — resuming from step ${from} (asked ${asked})`
+          : `sheet inputs unchanged (revision ${fresh.job.revision})`,
+      );
       if (inputsChanged(previous, fresh.job)) {
         await terminateRunner();
         writeFileSync(file, JSON.stringify(fresh.job));
-        if (from <= 4) rmSync(join(artifactsDir, "expected-basket.json"), { force: true });
+        if (from <= 4 && !placed) rmSync(join(artifactsDir, "expected-basket.json"), { force: true });
       }
     }
     for (const s of steps) {
@@ -619,6 +640,13 @@ async function shutdown(code: number): Promise<void> {
     log(`error closing browser: ${(err as Error).message}`);
   }
   process.exit(code);
+}
+
+/** The run's proxy from its job snapshot; null = direct. Throws on one that does not read. */
+function resolveProxy(): Proxy | null {
+  if (!JOB_ID) return parseAccountProxy(process.env.BOT_PROXY ?? "");
+  const job = JSON.parse(readFileSync(join(artifactsDir, "job.json"), "utf8")) as { proxy?: string };
+  return parseAccountProxy(job.proxy ?? "");
 }
 
 function resolveAccount(cfg: { credentials: { email: string } }): string {
@@ -736,8 +764,11 @@ async function main(): Promise<void> {
   }
 
   const account = resolveAccount(cfg);
+  // Set at launch, so not one request — the first Amazon page included — leaves without it.
+  const proxy = resolveProxy();
+  log(proxy ? `proxy ${proxy.label}` : "no proxy — the machine's own connection");
   // A fresh profile for every run; a relaunch for the same run gets that run's back.
-  const launched = await launchForRun({ runId, headless });
+  const launched = await launchForRun({ runId, headless, ...(proxy ? { proxy: proxy.url } : {}) });
   profileId = launched.profileId;
   profileTouchedAt = Date.now();
   log(`account ${account} on profile ${profileId}`);

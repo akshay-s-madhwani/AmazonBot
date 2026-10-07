@@ -10,6 +10,13 @@ export interface FailureRule {
 
 export const FAILURE_RULES: FailureRule[] = [
   {
+    code: "proxy_unreachable",
+    category: "ACCOUNT",
+    match: /^proxy .*(unreachable|not https?:\/\/host:port)|ERR_PROXY|ERR_TUNNEL_CONNECTION_FAILED/i,
+    fix: "The account's proxy did not answer. Fix or replace it in the Accounts tab's Proxy column; a changed proxy starts a new attempt in a new browser.",
+    adminFixable: true,
+  },
+  {
     code: "account_not_found",
     category: "ACCOUNT",
     match: /cannot find an account|no account found|not registered/i,
@@ -148,22 +155,22 @@ export const FAILURE_RULES: FailureRule[] = [
   {
     code: "voucher_invalid",
     category: "PAYMENT",
-    match: /promotional code .*not valid|not a valid|isn'?t valid|invalid code/i,
-    fix: "Amazon rejected the code. Replace `payment_codes` (Sheet1 col O) with a valid one, then resume.",
+    match: /promotional code .*not valid|not a valid|isn'?t valid|invalid code|invalid gift card/i,
+    fix: "Amazon rejected the voucher. Fix its code in the Vouchers tab, then rerun add_vouchers.",
     adminFixable: true,
   },
   {
     code: "voucher_expired",
     category: "PAYMENT",
     match: /expired|already (been )?(redeemed|used)/i,
-    fix: "The code is spent or expired. Put a fresh code in `payment_codes` (Sheet1 col O), then resume.",
+    fix: "The voucher is expired. Add a fresh one to the account's batch in the Vouchers tab, then rerun add_vouchers.",
     adminFixable: true,
   },
   {
     code: "balance_insufficient",
     category: "PAYMENT",
     match: /balance .*(cannot cover|did not become usable|insufficient)|still cannot cover/i,
-    fix: "The credit does not cover the order total. Add more codes to `payment_codes` (Sheet1 col O) — the failure line shows the shortfall — then resume.",
+    fix: "The balance does not cover the order total. Add an Apay voucher to the account's batch in the Vouchers tab — the failure line shows the shortfall — then rerun add_vouchers.",
     adminFixable: true,
   },
   {
@@ -199,14 +206,14 @@ export const FAILURE_RULES: FailureRule[] = [
     code: "payment_not_applied_in_session",
     category: "SITE",
     match: /never finished applying the payment method|setting your payment method/i,
-    fix: "The payment method was not applied in THIS browser session. Resume from the select_payment step (`&from=7`), not from confirm_order — a resumed runner starts with a fresh page.",
+    fix: "The payment method was not applied in THIS browser session. Resume from the select_payment step, not from note_order_id — a resumed runner starts with a fresh page.",
     adminFixable: true,
   },
   {
     code: "checkout_stalled",
     category: "SITE",
-    match: /did not settle|still on the cart page|checkout did not/i,
-    fix: "Checkout stalled mid-redirect. Resume to retry the same step.",
+    match: /did not settle|still on the cart page|checkout did not|not at checkout/i,
+    fix: "Checkout stalled or was left. Run from Proceed to buy.",
     adminFixable: true,
   },
   {

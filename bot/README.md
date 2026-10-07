@@ -19,13 +19,15 @@ standalone diagnostics can read configuration from env. The ordered pipeline is:
    purchase option, set quantity, apply any coupon, add to cart. Re-empties the
    cart first, so a retry cannot double-add.
 5. **proceed_to_buy** — SOP step 6.
-6. **select_address** — SOP step 7; requires one unambiguous PIN match and the requested address line.
-7. **select_payment** — SOP step 8: Amazon Pay balance / voucher codes.
-8. **confirm_order** — SOP step 9. ⚠ **Places the order.** See below.
-9. **note_order_id** — SOP step 10: records the `NNN-NNNNNNN-NNNNNNN` id to
+6. **add_vouchers** — the account's vouchers (Vouchers tab, by batch id), each
+   added to the Amazon Pay balance on the claim-code page. See Payment below.
+7. **select_address** — SOP step 7; requires one unambiguous PIN match and the requested address line.
+8. **select_payment** — SOP step 8: pays with the Amazon Pay balance.
+9. **confirm_order** — SOP step 9. ⚠ **Places the order.** See below.
+10. **note_order_id** — SOP step 10: records the `NNN-NNNNNNN-NNNNNNN` id to
    `artifacts/<run-id>/order-id.txt` and flags a cancelled order.
 
-The number **is** the resume address: `/resume?token=…&from=7` restarts at
+The number **is** the resume address: `/resume?token=…&from=8` restarts at
 `select_payment`. Inserting a step renumbers everything after it.
 
 If a listing can't offer the requested quantity, the run **stops and says so**
@@ -257,21 +259,19 @@ must stop before a replacement starts.
 
 ## Payment
 
-Exactly two methods, set per user row:
+An account's vouchers are the Vouchers-tab rows whose `batch id` matches the
+Accounts row's. `add_vouchers` (right after Proceed to Buy) adds every code,
+whatever its `type`, on <https://www.amazon.in/apay-products/gc/claimCode>
+("Add to Amazon Pay Balance"), one at a time, reloading the page after each
+submit. It never uses checkout's promo-code field.
 
-| `payment_method` | `payment_codes` | Meaning |
-| --- | --- | --- |
-| `voucher` | `SVDEE8XBMBF4X` | A shopping voucher applied at checkout |
-| `amazon_pay` | `CODE1:71, CODE2:98` | One or more codes redeemed to Amazon Pay balance, then paid from balance. The `:amount` suffix is optional and informational — several codes can be needed to cover one total. |
+Each code used is marked `Used` in the Vouchers tab's `status` column (add the
+column if the tab lacks it), and `Used` rows are never redeemed again. A code
+Amazon rejects does not stop the others; the step fails at the end naming it.
+With no vouchers, or all of them Used, the step is skipped.
 
-Both are redeemed through the checkout's "Enter Code / Apply" field and then paid
-from the resulting balance.
-
-> **Codes are single-use.** Redeeming one consumes it, and a failed order does
-> not give it back. So `select_payment` is a **DRY RUN by default**: it reports
-> the order total, the balance row and the codes it *would* redeem, then stops.
-> Set `PAYMENT_APPLY_CODES=true` in `bot/.env` only once you've checked the
-> numbers add up, then resume.
+`select_payment` then checks the balance covers the order total and pays with
+it.
 
 ## ⚠ Placing orders
 
@@ -313,7 +313,6 @@ dotenv library):
 | `PRODUCT_URL` | yes | Full `amazon.in` URL or short `amzn.in/d/...` link |
 | `PRODUCT_QUANTITY` | no | Positive integer, default `1` |
 | `PRODUCT_PURCHASE_OPTION` | no | `auto` (default) / `subscribe_save` / `one_time` / `fresh` |
-| `PAYMENT_APPLY_CODES` | no | `true` to actually redeem payment codes. **Default off** (dry run) because codes are single-use |
 
 `ADDRESS_CITY` and `ADDRESS_STATE` are only a **fallback**: Amazon auto-fills
 city/state from the PIN code and overwriting its canonical spelling makes it

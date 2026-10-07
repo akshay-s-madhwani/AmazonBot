@@ -199,8 +199,12 @@ async function handleEmail(page: Page, email: string): Promise<void> {
   await submitEnclosingForm(input);
 }
 
+/** Fixed, not scaled by BOT_PACE: a password typed the instant the page appears gets bounced. */
+const PASSWORD_WAIT_MS = 3_000;
+
 async function handlePassword(page: Page, password: string): Promise<void> {
-  await pause("password step");
+  console.log(`[bot] waiting ${PASSWORD_WAIT_MS / 1000}s (password step)`);
+  await sleep(PASSWORD_WAIT_MS);
   const input = await firstLocator(page, SEL.password);
   if (!input) throw new Error("password field not found");
   await input.fill(password);

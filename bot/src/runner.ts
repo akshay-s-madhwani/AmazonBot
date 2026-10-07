@@ -7,6 +7,7 @@ import { postEvent, type RunnerConfig, type StepResult } from "./protocol.js";
 import { LAST_STEP, LAST_STEP_INDEX, STEPS, stepAt, type StepContext } from "./steps.js";
 import { describeForOperator } from "./failures.js";
 import type { SheetJob } from "./job-client.js";
+import { parseAccountProxy } from "./proxy.js";
 
 
 const STEP_SETTLE_MS = 350;
@@ -82,7 +83,7 @@ let pauseRequested = false;
  */
 let captureNow: (() => Promise<string | null>) | null = null;
 
-const COMMIT_STEP_INDEX = STEPS.findIndex((s) => s.key === "confirm_order");
+const COMMIT_STEP_INDEX = STEPS.findIndex((s) => s.key === "note_order_id");
 
 function ensureControlServer(cfg: RunnerConfig, live: { index: number }): Promise<number> {
   if (controlServer) return Promise.resolve(controlPort);
@@ -186,7 +187,7 @@ async function awaitContinue(
   });
 }
 
-type JobData = Pick<StepContext, "creds" | "address" | "addresses" | "products" | "payment" | "rewards">;
+type JobData = Pick<StepContext, "creds" | "address" | "addresses" | "products" | "payment" | "rewards" | "proxy">;
 
 async function loadJob(
   jobId: string,
@@ -225,6 +226,7 @@ async function loadJob(
       products: job.items,
       payment: job.payment,
       rewards: job.rewards ?? [],
+      proxy: parseAccountProxy(job.proxy ?? ""),
     };
   }
 
@@ -237,6 +239,7 @@ async function loadJob(
     addresses: [],
     products: [loadProduct()],
     payment: { method: "none", codes: [] },
+    proxy: parseAccountProxy(process.env.BOT_PROXY ?? ""),
     rewards: rewardType
       ? [{
           row: 0,
@@ -337,6 +340,23 @@ async function capture(
   }
 }
 
+/**
+ * A used voucher goes to the master, which writes "Used" to the Vouchers tab.
+ * Best effort, like rewardMarker: add_vouchers also remembers it locally.
+ */
+function voucherMarker(jobId: string, runId: string): NonNullable<StepContext["markVoucher"]> {
+  return async (v) => {
+    if (!v.row) return;
+    try {
+      const { requireJobClient } = await import("./job-client.js");
+      await requireJobClient().markVoucherUsed(jobId, runId, v.row);
+      console.log(`[runner] Vouchers row ${v.row} -> Used`);
+    } catch (err) {
+      console.warn(`[runner] could not mark Vouchers row ${v.row} Used: ${(err as Error).message}`);
+    }
+  };
+}
+
 async function main(): Promise<number> {
   loadDotEnv();
   const cfg = parseConfig();
@@ -348,7 +368,7 @@ async function main(): Promise<number> {
     ...(await loadJob(jobId, cfg.artifacts_dir)),
     runId: cfg.run_id,
     artifactsDir: cfg.artifacts_dir,
-    ...(jobId ? { markReward: rewardMarker(jobId, cfg.run_id) } : {}),
+    ...(jobId ? { markReward: rewardMarker(jobId, cfg.run_id), markVoucher: voucherMarker(jobId, cfg.run_id) } : {}),
   };
 
   console.log(`[runner ${process.pid}] connecting over CDP to ${cfg.cdp_url}`);

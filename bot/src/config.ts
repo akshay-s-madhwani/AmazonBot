@@ -18,6 +18,12 @@ export type PaymentMethod = "voucher" | "amazon_pay" | "none";
 export interface PaymentCode {
   code: string;
   amount?: number;
+  /** Vouchers tab row, where its "Used" mark goes. Absent outside the sheet. */
+  row?: number;
+  /** apay: redeem into the Amazon Pay balance; coupon: apply at checkout. */
+  type?: "apay" | "coupon" | "unknown";
+  /** Vouchers.status, upper-cased; "USED" is not redeemed again. */
+  status?: string;
 }
 
 export interface PaymentSpec {
@@ -43,6 +49,8 @@ export function parsePaymentCodes(raw: string): PaymentCode[] {
 export type PurchaseOption = "auto" | "one_time" | "subscribe_save" | "fresh";
 
 export interface ProductSpec {
+  /** Items.item_id: what a multi-address account's ItemsQuantity names. */
+  itemId?: string;
   applyCoupon?: boolean;
   url: string;
   quantity: number;
@@ -85,14 +93,21 @@ export function rewardDone(r: RewardSpec): boolean {
   return r.status.trim().toUpperCase() === "COMPLETED";
 }
 
-/** Sheet spelling -> RewardType. Blank type with a url means URL. */
+/**
+ * A row check_reward can act on: SPIN / STICKERS, or anything with a
+ * reward_url. A row with neither a known type nor a url is left alone.
+ */
+export function rewardActionable(r: RewardSpec): boolean {
+  return r.type === "spin" || r.type === "stickers" || r.url.trim() !== "";
+}
+
+/** Sheet spelling -> RewardType. SPIN / STICKERS by name; anything else with a url means URL. */
 export function parseRewardType(raw: string, url = ""): RewardType | null {
   const t = raw.trim().toLowerCase().replace(/[\s-]+/g, "_");
   if (t === "url" || t === "link") return "url";
   if (t === "spin" || t === "spin_wheel" || t === "spinwheel") return "spin";
   if (t === "stickers" || t === "sticker" || t === "actions" || t === "action") return "stickers";
-  if (!t && url.trim()) return "url";
-  return null;
+  return url.trim() ? "url" : null;
 }
 
 export interface TargetAddress {
@@ -105,6 +120,10 @@ export interface TargetAddress {
   city: string;
   state: string;
   country: string;
+  /** Multi-address only: the ItemsQuantity cell, "item_id_quantity" per line. See allocation.ts. */
+  itemsQuantity?: string;
+  /** The Address-tab row (fleet jobs): where note_order_id's order id for this address goes. */
+  row?: number;
 }
 
 export function loadDotEnv(): void {
@@ -222,7 +241,7 @@ export function loadAddress(env: NodeJS.ProcessEnv = process.env): TargetAddress
     country: get("ADDRESS_COUNTRY") || "India",
   };
 
-  const required: Array<[keyof TargetAddress, string]> = [
+  const required: Array<[Exclude<keyof TargetAddress, "itemsQuantity" | "row">, string]> = [
     ["fullName", "ADDRESS_NAME"],
     ["phone", "ADDRESS_PHONE"],
     ["pincode", "ADDRESS_PINCODE"],

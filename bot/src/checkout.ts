@@ -5,7 +5,7 @@ import { checkoutAddressKey, sheetAddressKey } from "./address.js";
 export { checkoutAddressKey, sheetAddressKey } from "./address.js";
 import { pause, shortPause, sleep } from "./human.js";
 import { requireJobClient } from "./job-client.js";
-import { newOrdersFor, readOrderCards, readReviewShipments, reviewError, type BasketItem } from "./purchase-evidence.js";
+import { newOrdersFor, readOrderCards, readReviewShipments, reviewError, shipsTo, type BasketItem, type OrderCard } from "./purchase-evidence.js";
 import type { Locator, Page } from "./pw.js";
 
 
@@ -15,7 +15,7 @@ const NAV_TIMEOUT_MS = 45_000;
 
 export type CheckoutResult = { ok: true; detail: string } | { ok: false; reason: string };
 
-async function firstVisible(page: Page, selectors: string[]): Promise<Locator | null> {
+export async function firstVisible(page: Page, selectors: string[]): Promise<Locator | null> {
   for (const sel of selectors) {
     const loc = page.locator(sel).first();
     if ((await loc.count()) > 0 && (await loc.isVisible().catch(() => false))) return loc;
@@ -23,7 +23,7 @@ async function firstVisible(page: Page, selectors: string[]): Promise<Locator | 
   return null;
 }
 
-async function waitForFirstVisible(
+export async function waitForFirstVisible(
   page: Page,
   selectors: string[],
   timeoutMs = 20_000,
@@ -46,10 +46,32 @@ async function clickAndSettle(loc: Locator, page: Page, why: string): Promise<vo
 }
 
 
-async function readCart(
-  page: Page,
-): Promise<{ navCount: number; activeItems: number; emptyText: boolean }> {
+const CART_SETTLE_MS = 20_000;
+
+type CartState = { navCount: number; activeItems: number; emptyText: boolean };
+
+/**
+ * Opens the cart. Amazon can redirect the cart URL (e.g. to /cart/ref=...)
+ * while it loads, which aborts the goto even though the cart then shows.
+ */
+async function openCart(page: Page): Promise<void> {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      await page.goto(CART_URL, { waitUntil: "domcontentloaded", timeout: NAV_TIMEOUT_MS });
+      return;
+    } catch (err) {
+      await page.waitForLoadState("domcontentloaded", { timeout: NAV_TIMEOUT_MS }).catch(() => { });
+      if (/amazon\.[a-z.]+\/(gp\/)?cart/.test(page.url())) return;
+      if (attempt >= 2) throw err;
+      console.log(`[bot] cart navigation interrupted (${(err as Error).message.slice(0, 70)}) — retrying`);
+    }
+  }
+}
+
+/** Null while the page is still parsing: the badge renders before the cart rows. */
+async function readCart(page: Page): Promise<CartState | null> {
   return page.evaluate(() => {
+    if (document.readyState === "loading") return null;
     const badge = (document.querySelector("#nav-cart-count") as HTMLElement | null)?.textContent;
     const navCount = Number((badge ?? "").trim()) || 0;
 
@@ -66,12 +88,39 @@ async function readCart(
   });
 }
 
+/**
+ * readCart that waits out a reload. A Delete submits the cart form as a real
+ * navigation, so a read right after it threw "execution context was destroyed".
+ */
+async function readCartSettled(page: Page): Promise<CartState | null> {
+  const deadline = Date.now() + CART_SETTLE_MS;
+  for (; ;) {
+    const cart = await readCart(page).catch(() => null);
+    if (cart) return cart;
+    if (Date.now() >= deadline) return null;
+    await page.waitForLoadState("domcontentloaded", { timeout: NAV_TIMEOUT_MS }).catch(() => { });
+    await page.waitForTimeout(500);
+  }
+}
+
+/** True once the cart shows fewer items than `before`. */
+async function waitForDeletion(page: Page, before: CartState): Promise<boolean> {
+  const deadline = Date.now() + CART_SETTLE_MS;
+  while (Date.now() < deadline) {
+    await page.waitForTimeout(500);
+    const now = await readCart(page).catch(() => null);
+    if (now && (now.navCount < before.navCount || now.activeItems < before.activeItems)) return true;
+  }
+  return false;
+}
+
 export async function runClearCart(page: Page): Promise<CheckoutResult> {
   await pause("opening cart to clear it");
-  await page.goto(CART_URL, { waitUntil: "domcontentloaded", timeout: NAV_TIMEOUT_MS });
+  await openCart(page);
 
   for (let round = 1; round <= 15; round++) {
-    const cart = await readCart(page);
+    const cart = await readCartSettled(page);
+    if (!cart) return { ok: false, reason: `cart page did not finish loading (${page.url()})` };
 
     if (cart.navCount === 0) {
       return {
@@ -80,9 +129,11 @@ export async function runClearCart(page: Page): Promise<CheckoutResult> {
       };
     }
 
+    // Scoped to the active cart: a bare value="Delete" also matches Saved for later rows.
     const deleted = await page.evaluate(() => {
       const el = document.querySelector(
-        'input[name^="submit.delete-active"], input[value="Delete"]',
+        'input[name^="submit.delete-active"], #sc-active-cart input[value="Delete"], ' +
+          '[data-name="Active Items"] input[value="Delete"]',
       ) as HTMLInputElement | null;
       const form = el?.closest("form") as HTMLFormElement | null;
       if (!el || !form) return null;
@@ -109,7 +160,10 @@ export async function runClearCart(page: Page): Promise<CheckoutResult> {
     console.log(
       `[bot] deleting cart item (round ${round}; ${cart.activeItems} active, badge ${cart.navCount})`,
     );
-    await page.waitForLoadState("domcontentloaded", { timeout: NAV_TIMEOUT_MS }).catch(() => { });
+    if (!(await waitForDeletion(page, cart))) {
+      console.log("[bot] cart did not change after Delete — reopening the cart");
+      await openCart(page);
+    }
     await pause("cart item deleted");
   }
   return { ok: false, reason: "cart still not empty after 15 deletions" };
@@ -239,9 +293,19 @@ async function declineUpsell(page: Page): Promise<void> {
 }
 
 
+/** Polls until the page is off the cart; false if it is still there after timeoutMs. */
+async function leftCart(page: Page, timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  for (; ;) {
+    if (!/\/gp\/cart\/view/.test(page.url())) return true;
+    if (Date.now() >= deadline) return false;
+    await page.waitForTimeout(500);
+  }
+}
+
 export async function runProceedToBuy(page: Page): Promise<CheckoutResult> {
   await pause("opening cart");
-  await page.goto(CART_URL, { waitUntil: "domcontentloaded", timeout: NAV_TIMEOUT_MS });
+  await openCart(page);
 
   const subtotal = await page
     .locator("#sc-subtotal-amount-activecart, #sc-subtotal-amount-buybox")
@@ -250,19 +314,39 @@ export async function runProceedToBuy(page: Page): Promise<CheckoutResult> {
     .catch(() => "");
   console.log(`[bot] cart subtotal: ${subtotal.trim() || "unknown"}`);
 
-  const ptc = await firstVisible(page, [
+  const PTC = [
     'input[name="proceedToRetailCheckout"]',
     "#sc-buy-box-ptc-button input",
     "#hlb-ptc-btn-native",
     'input[data-feature-id="proceed-to-checkout-action"]',
-  ]);
+  ];
+  const ptc = await firstVisible(page, PTC);
   if (!ptc) return { ok: false, reason: "Proceed to Buy button not found in the cart" };
 
   await clickAndSettle(ptc, page, "proceeded to checkout");
 
-  if (/\/gp\/cart\/view/.test(page.url())) {
-    return { ok: false, reason: `still on the cart page after Proceed to Buy (${page.url()})` };
+  // The click navigates some time after it lands: wait for the cart to go,
+  // never read the URL once. A press that did not take is pressed once more.
+  if (!(await leftCart(page, 12_000))) {
+    const again = await firstVisible(page, PTC);
+    if (again) {
+      console.log("[bot] still on the cart after Proceed to Buy — pressing it once more");
+      await clickAndSettle(again, page, "proceeded to checkout (again)");
+    }
+    if (!(await leftCart(page, 20_000))) {
+      return { ok: false, reason: `still on the cart page after Proceed to Buy (${page.url()})` };
+    }
   }
+  await pause("checkout loading");
+  // Leaving the cart is not arriving: /checkout/entry/... is a redirect page
+  // that is blank for a while. The next step starts on the real checkout.
+  if (!(await waitForCheckoutPipeline(page))) {
+    return {
+      ok: false,
+      reason: `checkout did not settle out of the entry/redirect page (${page.url().slice(0, 90)})`,
+    };
+  }
+  await dismissCheckoutModal(page);
   return { ok: true, detail: `at checkout: ${page.url().slice(0, 80)}` };
 }
 
@@ -273,7 +357,8 @@ const SPLIT_LINK = "#stmaLink";
 async function openAddressPicker(page: Page): Promise<CheckoutResult> {
   if (/\/checkout\/p\/[^/]+\/address/.test(page.url())) return { ok: true, detail: "address list open" };
   const change = page.locator('a[aria-label="Change delivery address"]').filter({ visible: true }).first();
-  if (!(await change.count())) return { ok: false, reason: `no Change link for the delivery address at ${page.url()}` };
+  const shown = await change.waitFor({ timeout: 20_000 }).then(() => true).catch(() => false);
+  if (!shown) return { ok: false, reason: `no Change link for the delivery address at ${page.url()}` };
   await shortPause();
   await change.click({ timeout: NAV_TIMEOUT_MS });
   await page.waitForURL(/\/address/, { timeout: NAV_TIMEOUT_MS }).catch(() => { });
@@ -284,7 +369,7 @@ async function openAddressPicker(page: Page): Promise<CheckoutResult> {
 }
 
 /** Rows on the multi-address page, in page order, with the product each belongs to. */
-async function readItemRows(page: Page): Promise<Array<{ item: string; qty: number; key: string | null }>> {
+async function readItemRows(page: Page): Promise<Array<{ item: string; asin: string | null; qty: number; key: string | null }>> {
   return page.evaluate((rowSel) => {
     return [...document.querySelectorAll(rowSel)].map((dd) => {
       let card: Element | null = dd;
@@ -293,45 +378,131 @@ async function readItemRows(page: Page): Promise<Array<{ item: string; qty: numb
       for (let i = 0; i < 14 && product && !/₹/.test((product as HTMLElement).innerText); i++) product = product.parentElement;
       const select = card?.querySelector('select[name="line-item-address"]') as HTMLSelectElement | null;
       const chosen = select ? select.options[select.selectedIndex]?.text ?? "" : (dd as HTMLElement).innerText;
+      const link = product?.querySelector('a[href*="/dp/"], a[href*="/gp/product/"]')?.getAttribute("href") ?? "";
       return {
         item: ((product as HTMLElement | null)?.innerText ?? "").split("\n").map((l) => l.trim()).find((l) => l.length > 15) ?? "",
+        asin: product?.querySelector("[data-asin]")?.getAttribute("data-asin") ||
+          link.match(/\/(?:dp|gp\/product)\/([A-Z0-9]{10})/i)?.[1] || null,
         qty: Number(card?.querySelector('[data-a-selector="value"]')?.textContent?.trim() ?? "1"),
         chosen,
       };
     });
-  }, ITEMSELECT_ROW).then((rows) => rows.map((r) => ({ item: r.item, qty: r.qty, key: checkoutAddressKey(r.chosen) })));
+  }, ITEMSELECT_ROW).then((rows) =>
+    rows.map((r) => ({ item: r.item, asin: r.asin, qty: r.qty, key: checkoutAddressKey(r.chosen) })),
+  );
+}
+
+/** Which basket item a multi-address row is: by ASIN, else by title prefix. -1 = none, or more than one. */
+export function matchBasketItem(row: { item: string; asin: string | null }, basket: BasketItem[]): number {
+  if (row.asin) {
+    const i = basket.findIndex((b) => b.sku.toUpperCase() === row.asin!.toUpperCase());
+    if (i >= 0) return i;
+  }
+  const norm = (v: string) => v.toLowerCase().replace(/\.{3}|…/g, "").replace(/[^a-z0-9]/g, "");
+  const t = norm(row.item);
+  const hits = basket.flatMap((b, i) => {
+    const bt = norm(b.title);
+    const n = Math.min(t.length, bt.length, 40);
+    return n >= 10 && t.slice(0, n) === bt.slice(0, n) ? [i] : [];
+  });
+  return hits.length === 1 ? hits[0]! : -1;
+}
+
+type ItemRow = { item: number; qty: number; key: string | null };
+
+/** readItemRows with each row as its basket index; a string names a row that matches no basket item. */
+async function readBasketRows(page: Page, basket: BasketItem[]): Promise<ItemRow[] | string> {
+  const out: ItemRow[] = [];
+  for (const r of await readItemRows(page)) {
+    const item = matchBasketItem(r, basket);
+    if (item < 0) return `"${r.item.slice(0, 40)}" on the multi-address page is not a basket item`;
+    out.push({ item, qty: r.qty, key: r.key });
+  }
+  return out;
 }
 
 /**
- * The next row to move so that every item gives each address the same number
- * of units: null when already balanced, a reason when it never can be.
+ * The next row to move so that every item gives each address its share
+ * (shares[item][address]): null when done, a reason when it never can be.
  */
 export function planRowMoves(
-  rows: Array<{ item: string; key: string | null }>,
+  rows: Array<{ item: number; key: string | null }>,
   wantKeys: string[],
+  shares: number[][],
 ): { row: number; key: string } | null | string {
-  const byItem = new Map<string, number[]>();
-  rows.forEach((r, i) => byItem.set(r.item, [...(byItem.get(r.item) ?? []), i]));
-  for (const [item, idx] of byItem) {
-    if (idx.length % wantKeys.length !== 0) {
-      return `"${item.slice(0, 40)}" has ${idx.length} unit(s), not a multiple of ${wantKeys.length} addresses`;
-    }
-    const each = idx.length / wantKeys.length;
+  for (const [item, share] of shares.entries()) {
+    const idx = rows.flatMap((r, i) => (r.item === item ? [i] : []));
+    const total = share.reduce((n, q) => n + q, 0);
+    if (idx.length !== total) return `item ${item + 1} has ${idx.length} unit(s) on the page, expected ${total}`;
+    const owed = new Map(wantKeys.map((k, a) => [k, share[a]!]));
     const count = new Map(wantKeys.map((k) => [k, 0]));
     for (const i of idx) {
       const k = rows[i]!.key;
       if (k !== null && count.has(k)) count.set(k, count.get(k)! + 1);
     }
-    const short = wantKeys.find((k) => count.get(k)! < each);
+    const short = wantKeys.find((k) => count.get(k)! < owed.get(k)!);
     if (!short) continue;
     // A row on a non-sheet address first, else one from an address with too many.
     const spare =
       idx.find((i) => rows[i]!.key === null || !count.has(rows[i]!.key!)) ??
-      idx.find((i) => count.get(rows[i]!.key!)! > each);
-    if (spare === undefined) return `could not find a row of "${item.slice(0, 40)}" to move`;
+      idx.find((i) => count.get(rows[i]!.key!)! > owed.get(rows[i]!.key!)!);
+    if (spare === undefined) return `could not find a unit of item ${item + 1} to move`;
     return { row: spare, key: short };
   }
   return null;
+}
+
+/** Clicks one row's quantity stepper (+ or -). False when the row has none. */
+async function stepRowQuantity(page: Page, row: number, dir: "increment" | "decrement"): Promise<boolean> {
+  const marked = await page.evaluate(([rowSel, n]) => {
+    document.querySelectorAll("[data-bot-qty]").forEach((e) => e.removeAttribute("data-bot-qty"));
+    let card: Element | null = document.querySelectorAll(rowSel)[n] ?? null;
+    for (let i = 0; i < 12 && card && !card.querySelector('[data-a-selector="value"]'); i++) card = card.parentElement;
+    card?.setAttribute("data-bot-qty", "1");
+    return !!card;
+  }, [ITEMSELECT_ROW, row] as [string, number]);
+  if (!marked) return false;
+  const label = dir === "increment" ? "Increase" : "Decrease";
+  const button = page
+    .locator(`[data-bot-qty] [data-a-selector="${dir}"], [data-bot-qty] button[aria-label^="${label}" i]`)
+    .filter({ visible: true })
+    .first();
+  if (!(await button.count())) return false;
+  await button.scrollIntoViewIfNeeded().catch(() => { });
+  await shortPause();
+  await button.click({ timeout: NAV_TIMEOUT_MS });
+  return true;
+}
+
+/**
+ * The cart holds one unit of each item; this raises (or lowers) one item to
+ * `want` units on the multi-address page with its row's quantity stepper.
+ * A row is never stepped below 1: at 1 the "-" is a delete.
+ */
+async function setItemUnits(page: Page, basket: BasketItem[], item: number, want: number): Promise<CheckoutResult> {
+  const name = `"${basket[item]!.title.slice(0, 40)}"`;
+  for (let guard = 0; guard < want * 2 + 10; guard++) {
+    const rows = await readBasketRows(page, basket);
+    if (typeof rows === "string") return { ok: false, reason: rows };
+    const mine = rows.flatMap((r, n) => (r.item === item ? [{ ...r, n }] : []));
+    if (!mine.length) return { ok: false, reason: `${name} is not on the multi-address page` };
+    const have = mine.reduce((n, r) => n + r.qty, 0);
+    if (have === want) return { ok: true, detail: `${name} x${want}` };
+    const row = have < want ? mine[0] : mine.find((r) => r.qty > 1);
+    if (!row) return { ok: false, reason: `cannot lower ${name} to ${want} without deleting it` };
+    if (!(await stepRowQuantity(page, row.n, have < want ? "increment" : "decrement"))) {
+      return { ok: false, reason: `no quantity control for ${name} on the multi-address page` };
+    }
+    // The stepper redraws the page; wait for the item's units to move.
+    let moved = false;
+    for (const deadline = Date.now() + 10_000; !moved && Date.now() < deadline; ) {
+      await sleep(500);
+      const now = await readBasketRows(page, basket).catch(() => null);
+      if (Array.isArray(now)) moved = now.filter((r) => r.item === item).reduce((n, r) => n + r.qty, 0) !== have;
+    }
+    if (!moved) return { ok: false, reason: `quantity of ${name} did not change on the multi-address page` };
+  }
+  return { ok: false, reason: `could not set ${name} to ${want}` };
 }
 
 /** Picks one address for one row through its dropdown list, the way a person does. */
@@ -358,22 +529,30 @@ async function pickRowAddress(page: Page, row: number, want: string, label: stri
 }
 
 /**
- * MULTI-ADDRESS CHECKOUT. Change -> "Deliver to multiple addresses" -> split
- * every line until each row is one unit ("Deliver this item to additional
- * addresses" peels one unit off) -> each item's rows go to the addresses in
- * order, the item's sheet quantity to each -> Continue, back to payment.
- * Verified 2026-10-02; it precedes the payment method.
+ * MULTI-ADDRESS CHECKOUT. Change -> "Deliver to multiple addresses" -> raise
+ * each item (one unit in the cart) to its total with the row's stepper ->
+ * split every line until each row is one unit ("Deliver this item to
+ * additional addresses" peels one unit off) -> each address gets its share of
+ * every item (the basket's `shares`, from ItemsQuantity) -> Continue, back to
+ * payment. Split + assign verified 2026-10-02; the stepper is not yet.
  */
-async function selectMultipleAddresses(page: Page, targets: TargetAddress[]): Promise<CheckoutResult> {
+async function selectMultipleAddresses(page: Page, targets: TargetAddress[], basket: BasketItem[]): Promise<CheckoutResult> {
   const open = await openAddressPicker(page);
   if (!open.ok) return open;
   const multi = page.getByText("Deliver to multiple addresses", { exact: true }).filter({ visible: true }).first();
-  if (!(await multi.count())) return { ok: false, reason: "Multiple address button not found" };
+  // The URL flips to /address before the list finishes drawing; wait, don't peek.
+  const shown = await multi.waitFor({ timeout: 20_000 }).then(() => true).catch(() => false);
+  if (!shown) return { ok: false, reason: "Multiple address button not found" };
   await shortPause();
   await multi.click({ timeout: NAV_TIMEOUT_MS });
   await page.waitForURL(/itemselect/, { timeout: NAV_TIMEOUT_MS }).catch(() => { });
   await page.locator(ITEMSELECT_ROW).first().waitFor({ timeout: NAV_TIMEOUT_MS }).catch(() => { });
   await pause("multi-address page open");
+
+  for (const [i, b] of basket.entries()) {
+    const set = await setItemUnits(page, basket, i, b.quantity);
+    if (!set.ok) return set;
+  }
 
   // Split until every row is one unit. The page redraws after each split and
   // the next row's link appears only then, so wait for it rather than stop.
@@ -389,30 +568,35 @@ async function selectMultipleAddresses(page: Page, targets: TargetAddress[]): Pr
     const deadline = Date.now() + 10_000;
     while (Date.now() < deadline && (await readItemRows(page)).length <= before.length) await sleep(500);
   }
-  let rows = await readItemRows(page);
+  const split = await readBasketRows(page, basket);
+  if (typeof split === "string") return { ok: false, reason: split };
+  let rows = split;
   if (rows.some((r) => r.qty !== 1)) {
     return { ok: false, reason: `could not split every item into single units (${rows.map((r) => r.qty).join("/")})` };
   }
 
   const wantKeys = targets.map(sheetAddressKey);
-  const plan = planRowMoves(rows, wantKeys);
+  const shares = basket.map((b) => b.shares!);
+  const plan = planRowMoves(rows, wantKeys, shares);
   if (typeof plan === "string") return { ok: false, reason: plan };
 
   // Picking an address redraws the page and REORDERS the rows, so nothing is
   // assigned by position: after every pick the rows are read again and the
   // next move is planned from what the page shows now.
   for (let guard = 0; guard < rows.length * 3; guard++) {
-    const move = planRowMoves(rows, wantKeys);
+    const move = planRowMoves(rows, wantKeys, shares);
     if (typeof move === "string") return { ok: false, reason: move };
     if (!move) break;
     const target = targets[wantKeys.indexOf(move.key)]!;
     if (!(await pickRowAddress(page, move.row, move.key, target.fullName))) {
       return { ok: false, reason: `address "${target.fullName}" is not offered at checkout` };
     }
-    rows = await readItemRows(page);
+    const now = await readBasketRows(page, basket);
+    if (typeof now === "string") return { ok: false, reason: now };
+    rows = now;
   }
-  if (planRowMoves(rows, wantKeys) !== null) {
-    return { ok: false, reason: "the items could not be spread evenly over the addresses" };
+  if (planRowMoves(rows, wantKeys, shares) !== null) {
+    return { ok: false, reason: "the items could not be given their ItemsQuantity per address" };
   }
   console.log(`[bot] ${rows.length} unit(s) spread over ${targets.length} addresses`);
 
@@ -466,17 +650,24 @@ async function selectSingleAddress(page: Page, target: TargetAddress): Promise<C
   return { ok: true, detail: `delivering to ${target.fullName}` };
 }
 
-export async function runSelectAddresses(page: Page, targets: TargetAddress[]): Promise<CheckoutResult> {
+/** `basket` (with per-address shares) is needed only for several addresses. */
+export async function runSelectAddresses(page: Page, targets: TargetAddress[], basket: BasketItem[]): Promise<CheckoutResult> {
   await pause("selecting delivery address");
   const at = await ensureAtCheckout(page);
   if (!at.ok) return at;
+  if (targets.length > 1) {
+    // Shares are per address: dropping one would send its units nowhere.
+    const bad = targets.find((t) => !t.pincode || !t.line1);
+    if (bad) return { ok: false, reason: `address ${bad.fullName || "(no name)"} has no PIN or line 1` };
+    return selectMultipleAddresses(page, targets, basket);
+  }
   const usable = targets.filter((t) => t.pincode && t.line1);
   if (usable.length === 0) return { ok: false, reason: "no delivery address for this account" };
-  return usable.length > 1 ? selectMultipleAddresses(page, usable) : selectSingleAddress(page, usable[0]!);
+  return selectSingleAddress(page, usable[0]!);
 }
 
 
-async function readBalanceRow(page: Page): Promise<{ present: boolean; usable: boolean; text: string }> {
+export async function readBalanceRow(page: Page): Promise<{ present: boolean; usable: boolean; text: string }> {
   return page.evaluate(() => {
     const matches = [...document.querySelectorAll("div, li, label, span")].filter((e) =>
       /amazon pay balance/i.test((e as HTMLElement).innerText ?? ""),
@@ -557,7 +748,7 @@ export async function clickAmazonButton(page: Page, pattern: RegExp): Promise<bo
   return how !== null;
 }
 
-async function clickByText(page: Page, pattern: RegExp): Promise<boolean> {
+export async function clickByText(page: Page, pattern: RegExp): Promise<boolean> {
   const clicked = await page.evaluate((src) => {
     const re = new RegExp(src, "i");
     const controls = [
@@ -588,17 +779,20 @@ const METHOD_TEXT: Record<string, string> = {
   emi: "emi",
 };
 
-async function ensureAtCheckout(page: Page): Promise<CheckoutResult> {
-  if (!(await atCheckoutPipeline(page))) {
-    console.log(`[bot] not at checkout (${page.url().slice(0, 60)}) — going via the cart`);
-    const proceeded = await runProceedToBuy(page);
-    if (!proceeded.ok) return proceeded;
-  }
+/**
+ * The steps after Proceed to Buy work on the checkout already open and never
+ * go back to the cart: only add_items and proceed_to_buy touch it. A page
+ * still on Amazon's redirect is waited out; a page that is not checkout at
+ * all fails, and the run goes again from Proceed to Buy.
+ */
+export async function ensureAtCheckout(page: Page): Promise<CheckoutResult> {
   const settled = await waitForCheckoutPipeline(page);
   if (!settled) {
     return {
       ok: false,
-      reason: `checkout did not settle out of the entry/redirect page (${page.url().slice(0, 90)})`,
+      reason: /\/checkout\//.test(page.url())
+        ? `checkout did not settle out of the entry/redirect page (${page.url().slice(0, 90)})`
+        : `not at checkout (${page.url().slice(0, 90)}) — run from Proceed to buy`,
     };
   }
   await dismissCheckoutModal(page);
@@ -620,7 +814,7 @@ async function atCheckoutPipeline(page: Page): Promise<boolean> {
     .catch(() => false);
 }
 
-async function waitForCheckoutPipeline(page: Page, timeoutMs = 45_000): Promise<boolean> {
+export async function waitForCheckoutPipeline(page: Page, timeoutMs = 45_000): Promise<boolean> {
   const deadline = Date.now() + timeoutMs;
   for (; ;) {
     if (await atCheckoutPipeline(page)) return true;
@@ -629,7 +823,7 @@ async function waitForCheckoutPipeline(page: Page, timeoutMs = 45_000): Promise<
   }
 }
 
-async function dismissCheckoutModal(page: Page): Promise<void> {
+export async function dismissCheckoutModal(page: Page): Promise<void> {
   const closed = await page
     .evaluate(() => {
       const modals = [...document.querySelectorAll('.a-popover, [role="dialog"], .a-modal-scroller')]
@@ -654,6 +848,18 @@ async function dismissCheckoutModal(page: Page): Promise<void> {
       }
       return null;
     })
+    .catch(() => null)
+    // Prime upsells are not always an a-popover: any visible "No Thanks".
+    .then(async (hit) => hit ?? page.evaluate(() => {
+      const no = [...document.querySelectorAll('button, input[type="submit"], a, [role="button"], span')].find((n) => {
+        const el = n as HTMLElement;
+        if (el.offsetParent === null) return false;
+        return /^no,? thanks$/i.test((el.innerText || (el as HTMLInputElement).value || "").trim());
+      }) as HTMLElement | null;
+      if (!no) return null;
+      no.click();
+      return "No Thanks";
+    }))
     .catch(() => null);
   if (closed) {
     console.log(`[bot] dismissed checkout modal: "${closed}"`);
@@ -807,68 +1013,34 @@ async function stillOverlaid(page: Page): Promise<boolean> {
     .catch(() => false);
 }
 
+/**
+ * Pays with the Amazon Pay balance. Vouchers are redeemed before this, by
+ * add_vouchers (Apay codes into the balance, blank-type codes as coupons), so
+ * this step only checks the balance covers the order and selects it.
+ */
 export async function runApplyPayment(page: Page, payment: PaymentSpec): Promise<CheckoutResult> {
   await pause("reviewing payment");
   const at = await ensureAtCheckout(page);
   if (!at.ok) return at;
 
-  const total = await readOrderTotal(page);
-  const bal = await readBalanceRow(page);
-  const declared = payment.codes.reduce((sum, c) => sum + (c.amount ?? 0), 0);
-
+  // The page redraws after a modal is dismissed: wait for the summary, don't peek.
+  let total = await readOrderTotal(page);
+  for (const deadline = Date.now() + 20_000; total === null && Date.now() < deadline; ) {
+    await sleep(1000);
+    total = await readOrderTotal(page);
+  }
   console.log(`[bot] order total: ${total ?? "unknown"}`);
-  console.log(`[bot] balance row: ${bal.text || "(none)"}`);
-  console.log(
-    `[bot] payment: ${payment.method} with ${payment.codes.length} code(s)` +
-    (declared > 0 ? ` declaring ₹${declared}` : ""),
-  );
+  console.log(`[bot] payment: ${payment.method} with ${payment.codes.length} voucher(s), via add_vouchers`);
 
-  if (payment.method === "none") {
-    return { ok: false, reason: "no payment_method set on the user row (voucher | amazon_pay)" };
-  }
-
-  if (!/^(1|true|yes)$/i.test((process.env.PAYMENT_APPLY_CODES ?? "").trim())) {
-    return {
-      ok: false,
-      reason:
-        `DRY RUN — no codes redeemed. Order total ${total ?? "unknown"}; ` +
-        `${payment.method} has ${payment.codes.length} code(s)` +
-        (declared > 0 ? ` worth ₹${declared}` : "") +
-        `. Set PAYMENT_APPLY_CODES=true in bot/.env and resume to actually redeem.`,
-    };
-  }
-
-  const totalUpfront = parseRupees(total);
-  const balUpfront = parseRupees(bal.text);
-  const applied: string[] = [];
-  if (totalUpfront !== null && balUpfront !== null && balUpfront >= totalUpfront) {
-    console.log(
-      `[bot] balance ₹${balUpfront} already covers ₹${totalUpfront} — not redeeming any codes`,
-    );
-    applied.push(`existing balance ₹${balUpfront}`);
-  } else {
-    for (const { code, amount } of payment.codes) {
-      const label = `${code.slice(0, 6)}…${amount !== undefined ? ` (₹${amount})` : ""}`;
-      const res = await redeemCode(page, code);
-      if (!res.ok) {
-        if (/already (been )?(redeemed|used|applied)|expired/i.test(res.reason)) {
-          console.warn(`[bot] code ${label} already used — continuing: ${res.reason}`);
-          continue;
-        }
-        return {
-          ok: false,
-          reason: `${payment.method} code ${label} rejected: ${res.reason} (already-applied codes: ${applied.join(", ") || "none"})`,
-        };
-      }
-      applied.push(label);
-      console.log(`[bot] redeemed ${label}`);
-      await pause("code redeemed");
-    }
+  const totalNum = parseRupees(total);
+  // Vouchers and balance can cover everything: Amazon then shows ₹0.00 and
+  // "Pay Now", with no payment method left to choose.
+  if (totalNum === 0) {
+    return { ok: true, detail: "order total ₹0 — nothing left to pay" };
   }
 
   const after = await readBalanceRow(page);
-
-  const totalNum = parseRupees(total);
+  console.log(`[bot] balance row: ${after.text || "(none)"}`);
   const balNum = parseRupees(after.text);
 
   if (totalNum === null || balNum === null) {
@@ -887,15 +1059,15 @@ export async function runApplyPayment(page: Page, payment: PaymentSpec): Promise
       ok: false,
       reason:
         `balance insufficient: credit ₹${balNum} does not cover the order total ₹${totalNum} ` +
-        `(short ₹${short}). Applied: ${applied.join(", ")}. NOTE: the order total includes ` +
-        `delivery/fees, so it exceeds the item price. Add another code worth ≥₹${short}.`,
+        `(short ₹${short}). NOTE: the order total includes delivery/fees, so it exceeds ` +
+        `the item price. Add an Apay voucher worth ≥₹${short} to the batch and rerun add_vouchers.`,
     };
   }
   if (!after.usable) {
     return {
       ok: false,
       reason:
-        `credit applied (${applied.join(", ")}) but the balance still cannot cover the order — ` +
+        `the balance still cannot cover the order — ` +
         `"${after.text}". Order total ${total ?? "unknown"}.`,
     };
   }
@@ -911,10 +1083,10 @@ export async function runApplyPayment(page: Page, payment: PaymentSpec): Promise
     return { ok: false, reason: '"Use this payment method" button not found' };
   }
   await pause("advanced to order review");
-  return { ok: true, detail: `paid with ${payment.method}: ${applied.join(", ")}` };
+  return { ok: true, detail: `paid with the Amazon Pay balance (₹${balNum} for ₹${totalNum})` };
 }
 
-async function readPageErrors(page: Page): Promise<string[]> {
+export async function readPageErrors(page: Page): Promise<string[]> {
   return page
     .evaluate(() => {
       const out: string[] = [];
@@ -951,7 +1123,7 @@ async function waitForOrderReview(page: Page, timeoutMs = 90_000): Promise<boole
             const el = n as HTMLElement;
             return (
               el.offsetParent !== null &&
-              /place your order|place order/i.test(
+              /place your order|place order|^pay now$/i.test(
                 (el.innerText || (el as HTMLInputElement).value || "").trim(),
               )
             );
@@ -976,13 +1148,13 @@ async function waitForOrderReview(page: Page, timeoutMs = 90_000): Promise<boole
   }
 }
 
-function parseRupees(text: string | null): number | null {
+export function parseRupees(text: string | null): number | null {
   if (!text) return null;
   const m = text.replace(/,/g, "").match(/₹\s?([\d]+(?:\.\d+)?)/);
   return m ? Number(m[1]) : null;
 }
 
-async function readOrderTotal(page: Page): Promise<string | null> {
+export async function readOrderTotal(page: Page): Promise<string | null> {
   return page
     .evaluate(() => {
       const money = /₹\s?[\d,]+(?:\.\d+)?/g;
@@ -1016,54 +1188,6 @@ async function readOrderTotal(page: Page): Promise<string | null> {
     .catch(() => null);
 }
 
-async function redeemCode(page: Page, code: string): Promise<{ ok: true } | { ok: false; reason: string }> {
-  const input = await waitForFirstVisible(page, [
-    "#spendingLimitBypassGiftCardInput",
-    "#gcpromoinput",
-    'input[name="claimCode"]',
-    'input[placeholder="Enter Code" i]',
-  ], 15_000);
-  if (!input) return { ok: false, reason: "no gift-card / voucher code field on this checkout" };
-
-  await input.fill("");
-  await input.pressSequentially(code, { delay: 90 });
-  await shortPause();
-  if (!(await clickByText(page, /^apply$/))) {
-    return { ok: false, reason: "Apply button not found next to the code field" };
-  }
-  await pause("code applied");
-
-  const verdict = await page
-    .evaluate(() => {
-      const t = document.body.innerText;
-      const err = t.match(
-        /[^.\n]{0,60}(not valid|not a valid|isn'?t valid|invalid|expired|already (been )?(redeemed|used|applied)|cannot be applied|couldn'?t be applied|enter a valid)[^.\n]{0,60}/i,
-      );
-      const balRow = [...document.querySelectorAll("div, li, label")].find((e) =>
-        /amazon pay balance/i.test((e as HTMLElement).innerText ?? ""),
-      ) as HTMLElement | undefined;
-      const balText = (balRow?.innerText ?? "").replace(/\s+/g, " ").trim().slice(0, 120);
-      return {
-        error: err ? err[0].trim() : null,
-        balanceUsable: balText ? !/unavailable|insufficient/i.test(balText) : false,
-        balText,
-      };
-    })
-    .catch(() => ({ error: null, balanceUsable: false, balText: "" }));
-
-  if (verdict.error) return { ok: false, reason: verdict.error };
-  if (!verdict.balanceUsable) {
-    return {
-      ok: false,
-      reason:
-        `code applied but the balance did not become usable — "${verdict.balText || "no balance row"}". ` +
-        `Treating as NOT redeemed rather than continuing to an unpayable checkout.`,
-    };
-  }
-  return { ok: true };
-}
-
-
 interface LedgerEntry {
   key: string;
   /** Every order this purchase made, comma-separated (one per address). */
@@ -1093,15 +1217,16 @@ async function findNewOrders(
   page: Page,
   known: string[],
   targets: TargetAddress[],
-): Promise<{ ok: true; ids: string[]; detail: string } | { ok: false; reason: string }> {
+): Promise<{ ok: true; ids: string[]; orders: OrderCard[]; detail: string } | { ok: false; reason: string }> {
   let last = "no new order on Your Orders";
-  for (let attempt = 1; attempt <= 4; attempt++) {
+  // A multi-address purchase can take a minute to list every order.
+  for (let attempt = 1; attempt <= 8; attempt++) {
     await page.goto(ORDERS_URL, { waitUntil: "domcontentloaded", timeout: NAV_TIMEOUT_MS });
     await pause("reading Your Orders");
     const found = newOrdersFor(await readOrderCards(page), known, targets);
     if (found.ok) {
       const ids = found.orders.map((o) => o.id);
-      return { ok: true, ids, detail: found.orders.map((o) => `${o.id} -> ${o.shipTo}`).join(", ") };
+      return { ok: true, ids, orders: found.orders, detail: found.orders.map((o) => `${o.id} -> ${o.shipTo}`).join(", ") };
     }
     last = found.reason;
     await sleep(5000);
@@ -1140,14 +1265,10 @@ export async function runPlaceOrder(
 ): Promise<CheckoutResult> {
   const ledger = readLedger(artifactsDir);
   const prior = ledger.find((e) => e.key === idempotencyKey);
+  // Never clicks twice. A resume after the click moves on: note_order_id finds
+  // the orders. A second purchase is PENDING / New attempt in the panel.
   if (prior) {
-    return {
-      ok: false,
-      reason:
-        `This attempt submitted a purchase at ${prior.placed_at} ` +
-        `(order id ${prior.order_id ?? "unknown"}). ` +
-        `To purchase again, set PENDING or choose New attempt in either control panel.`,
-    };
+    return { ok: true, detail: `already submitted at ${prior.placed_at}; order ids are read next` };
   }
 
   const atOrder = await ensureAtCheckout(page);
@@ -1187,7 +1308,7 @@ export async function runPlaceOrder(
         const el = n as HTMLElement;
         return (
           el.offsetParent !== null &&
-          /place your order|place order/i.test(
+          /place your order|place order|^pay now$/i.test(
             (el.innerText || (el as unknown as HTMLInputElement).value || "").trim(),
           )
         );
@@ -1217,48 +1338,49 @@ export async function runPlaceOrder(
   const finalMismatch = reviewError(basket, addresses, await readReviewShipments(page));
   if (finalMismatch) return { ok: false, reason: `purchase intent reserved but checkout changed: ${finalMismatch}; reconcile before retrying` };
 
-  console.log("[bot] *** PLACING ORDER — irreversible ***");
-  if (place) {
-    await clickAndSettle(place, page, "order submitted");
-  } else {
-    if (!(await clickAmazonButton(page, /place your order|place order/))) {
-      await clickByText(page, /place your order|place order/);
-    }
-    await pause("order submitted");
-  }
-
-  await dismissBlockingOverlay(page);
-
-  const isConfirmed = (): Promise<boolean> =>
-    page.evaluate(() =>
-      /order placed[,!]? thank you|thank you.*your order|order confirmed/i.test(
-        document.body.innerText.slice(0, 5000),
-      ),
-    );
-
-  let confirmed = await isConfirmed();
-  if (!confirmed) {
+  const PLACE_TEXT = /place your order|place order|^pay now$/;
+  const clickPlace = async (): Promise<void> => {
+    // A Prime upsell can pop up at any moment on checkout and swallow the click.
+    await dismissCheckoutModal(page);
     await dismissBlockingOverlay(page);
-    await pause("waiting for the confirmation page");
-    confirmed = await isConfirmed();
-  }
+    if (place && (await place.isVisible().catch(() => false))) {
+      await clickAndSettle(place, page, "order submitted");
+    } else {
+      if (!(await clickAmazonButton(page, PLACE_TEXT))) await clickByText(page, PLACE_TEXT);
+      await pause("order submitted");
+    }
+  };
+  // The thank-you page is not read: note_order_id takes the ids from Your
+  // Orders. All this waits for is checkout letting go of the order.
+  // The thank-you page lives under /gp/buy/ too (/gp/buy/thankyou/...).
+  const leftCheckout = (timeout: number): Promise<boolean> =>
+    page
+      .waitForURL((u) => /thankyou/i.test(u.toString()) || !/\/checkout\/p\/|\/gp\/buy\//.test(u.toString()), { timeout })
+      .then(() => true)
+      .catch(() => false);
 
-  {
-    const seen = await findNewOrders(page, known, addresses);
-    if (seen.ok) return { ok: true, detail: `order(s) placed: ${seen.detail}` };
-    const err = await page
-      .locator(".a-alert-error .a-alert-content, #payment-error-message")
-      .first()
-      .innerText()
-      .catch(() => "");
+  console.log("[bot] *** PLACING ORDER — irreversible ***");
+  await clickPlace();
+  let left = await leftCheckout(30_000);
+  if (!left && (await readPageErrors(page)).length === 0) {
+    // Still on checkout, no error: a popup most likely ate the click. Amazon
+    // places one order per checkout, so pressing again cannot buy twice.
+    console.log("[bot] still on checkout after Pay Now — closing any popup and pressing it again");
+    await clickPlace();
+    left = await leftCheckout(60_000);
+  }
+  if (!left) {
+    const said = await readPageErrors(page);
     return {
       ok: false,
       reason:
-        `no order confirmation after placing${err.trim() ? `: ${err.trim()}` : ""}, ` +
-        `and Your Orders shows no matching order (${seen.reason}). ` +
+        (said.length > 0 ? `Amazon says: ${said.join(" | ")} — ` : "") +
+        `still at checkout after Pay Now. ` +
         `The attempt IS recorded in the ledger — verify in Your Orders before retrying.`,
     };
   }
+  await pause("order submitted");
+  return { ok: true, detail: "order submitted" };
 }
 
 
@@ -1286,10 +1408,21 @@ export async function runNoteOrderId(
   }
   const found = await findNewOrders(page, entry.known_orders, addresses);
   if (!found.ok) return { ok: false, reason: `order outcome UNKNOWN: ${found.reason}; human reconciliation required` };
-  const orderIds = found.ids.join(", ");
+  // One order per delivery address, one per line in the sheet's order_id cell.
+  const orderIds = found.ids.join("\n");
   const jobId = process.env.JOB_ID ?? "";
   const runId = process.env.RUN_ID ?? "";
   const client = requireJobClient();
+  // Each Address row gets the order(s) shipping to it. First, while the run
+  // still owns the row: a failure here leaves the purchase open to resume.
+  const perAddress = addresses.flatMap((t) => {
+    const ids = found.orders.filter((o) => shipsTo(o, t)).map((o) => o.id);
+    return t.row !== undefined && ids.length ? [{ row_number: t.row, order_id: ids.join("\n") }] : [];
+  });
+  if (perAddress.length) await client.markAddressOrders(jobId, runId, perAddress);
+  // Re-run after the ids were reported: the addresses are written again, the
+  // purchase is already complete on the master.
+  if (entry.order_id) return { ok: true, detail: `order id(s) ${found.detail}` };
   await client.completePurchase(runId, jobId, entry.token, orderIds, { orders: found.detail, basket: entry.basket });
   entry.order_id = orderIds;
   writeLedger(artifactsDir, ledger);

@@ -12,20 +12,30 @@ import { chooseAnswer, planCoupons } from "./reward.js";
 import { couponNumbers, matchCoupon, parseWantedCoupons } from "./coupons.js";
 import { parseRewardType } from "./config.js";
 import { addressKey, targetKey } from "./address.js";
-import { checkoutAddressKey, sheetAddressKey } from "./checkout.js";
-import { cartQuantity } from "./steps.js";
+import { checkoutAddressKey, matchBasketItem, planRowMoves, sheetAddressKey } from "./checkout.js";
+import { allocate, parseItemsQuantity } from "./allocation.js";
+import { planVouchers } from "./vouchers.js";
+import { parseAccountProxy } from "./proxy.js";
 
 const basket = [{ sku: "B012345678", quantity: 2, title: "Test product" }];
-test("Resume adopts changed inputs from the earliest affected step", () => {
+test("Resume starts at the asked step; only a changed basket goes back to clear_cart", () => {
   const job = { credentials: { email: "a@example.com", password: "pw", totpSecret: "" },
     address: { line1: "12 Main Road" }, items: [{ url: "https://amazon.in/dp/B012345678", quantity: 1 }],
     payment: { method: "voucher", codes: [] } } as unknown as SheetJob;
   assert.equal(resumeStep(job, job, 8), 8);
   assert.equal(inputsChanged(job, { ...job, status: "PENDING", orderId: "old-order" }), false);
   assert.equal(resumeStep(job, { ...job, items: [{ ...job.items[0]!, quantity: 2 }] }, 8), 3);
-  assert.equal(resumeStep(job, { ...job, address: { ...job.address, line1: "34 Main Road" } }, 8), 2);
-  assert.equal(resumeStep(job, { ...job, payment: { method: "amazon_pay", codes: [] } }, 8), 7);
-  assert.equal(resumeStep(job, { ...job, credentials: { ...job.credentials, password: "changed" } }, 8), 0);
+  // Before clear_cart already: nothing to go back to.
+  assert.equal(resumeStep(job, { ...job, items: [{ ...job.items[0]!, quantity: 2 }] }, 1), 1);
+  // Other edits are handed to the runner but move nothing.
+  const moved = { ...job, address: { ...job.address, line1: "34 Main Road" } } as SheetJob;
+  assert.equal(resumeStep(job, moved, 8), 8);
+  assert.equal(inputsChanged(job, moved), true);
+  assert.equal(resumeStep(job, { ...job, payment: { method: "amazon_pay", codes: [] } }, 8), 8);
+  assert.equal(resumeStep(job, { ...job, credentials: { ...job.credentials, password: "changed" } }, 8), 8);
+  // A voucher the run itself marked USED is progress, not an edit.
+  const withCode = { ...job, payment: { method: "voucher" as const, codes: [{ code: "A", row: 2, type: "apay" as const, status: "" }] } };
+  assert.equal(inputsChanged(withCode, { ...withCode, payment: { ...withCode.payment, codes: [{ ...withCode.payment.codes[0]!, status: "USED" }] } }), false);
 });
 test("telemetry persists before connection and sequence survives process restart", async () => {
   const stateDir = mkdtempSync(join(tmpdir(), "fleet-outbox-test-"));
@@ -80,17 +90,14 @@ test("start acceptance survives restart and rejects conflicting or corrupt ident
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
-test("A new or edited Reward row resumes from check_reward; one turning COMPLETED does not", () => {
+test("Reward edits are handed to the runner without moving the resume; one turning COMPLETED is not an edit", () => {
   const base = { credentials: {}, address: {}, items: [], payment: {}, rewards: [] } as unknown as SheetJob;
   const spin = { row: 4, type: "spin" as const, url: "", status: "PENDING", answer: "", coupons: "50-250" };
   const withSpin = { ...base, rewards: [spin] } as SheetJob;
-  assert.equal(resumeStep(base, withSpin, 5), 1);
-  assert.equal(resumeStep(withSpin, withSpin, 5), 5);
-  assert.equal(resumeStep(withSpin, { ...base, rewards: [{ ...spin, status: "BLOCKED" }] } as SheetJob, 5), 5);
-  assert.equal(resumeStep(withSpin, { ...base, rewards: [{ ...spin, status: "COMPLETED" }] } as SheetJob, 5), 5);
-  assert.equal(resumeStep(withSpin, { ...base, rewards: [{ ...spin, type: "stickers" }] } as SheetJob, 5), 1);
-  assert.equal(resumeStep(withSpin, { ...base, rewards: [{ ...spin, answer: "False" }] } as SheetJob, 5), 1);
-  assert.equal(resumeStep(withSpin, { ...base, rewards: [{ ...spin, coupons: "40-400" }] } as SheetJob, 5), 1);
+  assert.equal(resumeStep(base, withSpin, 5), 5);
+  assert.equal(inputsChanged(base, withSpin), true);
+  assert.equal(inputsChanged(withSpin, { ...base, rewards: [{ ...spin, status: "COMPLETED" }] } as SheetJob), false);
+  assert.equal(inputsChanged(withSpin, { ...base, rewards: [{ ...spin, answer: "False" }] } as SheetJob), true);
 });
 
 test("Spin quiz: the sheet's Answer, case-insensitive; blank takes the first option; a missing one is refused", () => {
@@ -164,12 +171,65 @@ test("Address keys: a sheet address, its address-book card and its checkout entr
   const other = "fhmi raghu sahu 47-8/31, zz kaikaluru Lakshmi nagar Bhagoji keer marg Chanban Sulaksh, KAIKALUR, ANDHRA PRADESH, 521333, India";
   assert.notEqual(checkoutAddressKey(other), sheetAddressKey(sheet));
   assert.equal(checkoutAddressKey("not an address"), null);
+  // Double spaces in the sheet: Amazon collapses them before cutting at 60.
+  const spaced = { ...sheet, fullName: "suresh 10", pincode: "521139", line1: "10 amazon ganguru gifa",
+    line2: "ximv  Janaki ramayya estates" };
+  assert.equal(checkoutAddressKey("suresh 10 10 amazon ganguru gifa, ximv Janaki ramayya estates, VIJAYAWADA, ANDHRA PRADESH, 521139, India"),
+    sheetAddressKey(spaced));
+  assert.equal(checkoutAddressKey("suresh 10, 10 amazon ganguru gifa, ximv Janaki ramayya estates, VIJAYAWADA, ANDHRA PRADESH, 521139, India"),
+    sheetAddressKey(spaced));
 });
 
-test("Multi-address cart: each address gets the item's sheet quantity", () => {
-  const item = { url: "https://amazon.in/dp/B012345678", quantity: 3, purchaseOption: "auto" as const };
-  assert.equal(cartQuantity(item, 1).quantity, 3);
-  assert.equal(cartQuantity(item, 2).quantity, 6);
+test("ItemsQuantity: item_id_quantity per line", () => {
+  assert.deepEqual(parseItemsQuantity("1_3\n2_2"), [{ itemId: "1", quantity: 3 }, { itemId: "2", quantity: 2 }]);
+  assert.deepEqual(parseItemsQuantity(" A_1 _ 4 \r\n\n"), [{ itemId: "A_1", quantity: 4 }]);
+  assert.deepEqual(parseItemsQuantity("A-1_4"), [{ itemId: "A-1", quantity: 4 }]);
+  assert.match(parseItemsQuantity("1_3\n2") as string, /bad line "2"/);
+  assert.match(parseItemsQuantity("1_0") as string, /bad line/);
+  assert.match(parseItemsQuantity("1-3") as string, /bad line "1-3"/);
+});
+
+test("Allocation: the cart takes the Items quantity; several addresses must split it exactly", () => {
+  const p = (itemId: string, quantity: number) => ({ itemId, url: `https://amazon.in/dp/${itemId}`, quantity, purchaseOption: "auto" as const });
+  const at = (fullName: string, itemsQuantity = "") => ({ fullName, phone: "", pincode: "521333", line1: "1", line2: "",
+    landmark: "", city: "", state: "", country: "India", itemsQuantity });
+  assert.deepEqual(allocate([p("1", 2), p("2", 5)], [at("a")]), { multi: false, shares: [[2], [5]], totals: [2, 5] });
+  // Items quantity 5 over three addresses, any split that adds up: 3 + 1 + 1.
+  const three = [at("a", "1_3\n2_2"), at("b", "1_1\n2_1"), at("c", "1_1")];
+  assert.deepEqual(allocate([p("1", 5), p("2", 3)], three), {
+    multi: true, shares: [[3, 1, 1], [2, 1, 0]], totals: [5, 3],
+  });
+  // Lines for the same item in one address add up.
+  assert.deepEqual(allocate([p("1", 4)], [at("a", "1_1\n1_2"), at("b", "1_1")]), {
+    multi: true, shares: [[3, 1]], totals: [4],
+  });
+  assert.match(allocate([p("1", 5)], three) as string, /item_id 2 is not in this account's items/);
+  assert.match(allocate([p("1", 6), p("2", 3)], three) as string, /^item 1: Items quantity 6, but the addresses add up to 5 \(3\/1\/1\)/);
+  assert.match(allocate([p("1", 5), p("2", 4)], three) as string, /^item 2: Items quantity 4, but the addresses add up to 3/);
+  assert.match(allocate([p("1", 2)], [at("a", "1_1"), at("b")]) as string, /^b: no ItemsQuantity/);
+  assert.match(allocate([p("1", 2)], [at("a", "1_1"), at("b", "9_1")]) as string, /item_id 9 is not/);
+  assert.match(allocate([p("1", 2), p("1", 3)], [at("a", "1_1"), at("b", "1_1")]) as string, /on two Items rows/);
+  assert.match(allocate([p("1", 2), p("2", 3)], [at("a", "1_1"), at("b", "1_1")]) as string, /item 2 is in no ItemsQuantity/);
+});
+
+test("Multi-address rows: each address gets its share of each item", () => {
+  const keys = ["a", "b"];
+  const shares = [[2, 1], [0, 1]];
+  const rows = [{ item: 0, key: null }, { item: 0, key: null }, { item: 0, key: null }, { item: 1, key: null }];
+  assert.deepEqual(planRowMoves(rows, keys, shares), { row: 0, key: "a" });
+  const done = [{ item: 0, key: "a" }, { item: 0, key: "b" }, { item: 0, key: "a" }, { item: 1, key: "b" }];
+  assert.equal(planRowMoves(done, keys, shares), null);
+  // Too many on "a": a unit moves from it to the address that is short.
+  const over = [{ item: 0, key: "a" }, { item: 0, key: "a" }, { item: 0, key: "a" }, { item: 1, key: "b" }];
+  assert.deepEqual(planRowMoves(over, keys, shares), { row: 0, key: "b" });
+  assert.match(planRowMoves(rows.slice(1), keys, shares) as string, /item 1 has 2 unit\(s\) on the page, expected 3/);
+});
+
+test("Multi-address rows match basket items by ASIN, else by title", () => {
+  const basket = [{ sku: "B0FY6KL849", title: lamp, quantity: 3 }, { sku: "B0CKZ7MBBT", title: study, quantity: 1 }];
+  assert.equal(matchBasketItem({ item: "anything", asin: "b0ckz7mbbt" }, basket), 1);
+  assert.equal(matchBasketItem({ item: "XECH Quest PRO Table Lamp with 15W…", asin: null }, basket), 0);
+  assert.equal(matchBasketItem({ item: "FREE Delivery Tomorrow", asin: null }, basket), -1);
 });
 
 const nhdi = { fullName: "nhdi naman jain", phone: "", pincode: "521333", line1: "1-66/86",
@@ -193,6 +253,17 @@ test("Review check: every sheet address gets every item at its quantity, nothing
   assert.match(reviewError(basket, [nhdi], [good[0]!, good[1]!])!, /not in the sheet/);
 });
 
+test("Review check: with shares, each address gets its ItemsQuantity", () => {
+  const basket = [
+    { sku: "B0FY6KL849", title: lamp, quantity: 3, shares: [2, 1] },
+    { sku: "B0CKZ7MBBT", title: study, quantity: 1, shares: [0, 1] },
+  ];
+  assert.equal(reviewError(basket, [nhdi, jypj], [ship(nhdi, [[lamp, 2]]), ship(jypj, [[lamp, 1], [study, 1]])]), null);
+  assert.match(reviewError(basket, [nhdi, jypj], [ship(nhdi, [[lamp, 2], [study, 1]]), ship(jypj, [[lamp, 1]])])!,
+    /nhdi naman jain: Xech 4-in-1 .* x1, expected x0/);
+  assert.match(reviewError(basket, [nhdi, jypj], [ship(nhdi, [[lamp, 1]]), ship(jypj, [[lamp, 2], [study, 1]])])!, /x1, expected x2/);
+});
+
 test("New orders: the ones not on Your Orders before, one per sheet address", () => {
   const cards = [
     { id: "406-6040956-0673968", shipTo: "nhdi naman jain", titles: [lamp, study], cancelled: false },
@@ -204,4 +275,55 @@ test("New orders: the ones not on Your Orders before, one per sheet address", ()
   assert.ok(found.ok && found.orders.map((o) => o.id).join() === "406-6040956-0673968,406-1457638-9489927");
   assert.ok(!newOrdersFor(cards, [...known, "406-1457638-9489927"], [nhdi, jypj]).ok);
   assert.ok(!newOrdersFor(cards, [], [nhdi, jypj]).ok);
+});
+
+test("Vouchers: every code goes to the claim page, whatever its type; Used ones left alone", () => {
+  const plan = planVouchers([
+    { code: "AP1", row: 2, type: "apay", status: "" },
+    { code: "CP1", row: 3, type: "coupon", status: "" },
+    { code: "OLD", row: 4, type: "apay", status: "USED" },
+    { code: "RETRY", row: 5, type: "coupon", status: "" },
+    { code: "ODD", row: 6, type: "unknown", status: "" },
+    { code: "  ", row: 7, type: "coupon", status: "" },
+    { code: "LEGACY" },
+  ], new Set(["RETRY"]));
+  assert.deepEqual(plan.todo.map((v) => v.code), ["AP1", "CP1", "ODD", "LEGACY"]);
+  assert.equal(plan.alreadyUsed, 2);
+});
+
+test("Proxy: http://host:port, bare host:port means http, anything else refuses", () => {
+  assert.equal(parseAccountProxy(""), null);
+  assert.deepEqual(parseAccountProxy(" https://10.0.0.1:8080 "), {
+    url: "https://10.0.0.1:8080", host: "10.0.0.1", port: 8080, label: "https://10.0.0.1:8080",
+  });
+  assert.equal(parseAccountProxy("proxy.example.com:3128")!.url, "http://proxy.example.com:3128");
+  assert.equal(parseAccountProxy("http://10.0.0.1:8080")!.url, "http://10.0.0.1:8080");
+  assert.equal(parseAccountProxy("socks5://u:p@1.2.3.4:1080")!.label, "socks5://1.2.3.4:1080");
+  assert.throws(() => parseAccountProxy("10.0.0.1"), /not http:\/\/host:port/);
+  assert.throws(() => parseAccountProxy("ftp://10.0.0.1:21"));
+});
+
+test("Your Orders: every new order matched to its address by Ship to name, exactly", () => {
+  const addr = (fullName: string) => ({ fullName, phone: "", pincode: "521139", line1: "x", line2: "", landmark: "",
+    city: "", state: "", country: "India" });
+  const card = (id: string, shipTo: string) => ({ id, shipTo, titles: [], cancelled: false });
+  const cards = [card("402-8867819-1957120", "suresh 10"), card("402-7221865-5850735", "suresh 11")];
+  const found = newOrdersFor(cards, [], [addr("suresh 10"), addr("suresh 11")]);
+  assert.ok(found.ok);
+  assert.deepEqual(found.ok && found.orders.map((o) => o.id), ["402-8867819-1957120", "402-7221865-5850735"]);
+  // "suresh 1" is not "suresh 10" unless Amazon cut the name short.
+  assert.equal(newOrdersFor([card("402-8867819-1957120", "suresh 10")], [], [addr("suresh 1")]).ok, false);
+  assert.ok(newOrdersFor([card("402-8867819-1957120", "suresh…")], [], [addr("suresh 10")]).ok);
+});
+
+test("Resume: a master that starts sending each address's sheet row does not rewind to set_address", () => {
+  const a = { fullName: "suresh 10", phone: "1", pincode: "521139", line1: "x", line2: "", landmark: "",
+    city: "", state: "", country: "India", itemsQuantity: "9_1" };
+  const job = (addresses: typeof a[]) => ({ credentials: {}, address: addresses[0], addresses, items: [],
+    payment: { method: "voucher", codes: [] }, rewards: [] }) as unknown as SheetJob;
+  const before = job([a]);
+  assert.equal(resumeStep(before, job([{ ...a, row: 30 } as typeof a]), 9), 9);
+  assert.equal(inputsChanged(before, job([{ ...a, row: 30 } as typeof a])), false);
+  // A changed split is a changed basket: back to clear_cart.
+  assert.equal(resumeStep(before, job([{ ...a, itemsQuantity: "9_2" }]), 9), 3);
 });
