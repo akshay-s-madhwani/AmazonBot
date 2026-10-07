@@ -59,6 +59,7 @@ import type { CDPSession, Locator, Page } from "./pw.js";
 
 const SPIN_URL = "https://www.amazon.in/game/gSUN0DE";
 const STICKERS_URL = "https://www.amazon.in/b?node=221530152031";
+const STICKERS_NODE = /[?&]node=221530152031\b/;
 
 const REWARD_BUTTON = 'button[id^="amzn1.rewards.reward."]';
 /** Everything a coupon's action can be: Amazon renders some as a-button spans. */
@@ -66,7 +67,11 @@ const CONTROLS = 'button, a, [role="button"], input[type="submit"], input[type="
 /** A coupon still to collect. */
 const OPEN_LABEL = /^(collect|collect now|redeem|redeem now)$/i;
 /** A coupon already collected. */
-const CLAIMED_LABEL = /^(order now|redeemed|collected)$|available to use/i;
+/**
+ * "Buy Now": the spin's prize page ("Congratulations! This prize is valid
+ * till …") grants the coupon outright and offers no Collect (seen 2026-10-08).
+ */
+const CLAIMED_LABEL = /^(order now|buy now|redeemed|collected)$|available to use/i;
 /**
  * A claimed coupon whose card shows a plain label, not a button: "AVAILABLE TO
  * USE DURING GREAT INDIAN FESTIVAL" on /rewards/checkoutCoupons.
@@ -84,7 +89,7 @@ const TASK_CARD = "[data-engagement-streak-count]";
 const TASK_BUTTON = "#streakActionButtonServerData";
 const VIEW_REWARD = '[data-mix-operations="viewRewardButtonClick"]';
 /** A product tile's link to its product page, on the deals page a task opens. */
-const PRODUCT_LINK = 'a[href*="/dp/"], a[href*="/gp/product/"], a[href*="/gp/aw/d/"]';
+const PRODUCT_LINK = 'a[href*="/dp/"], a[href*="/gp/product/"], a[href*="/gp/aw/d/"], a[href*="/deal/"]';
 const PRODUCT_PAGE = /\/(dp|gp\/product|gp\/aw\/d)\//i;
 /** The product page's own Add to cart, desktop and mobile site. */
 const PRODUCT_ADD_TO_CART =
@@ -137,6 +142,15 @@ async function mobileUserAgent(page: Page): Promise<{ ua: string; major: string 
   };
 }
 
+/** The reward step's mobile tab while it is open (it is left open when a row fails). */
+export async function openRewardTab(page: Page): Promise<Page | null> {
+  for (const p of page.context().pages()) {
+    if (p === page || p.isClosed()) continue;
+    if ((await p.evaluate(() => window.name).catch(() => "")) === TAB_NAME) return p;
+  }
+  return null;
+}
+
 async function closeStaleTabs(page: Page): Promise<void> {
   for (const p of page.context().pages()) {
     if (p === page) continue;
@@ -149,6 +163,8 @@ async function openMobileTab(page: Page): Promise<MobileTab> {
   await closeStaleTabs(page);
   const { ua, major } = await mobileUserAgent(page);
   const tab = await page.context().newPage();
+  // In front: a tab left behind another takes no clicks (see vouchers.ts).
+  await tab.bringToFront().catch(() => {});
   const session = await page.context().newCDPSession(tab);
   await session.send("Emulation.setDeviceMetricsOverride", {
     width: 412,
@@ -196,7 +212,28 @@ async function goto(tab: Page, url: string): Promise<boolean> {
 }
 
 function signedOut(tab: Page): boolean {
-  return /\/ap\/signin/.test(tab.url());
+  // /ax/claim is Amazon's sign-in too: where a game link goes without a session.
+  return /\/ap\/signin|\/ax\/claim/.test(tab.url());
+}
+
+/** "the home page" when Amazon sent a reward link there instead of its page, else null. */
+function sentHome(tab: Page): string | null {
+  try {
+    const path = new URL(tab.url()).pathname;
+    return path === "/" || /^\/(ref=|gp\/homepage)/.test(path) ? "the home page" : null;
+  } catch {
+    return null;
+  }
+}
+
+/** The page the tab is on, short, for a failure reason. */
+function where(tab: Page): string {
+  try {
+    const u = new URL(tab.url());
+    return `${u.pathname}${u.search}`.slice(0, 80);
+  } catch {
+    return tab.url().slice(0, 80);
+  }
 }
 
 function amazonLink(url: string): boolean {
@@ -269,7 +306,10 @@ async function readScreen(tab: Page): Promise<Screen> {
         const open = new RegExp(openSrc!, "i");
         const claimed = new RegExp(claimedSrc!, "i");
         const claimedText = new RegExp(claimedTextSrc!, "i");
-        const rewardPage = /\/rewards\//.test(location.pathname) || !!document.querySelector(reward!);
+        const rewardPage =
+          /\/rewards\//.test(location.pathname) ||
+          !!document.querySelector(reward!) ||
+          /this prize is valid till/i.test(text);
         const all = [...document.querySelectorAll(controlSel!)];
         const hits: Array<{ el: HTMLElement; idx: number; label: string; state: "open" | "claimed" }> = [];
         all.forEach((el, idx) => {
@@ -442,6 +482,12 @@ async function playThrough(tab: Page, label: string, r: RewardSpec): Promise<Row
   /** The coupon page of the last Collect press, and whether it was reopened to check it. */
   let couponUrl = "";
   let rechecked = false;
+  /**
+   * This row spun the wheel, pressed Answer now or answered the quiz. A
+   * coupon then shown as already granted was won by this run: the prize page
+   * grants it outright, with nothing to Collect.
+   */
+  let played = false;
   let s = await nextScreen(tab, "unknown", 15_000);
 
   for (let i = 0; i < MAX_TRANSITIONS; i++) {
@@ -452,6 +498,7 @@ async function playThrough(tab: Page, label: string, r: RewardSpec): Promise<Row
       case "wheel":
         await pause("before spinning");
         await pressAButton(tab, TAP_TO_SPIN);
+        played = true;
         console.log("[bot] rewards: spun — waiting for the wheel to stop");
         s = await nextScreen(tab, "wheel");
         break;
@@ -459,6 +506,7 @@ async function playThrough(tab: Page, label: string, r: RewardSpec): Promise<Row
       case "answer_now":
         await pause("after the wheel stopped");
         await pressAButton(tab, ANSWER_NOW);
+        played = true;
         s = await nextScreen(tab, "answer_now");
         break;
 
@@ -478,6 +526,7 @@ async function playThrough(tab: Page, label: string, r: RewardSpec): Promise<Row
         const option = tab.locator(MCQ_OPTION, { hasText: exact }).first();
         await option.scrollIntoViewIfNeeded().catch(() => {});
         await option.click({ timeout: 10_000 });
+        played = true;
         s = await nextScreen(tab, "quiz");
         break;
       }
@@ -511,13 +560,14 @@ async function playThrough(tab: Page, label: string, r: RewardSpec): Promise<Row
 
         // Nothing left to press: what the page shows now decides the row.
         await pause("after collecting");
-        const outcome = pressed.length ? ("collected" as const) : ("already_claimed" as const);
-        const verb = pressed.length ? "Collected" : "Already claimed";
+        const won = pressed.length > 0 || played;
+        const outcome = won ? ("collected" as const) : ("already_claimed" as const);
+        const verb = pressed.length ? "Collected" : played ? "Won" : "Already claimed";
         if (plan.found.length) {
           return { ok: true, outcome, found: plan.found, note: `${verb} ${plan.found.join(", ")}` };
         }
         if (pressed.length === 0 && plan.claimedOther.length) {
-          return { ok: true, outcome, found: [], note: `Already claimed ${plan.claimedOther.join(", ")} (not in Coupons)` };
+          return { ok: true, outcome, found: [], note: `${verb} ${plan.claimedOther.join(", ")} (not in Coupons)` };
         }
         if (pressed.length === 0 && plan.pickFull) {
           return { ok: true, outcome, found: [], note: "Already claimed (pick limit reached)" };
@@ -535,8 +585,11 @@ async function playThrough(tab: Page, label: string, r: RewardSpec): Promise<Row
 
       case "done":
         console.log(`[bot] rewards: page says "${s.text}"`);
-        return pressed.length
-          ? { ok: true, outcome: "collected", found: pressed, note: `Collected ${pressed.join(", ")}` }
+        if (pressed.length) {
+          return { ok: true, outcome: "collected", found: pressed, note: `Collected ${pressed.join(", ")}` };
+        }
+        return played
+          ? { ok: true, outcome: "collected", found: [], note: "Won" }
           : { ok: true, outcome: "already_claimed", found: [], note: "Already claimed" };
 
       case "wrong_answer":
@@ -557,7 +610,7 @@ async function playThrough(tab: Page, label: string, r: RewardSpec): Promise<Row
         console.log(`[bot] rewards: ${label}: unrecognised page ${tab.url()} — ${s.controls.join(", ")}`);
         return {
           ok: false,
-          reason: `Unrecognised page${s.controls.length ? ` (${s.controls.slice(0, 4).join(", ")})` : ""}`,
+          reason: `Unrecognised page ${where(tab)}${s.controls.length ? ` (${s.controls.slice(0, 4).join(", ")})` : ""}`,
         };
     }
   }
@@ -679,26 +732,68 @@ async function cartCount(tab: Page): Promise<number> {
   return digits ? Number(digits) : -1;
 }
 
-/** The product's id in a product link, so the same product is not opened twice. */
-function productKey(href: string): string {
-  return href.match(/\/(?:dp|gp\/product|gp\/aw\/d)\/([A-Z0-9]{10})/i)?.[1] ?? href;
-}
+/** Marks the tile findProduct picked, so it is clicked without a second search. */
+const PICK_ATTR = "data-fleet-pick";
+/** The whole product hunt on one task, within check_reward's 300s. */
+const PRODUCT_HUNT_MS = 150_000;
 
-/** The first visible product tile on the deals page not opened yet, scrolling down for one. */
-async function findProduct(tab: Page, tried: Set<string>): Promise<{ link: Locator; key: string } | null> {
-  for (let scroll = 0; scroll < 15; scroll++) {
-    const links = tab.locator(PRODUCT_LINK);
-    const n = await links.count();
-    for (let i = 0; i < n; i++) {
-      const link = links.nth(i);
-      const href = (await link.getAttribute("href").catch(() => null)) ?? "";
-      if (!href || tried.has(productKey(href))) continue;
-      if (await link.isVisible().catch(() => false)) return { link, key: productKey(href) };
-    }
+/**
+ * The first product tile on the page not opened yet, scrolling down for one.
+ * One evaluate per screen, not a locator round trip per link: the festival
+ * pages re-render their tiles while they load, and a per-link read of a tile
+ * that just went away waits out its timeout — minutes over a page of links.
+ * The pick is marked with PICK_ATTR (and its target dropped, so it opens here).
+ */
+async function findProduct(tab: Page, tried: Set<string>, deadline: number): Promise<{ key: string; href: string } | null> {
+  for (let scroll = 0; scroll < 15 && Date.now() < deadline; scroll++) {
+    const hit = await tab
+      .evaluate(
+        ([selector, skip, mark]) => {
+          const keyOf = (href: string): string =>
+            href.match(/\/(?:dp|gp\/product|gp\/aw\/d)\/([A-Z0-9]{10})/i)?.[1] ?? href.split(/[?#]/)[0]!;
+          document.querySelectorAll(`[${mark}]`).forEach((e) => e.removeAttribute(mark));
+          for (const a of document.querySelectorAll<HTMLAnchorElement>(selector)) {
+            const href = a.href;
+            if (!href) continue;
+            const key = keyOf(href);
+            if (skip.includes(key)) continue;
+            const r = a.getBoundingClientRect();
+            if (r.width === 0 || r.height === 0) continue;
+            a.setAttribute(mark, "1");
+            a.removeAttribute("target");
+            return { key, href };
+          }
+          return null;
+        },
+        [PRODUCT_LINK, [...tried], PICK_ATTR] as const,
+      )
+      .catch(() => null);
+    if (hit) return { key: hit.key, href: hit.href };
+    console.log(`[bot] rewards: no product link on screen yet — scrolling (${scroll + 1}/15)`);
     await tab.mouse.wheel(0, 700).catch(() => {});
     await sleep(1200);
   }
   return null;
+}
+
+/** Clicks the tile findProduct marked; opens its link directly if the click does not navigate. */
+async function openProduct(tab: Page, product: { key: string; href: string }): Promise<boolean> {
+  const tile = tab.locator(`[${PICK_ATTR}]`).first();
+  await tile.scrollIntoViewIfNeeded({ timeout: 5_000 }).catch(() => {});
+  await shortPause();
+  const before = tab.url();
+  // A tile re-rendered since it was marked is gone: go to its link rather
+  // than wait out the click.
+  const clicked = await tile.click({ timeout: 5_000 }).then(() => true).catch(() => false);
+  const moved =
+    clicked &&
+    (await tab
+      .waitForURL((u) => u.toString() !== before, { timeout: 15_000, waitUntil: "domcontentloaded" })
+      .then(() => true)
+      .catch(() => false));
+  if (moved) return true;
+  console.log(`[bot] rewards: ${clicked ? "clicking" : "could not click"} ${product.key} — opening its link`);
+  return goto(tab, product.href);
 }
 
 /**
@@ -710,12 +805,13 @@ async function findProduct(tab: Page, tried: Set<string>): Promise<{ link: Locat
 async function addThisProduct(tab: Page): Promise<boolean> {
   const buttons = tab.locator(PRODUCT_ADD_TO_CART);
   let button: Locator | null = null;
-  for (let i = 0, n = await buttons.count(); i < n && !button; i++) {
+  const n = await buttons.count().catch(() => 0);
+  for (let i = 0; i < n && !button; i++) {
     const b = buttons.nth(i);
-    if ((await b.isVisible().catch(() => false)) && (await b.isEnabled().catch(() => false))) button = b;
+    if ((await b.isVisible().catch(() => false)) && (await b.isEnabled({ timeout: 2_000 }).catch(() => false))) button = b;
   }
   if (!button) return false;
-  await button.scrollIntoViewIfNeeded().catch(() => {});
+  await button.scrollIntoViewIfNeeded({ timeout: 5_000 }).catch(() => {});
   await shortPause();
   const before = await cartCount(tab);
   const added = tab
@@ -739,41 +835,42 @@ async function addThisProduct(tab: Page): Promise<boolean> {
 
 /**
  * The deals page a task opens: click a product itself (not the "+" icon on
- * its tile), and on its product page press Add to cart. Up to three products,
- * back on the deals page between them — one can need options first.
+ * its tile), and on its product page press Add to cart. A deal tile can open
+ * a deal page first: one more product is picked there. Up to three products,
+ * back on the deals page between them — one can need options first. Bounded
+ * by PRODUCT_HUNT_MS so a page that never offers a product fails the task
+ * with a reason instead of running the step into its timeout.
  */
-async function addProductFromDeals(tab: Page): Promise<boolean> {
+export async function addProductFromDeals(tab: Page): Promise<boolean> {
   const dealsUrl = tab.url();
+  const deadline = Date.now() + PRODUCT_HUNT_MS;
   const tried = new Set<string>();
-  for (let attempt = 0; attempt < 3; attempt++) {
+  console.log(`[bot] rewards: looking for a product on ${dealsUrl}`);
+  for (let attempt = 0; attempt < 3 && Date.now() < deadline; attempt++) {
     if (attempt > 0) {
       if (!(await goto(tab, dealsUrl))) return false;
       await pause("back on the deals page");
     }
-    const product = await findProduct(tab, tried);
-    if (!product) {
-      console.log(`[bot] rewards: no product to open on ${tab.url()}`);
-      return false;
+    // The deals page, then at most one deal page in between.
+    let onProduct = false;
+    for (let hop = 0; hop < 2 && !onProduct && Date.now() < deadline; hop++) {
+      const product = await findProduct(tab, tried, deadline);
+      if (!product) {
+        console.log(`[bot] rewards: no product to open on ${tab.url()}`);
+        break;
+      }
+      tried.add(product.key);
+      console.log(`[bot] rewards: opening ${product.key}`);
+      if (!(await openProduct(tab, product))) continue;
+      await pause("letting the page load");
+      onProduct = PRODUCT_PAGE.test(new URL(tab.url()).pathname);
+      if (!onProduct) console.log(`[bot] rewards: ${product.key} opened ${tab.url()} — not a product page`);
     }
-    tried.add(product.key);
-    console.log(`[bot] rewards: opening product ${product.key}`);
-    await product.link.scrollIntoViewIfNeeded().catch(() => {});
-    await shortPause();
-    // Same tab: a tile can open the product in a new one.
-    await product.link.evaluate((a: Element) => a.removeAttribute("target")).catch(() => {});
-    await product.link.click({ timeout: 10_000 }).catch(() => {});
-    const opened = await tab
-      .waitForURL(PRODUCT_PAGE, { timeout: 20_000, waitUntil: "domcontentloaded" })
-      .then(() => true)
-      .catch(() => false);
-    if (!opened) {
-      console.log(`[bot] rewards: product ${product.key} did not open (at ${tab.url()})`);
-      continue;
-    }
-    await pause("letting the product page load");
+    if (!onProduct) continue;
     if (await addThisProduct(tab)) return true;
-    console.log(`[bot] rewards: product ${product.key} would not add — trying another`);
+    console.log(`[bot] rewards: that product would not add — trying another`);
   }
+  if (Date.now() >= deadline) console.log(`[bot] rewards: gave up finding a product after ${PRODUCT_HUNT_MS / 1000}s`);
   return false;
 }
 
@@ -898,6 +995,27 @@ async function runSpin(tab: Page, r: RewardSpec): Promise<RowResult> {
   console.log(`[bot] rewards: opening the spin game ${url}`);
   if (!(await goto(tab, url))) return { ok: false, reason: "Spin page did not load" };
   await pause("letting the spin wheel load");
+  if (signedOut(tab)) return SIGNED_OUT;
+  // Amazon sends a game it will not show this account (campaign over, not
+  // eligible) to the home page; say so rather than "unrecognised page".
+  const home = sentHome(tab);
+  if (home) {
+    console.log(`[bot] rewards: ${url} opened ${home} (${tab.url()})`);
+    return { ok: false, reason: `Spin link opened ${home}, not the game — campaign over or not offered to this account` };
+  }
+  // The sticker task board is not a spin game: playing it as one presses the
+  // wrong buttons. Either the row's link is the stickers page, or the default
+  // game now redirects there (the campaign moved on).
+  if (STICKERS_NODE.test(tab.url()) || (await tab.locator(TASK_CARD).count().catch(() => 0)) > 0) {
+    console.log(`[bot] rewards: spin link ${url} opened the sticker tasks (${tab.url()})`);
+    return {
+      ok: false,
+      retriable: false,
+      reason: r.url.trim()
+        ? "Spin row's reward_url opens the stickers page — use the spin game link, or set type STICKERS"
+        : `Default spin game ${SPIN_URL} now opens the stickers page — put the current spin game link in reward_url`,
+    };
+  }
   return playThrough(tab, "spin reward", r);
 }
 

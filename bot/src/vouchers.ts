@@ -104,8 +104,11 @@ export async function runAddVouchers(
     await markUsed?.(v);
   };
 
-  // A side tab, so the checkout stays where it is.
+  // A side tab, so the checkout stays where it is. In front: a new tab can
+  // open behind the checkout, where clicks never land ("element is outside of
+  // the viewport" until the step times out — seen 2026-10-08).
   const tab = await page.context().newPage();
+  await tab.bringToFront().catch(() => { });
   try {
     for (const v of plan.todo) {
       const r = await claimToBalance(tab, v.code);

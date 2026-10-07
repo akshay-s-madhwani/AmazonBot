@@ -5,6 +5,7 @@ import { chromium, type BrowserContext, type Page } from "./pw.js";
 import { loadAddress, loadConfig, loadDotEnv, loadProduct, parseRewardType, reloadDotEnv } from "./config.js";
 import { postEvent, type RunnerConfig, type StepResult } from "./protocol.js";
 import { LAST_STEP, LAST_STEP_INDEX, STEPS, stepAt, type StepContext } from "./steps.js";
+import { openRewardTab } from "./reward.js";
 import { describeForOperator } from "./failures.js";
 import type { SheetJob } from "./job-client.js";
 import { parseAccountProxy } from "./proxy.js";
@@ -446,13 +447,16 @@ async function main(): Promise<number> {
         process.exit(1);
       }
       await new Promise((r) => setTimeout(r, STEP_SETTLE_MS));
+      // check_reward works in its own mobile tab, left open when a row fails:
+      // that tab is what the operator needs to see, not the untouched main one.
+      const shotPage = (step.key === "check_reward" ? await openRewardTab(page) : null) ?? page;
       const shot = await capture(
-        page,
+        shotPage,
         cfg.artifacts_dir,
         `${i}-${step.key}-${result.status}`,
         result.status === "failed",
       );
-      const url = page.url();
+      const url = shotPage.url();
 
       await postEvent(cfg.slot_url, cfg.token, {
         type: "step.finished",

@@ -10,6 +10,8 @@ export interface BasketItem {
   title: string;
   /** Multi-address: units per delivery address, in address order. Absent = an even split. */
   shares?: number[];
+  /** A free product Amazon adds at checkout: never put in the cart or stepped, only routed. */
+  free?: boolean;
 }
 export interface CheckoutEvidence { items: BasketItem[]; address: string }
 export interface OrderEvidence { id: string; placedAt: string | null; items: BasketItem[]; cancelled: boolean }

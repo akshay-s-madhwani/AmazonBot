@@ -12,8 +12,8 @@ import { chooseAnswer, planCoupons } from "./reward.js";
 import { couponNumbers, matchCoupon, parseWantedCoupons } from "./coupons.js";
 import { parseRewardType } from "./config.js";
 import { addressKey, targetKey } from "./address.js";
-import { checkoutAddressKey, matchBasketItem, planRowMoves, sheetAddressKey } from "./checkout.js";
-import { allocate, parseItemsQuantity } from "./allocation.js";
+import { checkoutAddressKey, matchBasketItem, planRowAction, sheetAddressKey } from "./checkout.js";
+import { allocate, parseItemsQuantity, placeFreeItems } from "./allocation.js";
 import { planVouchers } from "./vouchers.js";
 import { parseAccountProxy } from "./proxy.js";
 
@@ -193,15 +193,15 @@ test("Allocation: the cart takes the Items quantity; several addresses must spli
   const p = (itemId: string, quantity: number) => ({ itemId, url: `https://amazon.in/dp/${itemId}`, quantity, purchaseOption: "auto" as const });
   const at = (fullName: string, itemsQuantity = "") => ({ fullName, phone: "", pincode: "521333", line1: "1", line2: "",
     landmark: "", city: "", state: "", country: "India", itemsQuantity });
-  assert.deepEqual(allocate([p("1", 2), p("2", 5)], [at("a")]), { multi: false, shares: [[2], [5]], totals: [2, 5] });
+  assert.deepEqual(allocate([p("1", 2), p("2", 5)], [at("a")]), { multi: false, shares: [[2], [5]], totals: [2, 5], free: [] });
   // Items quantity 5 over three addresses, any split that adds up: 3 + 1 + 1.
   const three = [at("a", "1_3\n2_2"), at("b", "1_1\n2_1"), at("c", "1_1")];
   assert.deepEqual(allocate([p("1", 5), p("2", 3)], three), {
-    multi: true, shares: [[3, 1, 1], [2, 1, 0]], totals: [5, 3],
+    multi: true, shares: [[3, 1, 1], [2, 1, 0]], totals: [5, 3], free: [0, 0, 0],
   });
   // Lines for the same item in one address add up.
   assert.deepEqual(allocate([p("1", 4)], [at("a", "1_1\n1_2"), at("b", "1_1")]), {
-    multi: true, shares: [[3, 1]], totals: [4],
+    multi: true, shares: [[3, 1]], totals: [4], free: [0, 0],
   });
   assert.match(allocate([p("1", 5)], three) as string, /item_id 2 is not in this account's items/);
   assert.match(allocate([p("1", 6), p("2", 3)], three) as string, /^item 1: Items quantity 6, but the addresses add up to 5 \(3\/1\/1\)/);
@@ -212,17 +212,55 @@ test("Allocation: the cart takes the Items quantity; several addresses must spli
   assert.match(allocate([p("1", 2), p("2", 3)], [at("a", "1_1"), at("b", "1_1")]) as string, /item 2 is in no ItemsQuantity/);
 });
 
-test("Multi-address rows: each address gets its share of each item", () => {
+test("Free items: *_N routes Amazon's free product; multi-address needs it exactly, single takes all", () => {
+  const p = (itemId: string, quantity: number) => ({ itemId, url: `https://amazon.in/dp/${itemId}`, quantity, purchaseOption: "auto" as const });
+  const at = (fullName: string, itemsQuantity = "") => ({ fullName, phone: "", pincode: "521333", line1: "1", line2: "",
+    landmark: "", city: "", state: "", country: "India", itemsQuantity });
+  const shampoo = { sku: "B0D6BNL45S", title: "WishCare Multi Peptide Anti Hairfall Shampoo", quantity: 1 };
+  // Account 17: 2 + 2 of item 11, the free one to the third address, which takes nothing else.
+  const acct17 = [at("suresh 4a", "11_2"), at("suresh 5a", "11_2"), at("suresh 6a", "*_1")];
+  const plan = allocate([p("11", 4)], acct17);
+  assert.deepEqual(plan, { multi: true, shares: [[2, 2, 0]], totals: [4], free: [0, 0, 1] });
+  if (typeof plan === "string") return;
+  assert.deepEqual(placeFreeItems(plan, [shampoo]), [[0, 0, 1]]);
+  assert.deepEqual(placeFreeItems(plan, []) , "ItemsQuantity sends 1 free item(s) (*_N) but no product page offers a free item");
+  assert.match(placeFreeItems(plan, [{ ...shampoo, quantity: 2 }]) as string, /2 free item\(s\) offered .* sends 1/);
+  // A free item and no "*" anywhere: multi-address fails at add_items.
+  const noStar = allocate([p("11", 4)], [at("a", "11_2"), at("b", "11_2")]);
+  if (typeof noStar === "string") throw new Error(noStar);
+  assert.match(placeFreeItems(noStar, [shampoo]) as string, /1 free item\(s\) offered \(WishCare.*\) but no address has \*_1/);
+  assert.deepEqual(placeFreeItems(noStar, []), []);
+  // Single address: everything goes there, no shares needed.
+  const single = allocate([p("11", 4)], [at("a")]);
+  if (typeof single === "string") throw new Error(single);
+  assert.equal(placeFreeItems(single, [shampoo]), null);
+  // Two free products share the "*" pool in address order.
+  const two = allocate([p("1", 2)], [at("a", "1_1\n*_1"), at("b", "1_1\n*_1")]);
+  if (typeof two === "string") throw new Error(two);
+  assert.deepEqual(placeFreeItems(two, [shampoo, { sku: "B000000002", title: "Other", quantity: 1 }]), [[1, 0], [0, 1]]);
+});
+
+test("Multi-address rows: one row per address, at that address's share", () => {
   const keys = ["a", "b"];
-  const shares = [[2, 1], [0, 1]];
-  const rows = [{ item: 0, key: null }, { item: 0, key: null }, { item: 0, key: null }, { item: 1, key: null }];
-  assert.deepEqual(planRowMoves(rows, keys, shares), { row: 0, key: "a" });
-  const done = [{ item: 0, key: "a" }, { item: 0, key: "b" }, { item: 0, key: "a" }, { item: 1, key: "b" }];
-  assert.equal(planRowMoves(done, keys, shares), null);
-  // Too many on "a": a unit moves from it to the address that is short.
-  const over = [{ item: 0, key: "a" }, { item: 0, key: "a" }, { item: 0, key: "a" }, { item: 1, key: "b" }];
-  assert.deepEqual(planRowMoves(over, keys, shares), { row: 0, key: "b" });
-  assert.match(planRowMoves(rows.slice(1), keys, shares) as string, /item 1 has 2 unit\(s\) on the page, expected 3/);
+  // 8 of item 1 to "a" only (the minimum-quantity case): one row, stepped to 8.
+  assert.deepEqual(planRowAction([{ item: 0, qty: 2, key: "b" }], keys, [[8, 0]]), { kind: "assign", row: 0, key: "a" });
+  assert.deepEqual(planRowAction([{ item: 0, qty: 2, key: "a" }], keys, [[8, 0]]), { kind: "step", row: 0, dir: "increment" });
+  assert.equal(planRowAction([{ item: 0, qty: 8, key: "a" }], keys, [[8, 0]]), null);
+  // 2 + 2 over two addresses: one more row, then each row its address and count.
+  const shares = [[2, 2], [0, 1]];
+  const start = [{ item: 0, qty: 4, key: "a" }, { item: 1, qty: 1, key: "a" }];
+  assert.deepEqual(planRowAction(start, keys, shares), { kind: "split", row: 0 });
+  const split = [{ item: 0, qty: 3, key: "a" }, { item: 0, qty: 1, key: "a" }, { item: 1, qty: 1, key: "a" }];
+  assert.deepEqual(planRowAction(split, keys, shares), { kind: "assign", row: 1, key: "b" });
+  const assigned = [{ item: 0, qty: 3, key: "a" }, { item: 0, qty: 1, key: "b" }, { item: 1, qty: 1, key: "a" }];
+  assert.deepEqual(planRowAction(assigned, keys, shares), { kind: "step", row: 0, dir: "decrement" });
+  const sized = [{ item: 0, qty: 2, key: "a" }, { item: 0, qty: 2, key: "b" }, { item: 1, qty: 1, key: "a" }];
+  assert.deepEqual(planRowAction(sized, keys, shares), { kind: "assign", row: 2, key: "b" });
+  assert.equal(planRowAction([...sized.slice(0, 2), { item: 1, qty: 1, key: "b" }], keys, shares), null);
+  // The bad old state (8 rows of one address): rows it does not need go.
+  const eight = Array.from({ length: 8 }, () => ({ item: 0, qty: 2, key: "a" }));
+  assert.deepEqual(planRowAction(eight, keys, [[8, 0]]), { kind: "delete", row: 1 });
+  assert.match(planRowAction([], keys, [[8, 0]]) as string, /item 1 is not on the multi-address page/);
 });
 
 test("Multi-address rows match basket items by ASIN, else by title", () => {

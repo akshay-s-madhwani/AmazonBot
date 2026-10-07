@@ -25,6 +25,7 @@ interface BuyBox {
   rows: Array<{ id: string; name: string; active: boolean; label: string }>;
   hasCoupon: boolean;
   couponChecked: boolean;
+  couponApplied: boolean;
   couponLabel: string;
   hasBuyNow: boolean;
   hasAddToCart: boolean;
@@ -71,6 +72,10 @@ async function readBuyBox(page: Page): Promise<BuyBox> {
       rows,
       hasCoupon: !!couponInput,
       couponChecked: couponInput?.checked ?? false,
+      // "5% off coupon applied" (span#done<id>), shown once Amazon took it.
+      couponApplied: [...(couponBox?.querySelectorAll('[id^="done"]') ?? [])].some(
+        (e) => (e as HTMLElement).getClientRects().length > 0 && /applied/i.test((e as HTMLElement).innerText),
+      ),
       couponLabel: clean((couponBox as HTMLElement | null)?.innerText).slice(0, 80),
       hasBuyNow: !!q("#buy-now-button"),
       hasAddToCart: !!q("#add-to-cart-button"),
@@ -171,7 +176,8 @@ export async function runOpenProduct(page: Page, spec: ProductSpec): Promise<Pro
   }
 
   if (spec.expectedPrice !== undefined) {
-    const tolerance = Number(process.env.PRICE_TOLERANCE ?? "15");
+    // The Items row's `buffer`, else ₹5 (PRICE_TOLERANCE overrides the default).
+    const tolerance = spec.priceBuffer ?? Number(process.env.PRICE_TOLERANCE ?? "5");
     if (box.price === null) {
       return {
         ok: false,
@@ -255,20 +261,36 @@ export async function runApplyCoupon(page: Page): Promise<ProductResult> {
     console.log("[bot] no coupon on this listing — skipping");
     return { ok: true, detail: "no coupon offered" };
   }
-  if (box.couponChecked) {
+  if (box.couponChecked || box.couponApplied) {
     return { ok: true, detail: "coupon already applied" };
   }
 
   await pause("applying coupon");
   console.log(`[bot] coupon found: ${box.couponLabel}`);
-  const cb = page.locator('#promoPriceBlockMessage_feature_div input[type="checkbox"]').first();
-  await cb.scrollIntoViewIfNeeded({ timeout: 5_000 }).catch(() => { });
-  await cb.dispatchEvent("click");
+  // The real checkbox is invisible (opacity 0) under a drawn white box; a
+  // scripted click on it did not reach Amazon's handler (B078T4KPBQ,
+  // 2026-10-08). Click the visible box the way a person does.
+  const visibleBox = page
+    .locator('#promoPriceBlockMessage_feature_div label:has(input[type="checkbox"]) i.a-icon-checkbox')
+    .first();
+  const target = (await visibleBox.isVisible().catch(() => false))
+    ? visibleBox
+    : page.locator('#promoPriceBlockMessage_feature_div label:has(input[type="checkbox"])').first();
+  await target.scrollIntoViewIfNeeded({ timeout: 5_000 }).catch(() => { });
+  await shortPause();
+  const clicked = await target.click({ timeout: 10_000 }).then(() => true).catch(() => false);
+  if (!clicked) {
+    await page.locator('#promoPriceBlockMessage_feature_div input[type="checkbox"]').first()
+      .click({ force: true, timeout: 10_000 }).catch(() => { });
+  }
   await pause("coupon toggled");
 
+  if (/\/ap\/signin/.test(page.url())) {
+    return { ok: false, reason: "applying the coupon asked to sign in again" };
+  }
   const after = await readBuyBox(page);
-  if (!after.couponChecked) {
-    return { ok: false, reason: `coupon checkbox did not stay checked (${box.couponLabel})` };
+  if (!after.couponChecked && !after.couponApplied) {
+    return { ok: false, reason: `coupon did not apply (${box.couponLabel})` };
   }
   return { ok: true, detail: `coupon applied: ${box.couponLabel}` };
 }

@@ -114,6 +114,57 @@ async function waitForDeletion(page: Page, before: CartState): Promise<boolean> 
   return false;
 }
 
+/**
+ * What the product page offers free ("Free with this product worth ₹99",
+ * #freebies_feature_div, seen 2026-10-08): the free product's ASIN, title and
+ * the seller the offer is tied to. This is the bot's only check for a free
+ * item — the cart does not list it; Amazon adds it at checkout. Null = none.
+ */
+export async function readOfferedFreebie(
+  page: Page,
+  waitMs = 0,
+): Promise<{ sku: string; title: string; seller: string } | null> {
+  // Signed-in only, and drawn after the rest of the page: give it time, and
+  // bring it into view in case it loads as it scrolls in.
+  const deadline = Date.now() + waitMs;
+  for (let tries = 0; ; tries++) {
+    const found = await readFreebieBox(page);
+    if (found || Date.now() >= deadline) return found;
+    if (tries === 0) {
+      await page.locator("#freebies_feature_div, #promoPriceBlockMessage_feature_div, #corePrice_feature_div")
+        .first().scrollIntoViewIfNeeded({ timeout: 3_000 }).catch(() => { });
+    }
+    await sleep(1000);
+  }
+}
+
+async function readFreebieBox(page: Page): Promise<{ sku: string; title: string; seller: string } | null> {
+  return page
+    .evaluate(() => {
+      // The feature div by id, else whatever block says "Free with this product".
+      let box: Element | null = document.querySelector("#freebies_feature_div");
+      if (!box || !/free with this product/i.test((box as HTMLElement).innerText ?? "")) {
+        const head = [...document.querySelectorAll("span, div, h2, h3")].find(
+          (e) => e.childElementCount < 4 && /^\s*free with this product/i.test(e.textContent ?? ""),
+        );
+        box = head ?? null;
+        for (let i = 0; box && i < 6 && !box.querySelector("[data-asin]"); i++) box = box.parentElement;
+      }
+      if (!box || !/free with this product/i.test((box as HTMLElement).innerText ?? "")) return null;
+      const sku = box.querySelector("[data-asin]")?.getAttribute("data-asin") ?? "";
+      // A leaf's own text, not cut short with "…": containers join the full
+      // and the truncated title into one string.
+      const title = [...box.querySelectorAll("a, span, div")]
+        .filter((e) => e.childElementCount === 0)
+        .map((e) => (e.textContent ?? "").replace(/\s+/g, " ").trim())
+        .filter((t) => t.length > 15 && !/…$|\.\.\.$/.test(t) && !/free with this product|offer applicable|see all eligible/i.test(t))
+        .sort((a, b) => b.length - a.length)[0] ?? "";
+      const seller = (box.querySelector('a[href*="redirectMerchantId="]')?.getAttribute("href") ?? "").match(/redirectMerchantId=([A-Z0-9]+)/)?.[1] ?? "";
+      return sku || title ? { sku, title, seller } : null;
+    })
+    .catch(() => null);
+}
+
 export async function runClearCart(page: Page): Promise<CheckoutResult> {
   await pause("opening cart to clear it");
   await openCart(page);
@@ -352,7 +403,6 @@ export async function runProceedToBuy(page: Page): Promise<CheckoutResult> {
 
 
 const ITEMSELECT_ROW = 'span[id^="line-item-address-"]';
-const SPLIT_LINK = "#stmaLink";
 
 async function openAddressPicker(page: Page): Promise<CheckoutResult> {
   if (/\/checkout\/p\/[^/]+\/address/.test(page.url())) return { ok: true, detail: "address list open" };
@@ -421,33 +471,52 @@ async function readBasketRows(page: Page, basket: BasketItem[]): Promise<ItemRow
   return out;
 }
 
+/** One change to the multi-address page. */
+export type RowAction =
+  /** "Deliver this item to additional addresses" on this row's item: one more row. */
+  | { kind: "split"; row: number }
+  /** A row this item does not need (more rows than addresses). */
+  | { kind: "delete"; row: number }
+  | { kind: "assign"; row: number; key: string }
+  | { kind: "step"; row: number; dir: "increment" | "decrement" };
+
 /**
- * The next row to move so that every item gives each address its share
- * (shares[item][address]): null when done, a reason when it never can be.
+ * The next change so that every item has ONE row per address it goes to,
+ * with that address's share as the row's quantity (shares[item][address]).
+ * Null when the page is right; a string when it never can be. Rows are not
+ * split into single units: an item with a minimum quantity (2) cannot be,
+ * and a row of 8 to one address is one row, not eight.
  */
-export function planRowMoves(
-  rows: Array<{ item: number; key: string | null }>,
+export function planRowAction(
+  rows: Array<{ item: number; qty: number; key: string | null }>,
   wantKeys: string[],
   shares: number[][],
-): { row: number; key: string } | null | string {
+): RowAction | null | string {
   for (const [item, share] of shares.entries()) {
+    const want = wantKeys.filter((_, a) => share[a]! > 0);
+    if (want.length === 0) continue;
     const idx = rows.flatMap((r, i) => (r.item === item ? [i] : []));
-    const total = share.reduce((n, q) => n + q, 0);
-    if (idx.length !== total) return `item ${item + 1} has ${idx.length} unit(s) on the page, expected ${total}`;
-    const owed = new Map(wantKeys.map((k, a) => [k, share[a]!]));
-    const count = new Map(wantKeys.map((k) => [k, 0]));
+    if (idx.length === 0) return `item ${item + 1} is not on the multi-address page`;
+    if (idx.length < want.length) {
+      // Peel the new row off the row with the most units.
+      const from = idx.reduce((b, i) => (rows[i]!.qty > rows[b]!.qty ? i : b), idx[0]!);
+      return { kind: "split", row: from };
+    }
+    // The row that already serves each wanted address (the first, if several).
+    const served = new Map<string, number>();
     for (const i of idx) {
       const k = rows[i]!.key;
-      if (k !== null && count.has(k)) count.set(k, count.get(k)! + 1);
+      if (k !== null && want.includes(k) && !served.has(k)) served.set(k, i);
     }
-    const short = wantKeys.find((k) => count.get(k)! < owed.get(k)!);
-    if (!short) continue;
-    // A row on a non-sheet address first, else one from an address with too many.
-    const spare =
-      idx.find((i) => rows[i]!.key === null || !count.has(rows[i]!.key!)) ??
-      idx.find((i) => count.get(rows[i]!.key!)! > owed.get(rows[i]!.key!)!);
-    if (spare === undefined) return `could not find a unit of item ${item + 1} to move`;
-    return { row: spare, key: short };
+    const spare = idx.filter((i) => ![...served.values()].includes(i));
+    if (idx.length > want.length) return { kind: "delete", row: spare[0]! };
+    const missing = want.find((k) => !served.has(k));
+    if (missing) return { kind: "assign", row: spare[0]!, key: missing };
+    for (const [k, i] of served) {
+      const need = share[wantKeys.indexOf(k)]!;
+      const have = rows[i]!.qty;
+      if (have !== need) return { kind: "step", row: i, dir: have < need ? "increment" : "decrement" };
+    }
   }
   return null;
 }
@@ -475,34 +544,46 @@ async function stepRowQuantity(page: Page, row: number, dir: "increment" | "decr
 }
 
 /**
- * The cart holds one unit of each item; this raises (or lowers) one item to
- * `want` units on the multi-address page with its row's quantity stepper.
- * A row is never stepped below 1: at 1 the "-" is a delete.
+ * Marks (data-bot-ctl) one control for row `row`, walking up from the row:
+ * the split link of its item card, or its own remove control. False = none.
  */
-async function setItemUnits(page: Page, basket: BasketItem[], item: number, want: number): Promise<CheckoutResult> {
-  const name = `"${basket[item]!.title.slice(0, 40)}"`;
-  for (let guard = 0; guard < want * 2 + 10; guard++) {
-    const rows = await readBasketRows(page, basket);
-    if (typeof rows === "string") return { ok: false, reason: rows };
-    const mine = rows.flatMap((r, n) => (r.item === item ? [{ ...r, n }] : []));
-    if (!mine.length) return { ok: false, reason: `${name} is not on the multi-address page` };
-    const have = mine.reduce((n, r) => n + r.qty, 0);
-    if (have === want) return { ok: true, detail: `${name} x${want}` };
-    const row = have < want ? mine[0] : mine.find((r) => r.qty > 1);
-    if (!row) return { ok: false, reason: `cannot lower ${name} to ${want} without deleting it` };
-    if (!(await stepRowQuantity(page, row.n, have < want ? "increment" : "decrement"))) {
-      return { ok: false, reason: `no quantity control for ${name} on the multi-address page` };
+async function markRowControl(page: Page, row: number, what: "split" | "delete"): Promise<boolean> {
+  return page.evaluate(([rowSel, n, kind]) => {
+    document.querySelectorAll("[data-bot-ctl]").forEach((e) => e.removeAttribute("data-bot-ctl"));
+    const shown = (e: Element) => (e as HTMLElement).getClientRects().length > 0;
+    const start = document.querySelectorAll(rowSel)[n as number];
+    if (!start) return false;
+    if (kind === "split") {
+      // The nearest card up from the row that holds a split link is its item's.
+      for (let el: Element | null = start; el && el !== document.body; el = el.parentElement) {
+        const link = [...el.querySelectorAll("#stmaLink, a, span[role=button]")].find(
+          (a) => shown(a) && (a.id === "stmaLink" || /additional address/i.test((a as HTMLElement).innerText ?? "")),
+        );
+        if (link) { link.setAttribute("data-bot-ctl", "1"); return true; }
+      }
+      return false;
     }
-    // The stepper redraws the page; wait for the item's units to move.
-    let moved = false;
-    for (const deadline = Date.now() + 10_000; !moved && Date.now() < deadline; ) {
-      await sleep(500);
-      const now = await readBasketRows(page, basket).catch(() => null);
-      if (Array.isArray(now)) moved = now.filter((r) => r.item === item).reduce((n, r) => n + r.qty, 0) !== have;
+    // Delete: the row's own remove control (the "x" beside its address), not
+    // anything in the quantity stepper, and not in a neighbouring row.
+    const rows = [...document.querySelectorAll(rowSel)];
+    for (let el: Element | null = start.parentElement; el && el !== document.body; el = el.parentElement) {
+      if (rows.some((r) => r !== start && el!.contains(r))) break;
+      const del = [...el.querySelectorAll("a, button, span[role=button], i, input[type=image]")].find((c) => {
+        if (!shown(c) || c.closest("[data-a-selector]")) return false;
+        const label = `${c.getAttribute("aria-label") ?? ""} ${c.getAttribute("title") ?? ""} ${(c as HTMLElement).innerText ?? ""} ${c.className}`;
+        return /remove|delete|close|×|✕|✖/i.test(label);
+      });
+      if (del) { del.setAttribute("data-bot-ctl", "1"); return true; }
     }
-    if (!moved) return { ok: false, reason: `quantity of ${name} did not change on the multi-address page` };
-  }
-  return { ok: false, reason: `could not set ${name} to ${want}` };
+    return false;
+  }, [ITEMSELECT_ROW, row, what] as [string, number, string]);
+}
+
+async function clickMarked(page: Page): Promise<void> {
+  const el = page.locator("[data-bot-ctl]").first();
+  await el.scrollIntoViewIfNeeded({ timeout: 5_000 }).catch(() => { });
+  await shortPause();
+  await el.click({ timeout: NAV_TIMEOUT_MS });
 }
 
 /** Picks one address for one row through its dropdown list, the way a person does. */
@@ -529,12 +610,13 @@ async function pickRowAddress(page: Page, row: number, want: string, label: stri
 }
 
 /**
- * MULTI-ADDRESS CHECKOUT. Change -> "Deliver to multiple addresses" -> raise
- * each item (one unit in the cart) to its total with the row's stepper ->
- * split every line until each row is one unit ("Deliver this item to
- * additional addresses" peels one unit off) -> each address gets its share of
- * every item (the basket's `shares`, from ItemsQuantity) -> Continue, back to
- * payment. Split + assign verified 2026-10-02; the stepper is not yet.
+ * MULTI-ADDRESS CHECKOUT. Change -> "Deliver to multiple addresses" -> every
+ * item gets ONE row per address it goes to ("Deliver this item to additional
+ * addresses" adds a row) -> each row gets its address and, with its own
+ * stepper, that address's share (the basket's `shares`, from ItemsQuantity)
+ * -> Continue, back to payment. 2026-10-08: rows are no longer split into
+ * single units — an item with a minimum quantity of 2 cannot be, and 8 to
+ * one address is one row of 8.
  */
 async function selectMultipleAddresses(page: Page, targets: TargetAddress[], basket: BasketItem[]): Promise<CheckoutResult> {
   const open = await openAddressPicker(page);
@@ -549,56 +631,73 @@ async function selectMultipleAddresses(page: Page, targets: TargetAddress[], bas
   await page.locator(ITEMSELECT_ROW).first().waitFor({ timeout: NAV_TIMEOUT_MS }).catch(() => { });
   await pause("multi-address page open");
 
-  for (const [i, b] of basket.entries()) {
-    const set = await setItemUnits(page, basket, i, b.quantity);
-    if (!set.ok) return set;
+  let read = await readBasketRows(page, basket);
+  if (typeof read === "string") return { ok: false, reason: read };
+  let rows = read;
+
+  // The product page promised it; Amazon adds it only here. Say so by name.
+  const missingFree = basket.find((b, i) => b.free && !rows.some((r) => r.item === i));
+  if (missingFree) {
+    return { ok: false, reason: `free item "${missingFree.title.slice(0, 40)}" (offered on the product page) is not at checkout` };
   }
 
-  // Split until every row is one unit. The page redraws after each split and
-  // the next row's link appears only then, so wait for it rather than stop.
-  for (let guard = 0; guard < 200; guard++) {
-    const before = await readItemRows(page);
-    if (!before.some((r) => r.qty > 1)) break;
-    const split = page.locator(SPLIT_LINK).filter({ visible: true }).first();
-    const shown = await split.waitFor({ timeout: 10_000 }).then(() => true).catch(() => false);
-    if (!shown) break;
-    await split.scrollIntoViewIfNeeded().catch(() => { });
-    await shortPause();
-    await split.click({ timeout: NAV_TIMEOUT_MS });
-    const deadline = Date.now() + 10_000;
-    while (Date.now() < deadline && (await readItemRows(page)).length <= before.length) await sleep(500);
-  }
-  const split = await readBasketRows(page, basket);
-  if (typeof split === "string") return { ok: false, reason: split };
-  let rows = split;
-  if (rows.some((r) => r.qty !== 1)) {
-    return { ok: false, reason: `could not split every item into single units (${rows.map((r) => r.qty).join("/")})` };
-  }
-
+  // One change at a time, re-reading the page after each: picking an address
+  // redraws the page and REORDERS the rows, so nothing is done by position.
   const wantKeys = targets.map(sheetAddressKey);
   const shares = basket.map((b) => b.shares!);
-  const plan = planRowMoves(rows, wantKeys, shares);
-  if (typeof plan === "string") return { ok: false, reason: plan };
-
-  // Picking an address redraws the page and REORDERS the rows, so nothing is
-  // assigned by position: after every pick the rows are read again and the
-  // next move is planned from what the page shows now.
-  for (let guard = 0; guard < rows.length * 3; guard++) {
-    const move = planRowMoves(rows, wantKeys, shares);
-    if (typeof move === "string") return { ok: false, reason: move };
-    if (!move) break;
-    const target = targets[wantKeys.indexOf(move.key)]!;
-    if (!(await pickRowAddress(page, move.row, move.key, target.fullName))) {
-      return { ok: false, reason: `address "${target.fullName}" is not offered at checkout` };
+  const sig = (r: ItemRow[]) => JSON.stringify(r);
+  const totalUnits = shares.flat().reduce((n, q) => n + q, 0);
+  for (let guard = 0; guard < totalUnits * 2 + rows.length * 3 + 20; guard++) {
+    const act = planRowAction(rows, wantKeys, shares);
+    if (typeof act === "string") return { ok: false, reason: act };
+    if (!act) break;
+    const r = rows[act.row]!;
+    const name = `"${basket[r.item]!.title.slice(0, 40)}"`;
+    const before = sig(rows);
+    if (act.kind === "assign") {
+      const target = targets[wantKeys.indexOf(act.key)]!;
+      console.log(`[bot] ${name}: a row -> ${target.fullName}`);
+      if (!(await pickRowAddress(page, act.row, act.key, target.fullName))) {
+        return { ok: false, reason: `address "${target.fullName}" is not offered at checkout` };
+      }
+    } else if (act.kind === "step") {
+      if (!(await stepRowQuantity(page, act.row, act.dir))) {
+        return { ok: false, reason: `no quantity control for ${name} on the multi-address page` };
+      }
+    } else {
+      console.log(`[bot] ${name}: ${act.kind === "split" ? "one more row for another address" : "removing a row no address needs"}`);
+      if (!(await markRowControl(page, act.row, act.kind))) {
+        return {
+          ok: false,
+          reason: act.kind === "split"
+            ? `no "Deliver this item to additional addresses" link for ${name}`
+            : `no remove control on a spare row of ${name}`,
+        };
+      }
+      await clickMarked(page);
     }
-    const now = await readBasketRows(page, basket);
+    // The page redraws after every change; wait for it to show.
+    let now: ItemRow[] | string = rows;
+    for (const deadline = Date.now() + 15_000; Date.now() < deadline; ) {
+      await sleep(600);
+      const got = await readBasketRows(page, basket).catch(() => null);
+      if (got !== null) now = got;
+      if (typeof now === "string" || sig(now) !== before) break;
+    }
     if (typeof now === "string") return { ok: false, reason: now };
+    if (sig(now) === before) return { ok: false, reason: `${name}: the page did not change after ${act.kind}` };
+    if (act.kind === "step" && act.dir === "decrement" &&
+        now.filter((x) => x.item === r.item).length < rows.filter((x) => x.item === r.item).length) {
+      // At the item's minimum quantity the "-" is a bin: it deleted the row.
+      const want = shares[r.item]![wantKeys.indexOf(r.key!)]!;
+      return { ok: false, reason: `${name}: ${want} for one address is below Amazon's minimum quantity (${r.qty})` };
+    }
     rows = now;
   }
-  if (planRowMoves(rows, wantKeys, shares) !== null) {
+  if (planRowAction(rows, wantKeys, shares) !== null) {
     return { ok: false, reason: "the items could not be given their ItemsQuantity per address" };
   }
-  console.log(`[bot] ${rows.length} unit(s) spread over ${targets.length} addresses`);
+  console.log(`[bot] ${rows.length} row(s), ${totalUnits} unit(s) over ${targets.length} addresses`);
 
   await pause("before continuing to payment");
   await page.locator("#checkout-primary-continue-button-id input").first().click({ timeout: NAV_TIMEOUT_MS });
@@ -667,18 +766,36 @@ export async function runSelectAddresses(page: Page, targets: TargetAddress[], b
 }
 
 
-export async function readBalanceRow(page: Page): Promise<{ present: boolean; usable: boolean; text: string }> {
+/**
+ * The Amazon Pay balance row: "Use your ₹617.00 Amazon Pay Balance" /
+ * "Amazon Pay Balance ₹0.00 Unavailable". Only a row with an amount counts —
+ * a banner above it, "View all Amazon vouchers in your Amazon Pay Balance",
+ * was read instead and left the balance unknown (2026-10-08). The ₹ sign is
+ * drawn by CSS there ("Use your 617.00 Amazon Pay Balance"), so the amount is
+ * read with or without it. Usable is judged on the block around the row,
+ * where "Insufficient balance" sits.
+ */
+export async function readBalanceRow(
+  page: Page,
+): Promise<{ present: boolean; usable: boolean; text: string; amount: number | null }> {
   return page.evaluate(() => {
-    const matches = [...document.querySelectorAll("div, li, label, span")].filter((e) =>
-      /amazon pay balance/i.test((e as HTMLElement).innerText ?? ""),
-    ) as HTMLElement[];
-    if (matches.length === 0) return { present: false, usable: false, text: "" };
+    const squash = (e: Element) => ((e as HTMLElement).innerText ?? "").replace(/\s+/g, " ").trim();
+    const AMOUNT = /(?:₹\s*)?(\d[\d,]*\.\d{2})\b/;
+    const matches = [...document.querySelectorAll("div, li, label, span")].filter((e) => {
+      const t = squash(e);
+      return /amazon pay balance/i.test(t) && AMOUNT.test(t) && t.length < 400;
+    }) as HTMLElement[];
+    if (matches.length === 0) return { present: false, usable: false, text: "", amount: null };
 
     const row = matches.reduce((best, e) => (best.contains(e) ? e : best), matches[0]!);
-
-    const full = (row.innerText ?? "").replace(/\s+/g, " ").trim();
-    const unusable = /unavailable|insufficient|add money/i.test(full);
-    return { present: true, usable: !unusable, text: full.slice(0, 160) };
+    let block: HTMLElement = row;
+    while (block.parentElement && !/another payment method/i.test(squash(block.parentElement)) && squash(block.parentElement).length < 400) {
+      block = block.parentElement;
+    }
+    const unusable = /unavailable|insufficient|add money/i.test(squash(block));
+    const text = squash(row);
+    const amount = Number((text.match(AMOUNT)?.[1] ?? "").replace(/,/g, ""));
+    return { present: true, usable: !unusable, text: text.slice(0, 160), amount: Number.isFinite(amount) && text.match(AMOUNT) ? amount : null };
   });
 }
 
@@ -1041,7 +1158,7 @@ export async function runApplyPayment(page: Page, payment: PaymentSpec): Promise
 
   const after = await readBalanceRow(page);
   console.log(`[bot] balance row: ${after.text || "(none)"}`);
-  const balNum = parseRupees(after.text);
+  const balNum = after.amount;
 
   if (totalNum === null || balNum === null) {
     return {

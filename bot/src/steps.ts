@@ -19,6 +19,7 @@ import { runCheckReward } from "./reward.js";
 import { runAddresses } from "./address.js";
 import { runApplyCoupon, runOpenProduct, runSetQuantity } from "./product.js";
 import {
+  readOfferedFreebie,
   runAddToCart,
   runApplyPayment,
   runClearCart,
@@ -28,7 +29,7 @@ import {
   runSelectAddresses,
 } from "./checkout.js";
 import { classifyFailure, type StepResult } from "./protocol.js";
-import { allocate } from "./allocation.js";
+import { allocate, placeFreeItems, type FreeItem } from "./allocation.js";
 import { runAddVouchers } from "./vouchers.js";
 
 /**
@@ -131,8 +132,10 @@ export const STEPS: StepDef[] = [
         };
       }
       console.log(`[bot] ✓ rewards: ${r.detail}`);
-      // Already claimed / COMPLETED rows are the only "nothing to do" outcomes.
-      return r.outcome === "collected" ? { status: "succeeded" } : { status: "skipped" };
+      // A coupon already claimed is a success (it is the account's, and the
+      // row is marked COMPLETED); "skipped" only when every row was COMPLETED
+      // in the sheet before this run and nothing was opened.
+      return r.outcome === "all_completed" ? { status: "skipped" } : { status: "succeeded" };
     },
   },
   {
@@ -180,6 +183,14 @@ export const STEPS: StepDef[] = [
       if (!cleared.ok) return toResult(cleared);
 
       const expected: BasketItem[] = [];
+      /**
+       * Free products the product pages offer ("Free with this product"): one
+       * unit per order for each product that offers it (a Lifebuoy pack x4
+       * brought one shampoo, 2026-10-08). Taken from the product page alone —
+       * the cart does not list them; Amazon adds them at checkout.
+       */
+      const freeItems: FreeItem[] = [];
+      const expectsFree = plan.free.some((q) => q > 0);
       for (const [i, item] of ctx.products.entries()) {
         // The Items quantity, with several addresses too: allocate() checked
         // the addresses add up to it, and select_address spreads it.
@@ -196,18 +207,46 @@ export const STEPS: StepDef[] = [
           quantity: plan.totals[i]!,
           ...(plan.multi ? { shares: plan.shares[i]! } : {}),
         });
-
         const qty = await runSetQuantity(page, item);
         if (!qty.ok) return toResult({ ok: false, reason: `${label}: ${qty.reason}` });
 
-        const coupon = item.applyCoupon === false ? { ok: true as const } : await runApplyCoupon(page);
+        // Only an apply_coupon TRUE row presses the product page's coupon box.
+        const coupon = item.applyCoupon === true ? await runApplyCoupon(page) : { ok: true as const };
         if (!coupon.ok) return toResult({ ok: false, reason: `${label}: ${coupon.reason}` });
+
+        // The product page's "Free with this product", read last before the
+        // add: it draws late. Long wait only when the sheet expects one.
+        const freebie = await readOfferedFreebie(page, expectsFree ? 15_000 : 2_000);
+        if (freebie?.sku) {
+          console.log(`[bot] ${label}: comes with a free ${freebie.title.slice(0, 60) || freebie.sku} (${freebie.sku})`);
+          const same = freeItems.find((f) => f.sku === freebie.sku);
+          if (same) same.quantity += 1;
+          else freeItems.push({ sku: freebie.sku, title: freebie.title || freebie.sku, quantity: 1 });
+        } else if (expectsFree) {
+          console.log(`[bot] ${label}: no "Free with this product" on the product page`);
+        }
 
         const added = await runAddToCart(page);
         if (!added.ok) return toResult({ ok: false, reason: `${label}: ${added.reason}` });
       }
+
+      // Free products Amazon will add at checkout: routed by "*_N", and part
+      // of the basket every later check holds checkout to.
+      const freeShares = placeFreeItems(plan, freeItems);
+      if (typeof freeShares === "string") {
+        return { status: "failed", failure_code: "missing_field", detail: freeShares, retriable: false };
+      }
+      for (const [f, item] of freeItems.entries()) {
+        console.log(
+          `[bot] free item: ${item.title.slice(0, 60)} (${item.sku}) x${item.quantity}` +
+            (freeShares ? ` -> ${freeShares[f]!.join("/")}` : ""),
+        );
+        expected.push({ ...item, free: true, ...(freeShares ? { shares: freeShares[f]! } : {}) });
+      }
+
       writeFileSync(join(ctx.artifactsDir, "expected-basket.json"), JSON.stringify(expected));
-      return toResult({ ok: true, detail: `${ctx.products.length} item(s) in cart` });
+      const free = freeItems.reduce((n, f) => n + f.quantity, 0);
+      return toResult({ ok: true, detail: `${ctx.products.length} item(s) in cart${free ? `, ${free} free at checkout` : ""}` });
     },
   },
   {

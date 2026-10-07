@@ -78,6 +78,7 @@ const ITEM_HEADERS = [
   "apply_coupon",
   "price",
   "notes",
+  "buffer",
 ] as const;
 
 type UserCol = (typeof USER_HEADERS)[number];
@@ -261,6 +262,10 @@ function parseItem(row: string[], icol: ColumnMap<ItemCol>): ProductSpec | null 
   const expectedPrice = priceRaw ? Number(priceRaw) : undefined;
   if (expectedPrice !== undefined && !Number.isFinite(expectedPrice)) return null;
 
+  const bufferRaw = cell(row, icol.buffer).replace(/[₹,\s]/g, "");
+  const priceBuffer = bufferRaw ? Number(bufferRaw) : undefined;
+  if (priceBuffer !== undefined && !(Number.isFinite(priceBuffer) && priceBuffer >= 0)) return null;
+
   const applyCouponRaw = cell(row, icol.apply_coupon);
   return {
     url: cell(row, icol.product_url),
@@ -268,6 +273,7 @@ function parseItem(row: string[], icol: ColumnMap<ItemCol>): ProductSpec | null 
     purchaseOption: opt as PurchaseOption,
     applyCoupon: icol.apply_coupon < 0 || applyCouponRaw === "" ? true : bool(applyCouponRaw),
     ...(expectedPrice !== undefined ? { expectedPrice } : {}),
+    ...(priceBuffer !== undefined ? { priceBuffer } : {}),
   };
 }
 
@@ -321,7 +327,9 @@ const WRITE_BACK_COLUMNS: readonly UserCol[] = [
 function rowRevision(row: string[], items: ProductSpec[], col: ColumnMap<UserCol>): string {
   const written = new Set<UserCol>(WRITE_BACK_COLUMNS);
   const input = USER_HEADERS.map((h) => (written.has(h) ? "" : cell(row, col[h])));
-  const basket = items.map((i) => [i.url, i.quantity, i.purchaseOption, i.expectedPrice, i.applyCoupon]);
+  // A buffer is hashed only when set, so adding the column moved no revision.
+  const basket = items.map((i) => [i.url, i.quantity, i.purchaseOption, i.expectedPrice, i.applyCoupon,
+    ...(i.priceBuffer !== undefined ? [i.priceBuffer] : [])]);
   return createHash("sha256")
     .update(JSON.stringify([input, basket]))
     .digest("hex")

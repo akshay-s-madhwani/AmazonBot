@@ -56,6 +56,8 @@ export interface ProductSpec {
   quantity: number;
   purchaseOption: PurchaseOption;
   expectedPrice?: number;
+  /** Items.buffer: how far (₹) the live price may be from expectedPrice. Absent = ₹5. */
+  priceBuffer?: number;
 }
 
 /**
