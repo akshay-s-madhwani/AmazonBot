@@ -105,7 +105,8 @@ function renderEnrollment(bot) {
     <div class="enroll">
       <span class="enroll-icon">${ICON_WAIT}</span>
       <div>
-        <h2 class="md-title-lg">${msg.enrollment.title}</h2>
+        <h2 class="md-title-lg">${e.rejection ? msg.enrollment.rejectedTitle : msg.enrollment.title}</h2>
+        ${e.rejection ? `<p class="md-body-sm"><b>${esc(e.rejection)}</b></p>` : ""}
         <p class="md-body-sm">${msg.enrollment.explainHtml(esc(bot.masterUrl))}</p>
         <div class="short-id">${esc(e.shortId)}</div>
         <p class="md-body-sm">${msg.enrollment.meanwhile}</p>

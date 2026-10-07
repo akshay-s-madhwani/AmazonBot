@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -17,11 +17,7 @@ export function readNodeIdFile(): string {
   }
 }
 
-export function writeNodeIdFile(id: string): void {
-  writeFileSync(NODE_ID_FILE, `${normaliseNodeId(id)}\n`, "utf8");
-}
-
-export type NodeIdSource = "argument" | "env" | "file" | "enrollment" | "unset";
+export type NodeIdSource = "argument" | "env" | "file" | "unset";
 
 export interface NodeIdentity {
   id: string;
@@ -49,8 +45,6 @@ export function describeNodeId(identity: NodeIdentity): string {
       return `${identity.id} (from NODE_ID)`;
     case "file":
       return `${identity.id} (from .node-id)`;
-    case "enrollment":
-      return `${identity.id} (assigned when this machine was approved)`;
     default:
       return "unset — will only run rows whose node_id is blank";
   }

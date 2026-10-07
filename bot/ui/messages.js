@@ -50,6 +50,7 @@ export const msg = {
    */
   enrollment: {
     title: "Waiting to be approved",
+    rejectedTitle: "Rejected by the control panel",
     explainHtml: (masterUrl) =>
       `This machine has announced itself to ${masterUrl} and is waiting for an ` +
       `operator. Open the control panel, go to <b>Bot Grid</b>, and approve the request ` +

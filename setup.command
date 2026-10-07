@@ -35,24 +35,36 @@ if [ "$(sysctl -n hw.optional.arm64 2>/dev/null)" != "1" ]; then
 fi
 echo "  [ok] Apple Silicon"
 
-# ---- Node.js 20.6+ -----------------------------------------------------------
-if ! command -v node >/dev/null 2>&1; then
-  echo "  [X] Node.js is not installed."
-  echo
-  echo "      Install the LTS build from https://nodejs.org/ (version 20.6 or"
-  echo "      newer, the macOS Installer), then run this script again."
-  echo
-  pause
-  exit 1
+# ---- Node.js 20.6+ -- installed through nvm when missing or too old ----------
+# A double-clicked script reads no shell profile, so load nvm by hand.
+export NVM_DIR="${NVM_DIR:-$HOME/.nvm}"
+load_nvm() { [ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"; }
+node_ok() {
+  command -v node >/dev/null 2>&1 &&
+    node -e 'const [a,b]=process.versions.node.split(".").map(Number);process.exit(a>20||(a===20&&b>=6)?0:1)'
+}
+load_nvm
+if ! node_ok; then
+  if command -v node >/dev/null 2>&1; then
+    echo "  ... Node.js $(node -v) is too old -- installing the current LTS through nvm."
+  else
+    echo "  ... Node.js is not installed -- installing the current LTS through nvm."
+  fi
+  if ! load_nvm; then
+    echo "  ... installing nvm"
+    # METHOD=script: no git, so no Xcode tools prompt on a fresh Mac.
+    curl -fsSL https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh | METHOD=script bash || fail
+    load_nvm || fail
+  fi
+  nvm install --lts || fail
+  nvm alias default 'lts/*' >/dev/null
+  nvm use default >/dev/null || fail
+  if ! node_ok; then
+    echo "  [X] Node.js is still not usable after the install."
+    fail
+  fi
 fi
 NODE_V="$(node -v)"
-if ! node -e 'const [a,b]=process.versions.node.split(".").map(Number);process.exit(a>20||(a===20&&b>=6)?0:1)'; then
-  echo "  [X] Node.js $NODE_V is too old -- 20.6 or newer is required."
-  echo "      Update from https://nodejs.org/ and run this script again."
-  echo
-  pause
-  exit 1
-fi
 # An Intel build of Node under Rosetta would ask ShardX for an Intel engine.
 if [ "$(node -p process.arch)" != "arm64" ]; then
   echo "  [X] Node.js $NODE_V is the Intel build."
@@ -113,6 +125,23 @@ echo "MASTER_URL=$MASTER_URL" >> "bot/.env.tmp"
 mv -f "bot/.env.tmp" "bot/.env"
 echo "  [ok] MASTER_URL written to bot/.env"
 
+# ---- this machine's node id -> bot/.node-id -----------------------------------
+# Always asked; Enter takes the machine name. This is the bot id the machine
+# is approved as. A copied folder's approval for another id is discarded by
+# the bot at start, and an id already in use is rejected by the master.
+[ -s "bot/.node-id" ] && echo "  current node id: $(tr -d '[:space:]' < bot/.node-id)"
+NODE_ID_DEFAULT="$(scutil --get LocalHostName 2>/dev/null || hostname -s)"
+NODE_ID_DEFAULT="$(printf '%s' "$NODE_ID_DEFAULT" | tr '[:upper:]' '[:lower:]')"
+while :; do
+  echo
+  read -r -p "  Node id [$NODE_ID_DEFAULT]: " NODE_ID_IN
+  NODE_ID_IN="${NODE_ID_IN:-$NODE_ID_DEFAULT}"
+  [[ "$NODE_ID_IN" =~ ^[A-Za-z0-9_-]{1,64}$ ]] && break
+  echo "  [X] Use letters, digits, - or _ only."
+done
+printf '%s\n' "$NODE_ID_IN" > "bot/.node-id"
+echo "  [ok] node id: $NODE_ID_IN"
+
 # ---- install + build, in dependency order -------------------------------------
 build_pkg() {
   echo "  --- $2 ---"
@@ -137,6 +166,8 @@ cat > "start.command" <<'EOF'
 #!/bin/bash
 cd "$(dirname "$0")/bot" || exit 1
 printf '\033]0;Bot\007'
+export NVM_DIR="${NVM_DIR:-$HOME/.nvm}"
+[ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"
 open http://127.0.0.1:7800
 node dist/manager.js
 echo

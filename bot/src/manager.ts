@@ -15,7 +15,14 @@ import { dirname, extname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import express, { type Request, type Response } from "express";
 import { loadDotEnv } from "./config.js";
-import { ensureEnrolled, formatShortId, loadCredentials, loadIdentity } from "./enroll.js";
+import {
+  discardForeignIdentity,
+  enrollmentRejection,
+  ensureEnrolled,
+  formatShortId,
+  loadCredentials,
+  loadIdentity,
+} from "./enroll.js";
 import {
   AGENT_VERSION,
   fleetConfigFromCredentials,
@@ -26,7 +33,7 @@ import {
   type FleetHooks,
 } from "./fleet.js";
 import { appendEvent, logsDir, makeEvent, openLog, tee } from "./logs.js";
-import { describeNodeId, resolveNodeId, writeNodeIdFile } from "./node-id.js";
+import { describeNodeId, resolveNodeId } from "./node-id.js";
 import { JobClient, requireJobClient, type SheetJob } from "./job-client.js";
 import { sheetDirectMode } from "./sheet-direct.js";
 import { STEPS } from "./steps.js";
@@ -1002,7 +1009,11 @@ app.get("/api/overview", async (_req: Request, res: Response) => {
         ? { state: "standalone" }
         : creds
           ? { state: "approved", botId: creds.bot_id, natsUrl: creds.nats_url }
-          : { state: "pending", shortId: formatShortId(loadIdentity().short_id) },
+          : {
+            state: "pending",
+            shortId: formatShortId(loadIdentity().short_id),
+            rejection: enrollmentRejection(),
+          },
       link: fleet ? "linked" : "offline",
       localArtifacts: LOCAL_ARTIFACTS,
     },
@@ -1415,7 +1426,7 @@ async function linkToMaster(): Promise<void> {
       log("not approved — running standalone (no control panel, no telemetry)");
       return;
     }
-    adoptFleetIdentity(creds.bot_id);
+    if (!adoptFleetIdentity(creds.bot_id)) return;
     cfg = fleetConfigFromCredentials(creds, masterUrl);
   } else {
     try {
@@ -1436,17 +1447,19 @@ async function linkToMaster(): Promise<void> {
   }
 }
 
-function adoptFleetIdentity(botId: string): void {
-  if (NODE.id === botId) return;
-  if (NODE.id) {
-    log(
-      `WARNING: this machine was configured as "${NODE.id}" but was approved as ` +
-        `"${botId}" — using the approved id for both the control plane and sheet rows`,
-    );
-  }
-  writeNodeIdFile(botId);
-  NODE = { id: botId, source: "enrollment" };
-  log(`  bot id: ${describeNodeId(NODE)}`);
+/**
+ * The approval must be for this machine's .node-id — the id is never taken
+ * from the approval. .node-id is re-read: it may have been fixed while the
+ * master was refusing the old one.
+ */
+function adoptFleetIdentity(botId: string): boolean {
+  NODE = resolveNodeId();
+  if (NODE.id === botId) return true;
+  log(
+    `ERROR: approved as "${botId}" but .node-id is "${NODE.id}" — not joining. ` +
+      `Restart the bot to ask again as "${NODE.id}".`,
+  );
+  return false;
 }
 
 // Refuse the MASTER_URL + SHEET_ID mix here, at boot, rather than letting every
@@ -1459,9 +1472,19 @@ try {
 }
 
 const bootMasterUrl = (process.env.MASTER_URL ?? "").trim();
+if (bootMasterUrl) {
+  if (!NODE.id) {
+    log("FATAL: this machine has no node id. Run setup again, or write one into bot/.node-id.");
+    process.exit(1);
+  }
+  const reasons = discardForeignIdentity(NODE.id);
+  if (reasons.length > 0) {
+    log(`discarded this folder's fleet approval: ${reasons.join("; ")}`);
+    log(`asking to join again as "${NODE.id}"`);
+  }
+}
 const bootCredentials = bootMasterUrl ? loadCredentials() : null;
-if (bootCredentials) {
-  adoptFleetIdentity(bootCredentials.bot_id);
+if (bootCredentials && adoptFleetIdentity(bootCredentials.bot_id)) {
   fleet = FleetLink.buffer(fleetConfigFromCredentials(bootCredentials, bootMasterUrl), hooks);
 } else if (!bootMasterUrl) {
   const cfg = fleetConfigFromEnv(NODE.id);

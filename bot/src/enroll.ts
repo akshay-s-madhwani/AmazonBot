@@ -1,8 +1,9 @@
 import { createHash, randomBytes } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { hostname } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { resolveNodeId } from "./node-id.js";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const PKG_ROOT = join(HERE, "..");
@@ -35,20 +36,66 @@ export function formatShortId(shortId: string): string {
   return `${shortId.slice(0, 4)}-${shortId.slice(4)}`;
 }
 
+interface IdentityFile {
+  secret?: unknown;
+  /** The machine the identity was made on; a copied folder carries the wrong one. */
+  hostname?: unknown;
+}
+
+function readIdentityFile(): IdentityFile | null {
+  if (!existsSync(IDENTITY_FILE)) return null;
+  try {
+    return JSON.parse(readFileSync(IDENTITY_FILE, "utf8")) as IdentityFile;
+  } catch {
+    return null;
+  }
+}
+
+function writeIdentityFile(secret: string): void {
+  const body = { secret, short_id: shortIdFromSecret(secret), hostname: hostname() };
+  writeFileSync(IDENTITY_FILE, `${JSON.stringify(body, null, 2)}\n`, "utf8");
+}
+
 export function loadIdentity(): BotIdentity {
-  if (existsSync(IDENTITY_FILE)) {
-    try {
-      const raw = JSON.parse(readFileSync(IDENTITY_FILE, "utf8")) as { secret?: unknown };
-      if (typeof raw.secret === "string" && raw.secret.length >= 16) {
-        return { secret: raw.secret, short_id: shortIdFromSecret(raw.secret) };
-      }
-    } catch {
-    }
+  const raw = readIdentityFile();
+  if (raw && typeof raw.secret === "string" && raw.secret.length >= 16) {
+    // Made before identities recorded their machine: claim it for this one.
+    if (typeof raw.hostname !== "string") writeIdentityFile(raw.secret);
+    return { secret: raw.secret, short_id: shortIdFromSecret(raw.secret) };
   }
   const secret = randomBytes(32).toString("base64url");
-  const identity: BotIdentity = { secret, short_id: shortIdFromSecret(secret) };
-  writeFileSync(IDENTITY_FILE, `${JSON.stringify(identity, null, 2)}\n`, "utf8");
-  return identity;
+  writeIdentityFile(secret);
+  return { secret, short_id: shortIdFromSecret(secret) };
+}
+
+/**
+ * The bot id is this machine's .node-id, nothing else. An identity made on
+ * another machine (the bot folder was copied) or an approval for a different
+ * id is not this machine's: both files are deleted so it asks to join afresh,
+ * under a new short id, as the id in .node-id. Returns why, for the log.
+ */
+export function discardForeignIdentity(nodeId: string): string[] {
+  const reasons: string[] = [];
+  const raw = readIdentityFile();
+  if (raw && typeof raw.hostname === "string" && raw.hostname !== hostname()) {
+    reasons.push(`its identity was made on ${raw.hostname}, this machine is ${hostname()}`);
+  }
+  const creds = loadCredentials();
+  if (creds && creds.bot_id !== nodeId) {
+    reasons.push(`it was approved as "${creds.bot_id}" but .node-id is "${nodeId}"`);
+  }
+  if (reasons.length > 0) {
+    rmSync(IDENTITY_FILE, { force: true });
+    rmSync(CREDENTIALS_FILE, { force: true });
+  }
+  return reasons;
+}
+
+let rejection: string | null = null;
+
+/** Why the master is refusing this machine right now, if it is. */
+export function enrollmentRejection(): string | null {
+  return rejection;
 }
 
 export function loadCredentials(): FleetCredentials | null {
@@ -85,6 +132,10 @@ export async function ensureEnrolled(opts: EnrollOptions): Promise<FleetCredenti
   const existing = loadCredentials();
   if (existing) return existing;
 
+  if (!resolveNodeId().id) {
+    log("FATAL: this machine has no node id. Run setup again, or write one into bot/.node-id.");
+    return null;
+  }
   const identity = loadIdentity();
   const base = opts.masterUrl.replace(/\/+$/, "");
   const pretty = formatShortId(identity.short_id);
@@ -94,20 +145,27 @@ export async function ensureEnrolled(opts: EnrollOptions): Promise<FleetCredenti
   log(`this machine is not part of the fleet yet.`);
   log(`  short id:  ${pretty}`);
   log(`  machine:   ${hostname()}`);
+  log(`  node id:   ${resolveNodeId().id}`);
   log(`  master:    ${base}`);
   log(`approve it in the control panel (Bot Grid) — waiting...`);
   log("");
 
   let announced = false;
+  let idTaken = false;
   for (let attempt = 0; opts.maxPolls === undefined || attempt < opts.maxPolls; attempt++) {
     try {
-      if (!announced || attempt % 12 === 0) {
+      // While the id is refused, announce every round: .node-id is read afresh
+      // each time, so fixing the file is enough — no restart.
+      if (!announced || idTaken || attempt % 12 === 0) {
+        const nodeId = resolveNodeId().id;
         const res = await fetch(`${base}/enroll`, {
           method: "POST",
           headers: { "content-type": "application/json" },
           body: JSON.stringify({
             secret: identity.secret,
             hostname: hostname(),
+            // This machine's .node-id: the bot id it is approved as.
+            node_id: nodeId,
             os: osName(),
             agent_version: opts.agentVersion ?? "0.2.0",
             worker_count: opts.workerCount,
@@ -118,8 +176,26 @@ export async function ensureEnrolled(opts: EnrollOptions): Promise<FleetCredenti
           log(`delete ${IDENTITY_FILE} to generate a new identity, then restart.`);
           return null;
         }
+        if (res.status === 400) {
+          const err = ((await res.json().catch(() => ({}))) as { error?: string }).error;
+          log(`FATAL: the master refused this machine's request: ${err ?? "HTTP 400"}`);
+          return null;
+        }
         if (!res.ok) throw new Error(`master returned HTTP ${res.status}`);
         announced = true;
+        const ann = (await res.json().catch(() => ({}))) as { status?: string; reason?: string };
+        const wasTaken = idTaken;
+        idTaken = ann.status === "rejected" && ann.reason === "id_taken";
+        if (idTaken) {
+          rejection =
+            `Rejected: id "${nodeId}" already exists. ` +
+            `Update bot/.node-id with a unique id.`;
+          if (!wasTaken || attempt % 12 === 0) log(rejection);
+          await sleep(interval);
+          continue;
+        }
+        rejection = null;
+        if (wasTaken) log(`node id "${nodeId}" accepted — waiting for approval in the control panel`);
       }
 
       const poll = await fetch(`${base}/enroll/poll`, {

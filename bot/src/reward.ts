@@ -1,7 +1,7 @@
 import { pause, shortPause, sleep } from "./human.js";
 import { rewardActionable, rewardDone, type RewardMark, type RewardMarkExtra, type RewardSpec } from "./config.js";
 import { couponNumbers, describeCoupon, matchCoupon, parseWantedCoupons, type WantedCoupon } from "./coupons.js";
-import type { CDPSession, Page } from "./pw.js";
+import type { CDPSession, Locator, Page } from "./pw.js";
 
 /**
  * THE REWARD STEP. Three kinds, set per account by the Reward tab's `type`:
@@ -47,9 +47,10 @@ import type { CDPSession, Page } from "./pw.js";
  *   or SINGLE_CLICK_CHECK_IN), data-action-url and an activeButton /
  *   lockedButton class. A done card shows "Completed" and loses the button.
  *   -> Start opens the task page in the same tab (price drops, today's deals)
- *   -> any button[aria-label="Add to cart"] (a "+" icon on the deals page)
- *   -> back to the task page; "Refresh to check status" is only an image
- *      link to the same page. The next card turns active.
+ *   -> a product on it is opened (not the "+" Add to cart icon on its tile,
+ *      changed 2026-10-07) and its product page's Add to cart pressed
+ *   -> straight back to the task page's URL. The next card turns active.
+ *      ("Refresh to check status" is only an image link to the same page.)
  *   -> Claim (SINGLE_CLICK_CHECK_IN) updates the card over ajax to
  *      "View reward" -> /rewards/streaks/checkoutCoupons?streakId=... ->
  *      the same coupon screen as the spin.
@@ -82,7 +83,12 @@ const MCQ_OPTION = ".mcq-option";
 const TASK_CARD = "[data-engagement-streak-count]";
 const TASK_BUTTON = "#streakActionButtonServerData";
 const VIEW_REWARD = '[data-mix-operations="viewRewardButtonClick"]';
-const ADD_TO_CART = 'button[aria-label="Add to cart" i]';
+/** A product tile's link to its product page, on the deals page a task opens. */
+const PRODUCT_LINK = 'a[href*="/dp/"], a[href*="/gp/product/"], a[href*="/gp/aw/d/"]';
+const PRODUCT_PAGE = /\/(dp|gp\/product|gp\/aw\/d)\//i;
+/** The product page's own Add to cart, desktop and mobile site. */
+const PRODUCT_ADD_TO_CART =
+  '#add-to-cart-button, #add-to-cart-button-ubb, input[name="submit.add-to-cart"], button[name="submit.add-to-cart"]';
 /** A task card that does not advance after this many tries fails the row. */
 const TASK_ATTEMPTS = 3;
 const MAX_TASK_ROUNDS = 12;
@@ -673,52 +679,110 @@ async function cartCount(tab: Page): Promise<number> {
   return digits ? Number(digits) : -1;
 }
 
-/**
- * "Scroll down until you see an Add to Cart button, click it." Tries up to
- * three buttons (one can open an options sheet instead of adding) and counts
- * the add as done when Amazon's cart API answers or the cart badge goes up.
- */
-async function addAnyItemToCart(tab: Page): Promise<boolean> {
-  const tried = new Set<number>();
-  for (let scroll = 0; scroll < 20 && tried.size < 3; scroll++) {
-    const buttons = tab.locator(ADD_TO_CART);
-    const n = await buttons.count();
-    let index = -1;
+/** The product's id in a product link, so the same product is not opened twice. */
+function productKey(href: string): string {
+  return href.match(/\/(?:dp|gp\/product|gp\/aw\/d)\/([A-Z0-9]{10})/i)?.[1] ?? href;
+}
+
+/** The first visible product tile on the deals page not opened yet, scrolling down for one. */
+async function findProduct(tab: Page, tried: Set<string>): Promise<{ link: Locator; key: string } | null> {
+  for (let scroll = 0; scroll < 15; scroll++) {
+    const links = tab.locator(PRODUCT_LINK);
+    const n = await links.count();
     for (let i = 0; i < n; i++) {
-      if (tried.has(i)) continue;
-      if (await buttons.nth(i).isVisible().catch(() => false)) {
-        index = i;
-        break;
-      }
+      const link = links.nth(i);
+      const href = (await link.getAttribute("href").catch(() => null)) ?? "";
+      if (!href || tried.has(productKey(href))) continue;
+      if (await link.isVisible().catch(() => false)) return { link, key: productKey(href) };
     }
-    if (index < 0) {
-      await tab.mouse.wheel(0, 700).catch(() => {});
-      await sleep(1200);
-      continue;
-    }
-    tried.add(index);
-    const button = buttons.nth(index);
-    await button.scrollIntoViewIfNeeded().catch(() => {});
-    await shortPause();
-    const before = await cartCount(tab);
-    const added = tab
-      .waitForResponse(
-        (r) => r.request().method() === "POST" && /\/cart\/|add-to-cart|addtocart/i.test(r.url()) && r.ok(),
-        { timeout: 12_000 },
-      )
-      .then(() => true)
-      .catch(() => false);
-    await button.click({ timeout: 10_000 }).catch(() => {});
-    const apiOk = await added;
-    await sleep(1500);
-    const after = await cartCount(tab);
-    if (apiOk || (before >= 0 && after > before)) {
-      console.log(`[bot] rewards: added an item to the cart (cart ${before} -> ${after})`);
-      return true;
-    }
-    console.log("[bot] rewards: that Add to cart did not take — trying another item");
+    await tab.mouse.wheel(0, 700).catch(() => {});
+    await sleep(1200);
+  }
+  return null;
+}
+
+/**
+ * Press the product page's own Add to cart. Done when Amazon's cart API
+ * answers, the cart badge goes up, or the page moves on to the added-to-cart
+ * screen. False when the product has no usable button (needs a size or
+ * colour first, or is unavailable).
+ */
+async function addThisProduct(tab: Page): Promise<boolean> {
+  const buttons = tab.locator(PRODUCT_ADD_TO_CART);
+  let button: Locator | null = null;
+  for (let i = 0, n = await buttons.count(); i < n && !button; i++) {
+    const b = buttons.nth(i);
+    if ((await b.isVisible().catch(() => false)) && (await b.isEnabled().catch(() => false))) button = b;
+  }
+  if (!button) return false;
+  await button.scrollIntoViewIfNeeded().catch(() => {});
+  await shortPause();
+  const before = await cartCount(tab);
+  const added = tab
+    .waitForResponse(
+      (r) => r.request().method() === "POST" && /\/cart\/|add-to-cart|addtocart/i.test(r.url()) && r.ok(),
+      { timeout: 12_000 },
+    )
+    .then(() => true)
+    .catch(() => false);
+  await button.click({ timeout: 10_000 }).catch(() => {});
+  const apiOk = await added;
+  await sleep(1500);
+  const after = await cartCount(tab);
+  const moved = /\/cart\b|smart-wagon|huc\//i.test(tab.url());
+  if (apiOk || moved || (before >= 0 && after > before)) {
+    console.log(`[bot] rewards: added the product to the cart (cart ${before} -> ${after})`);
+    return true;
   }
   return false;
+}
+
+/**
+ * The deals page a task opens: click a product itself (not the "+" icon on
+ * its tile), and on its product page press Add to cart. Up to three products,
+ * back on the deals page between them — one can need options first.
+ */
+async function addProductFromDeals(tab: Page): Promise<boolean> {
+  const dealsUrl = tab.url();
+  const tried = new Set<string>();
+  for (let attempt = 0; attempt < 3; attempt++) {
+    if (attempt > 0) {
+      if (!(await goto(tab, dealsUrl))) return false;
+      await pause("back on the deals page");
+    }
+    const product = await findProduct(tab, tried);
+    if (!product) {
+      console.log(`[bot] rewards: no product to open on ${tab.url()}`);
+      return false;
+    }
+    tried.add(product.key);
+    console.log(`[bot] rewards: opening product ${product.key}`);
+    await product.link.scrollIntoViewIfNeeded().catch(() => {});
+    await shortPause();
+    // Same tab: a tile can open the product in a new one.
+    await product.link.evaluate((a: Element) => a.removeAttribute("target")).catch(() => {});
+    await product.link.click({ timeout: 10_000 }).catch(() => {});
+    const opened = await tab
+      .waitForURL(PRODUCT_PAGE, { timeout: 20_000, waitUntil: "domcontentloaded" })
+      .then(() => true)
+      .catch(() => false);
+    if (!opened) {
+      console.log(`[bot] rewards: product ${product.key} did not open (at ${tab.url()})`);
+      continue;
+    }
+    await pause("letting the product page load");
+    if (await addThisProduct(tab)) return true;
+    console.log(`[bot] rewards: product ${product.key} would not add — trying another`);
+  }
+  return false;
+}
+
+/** Straight back to the task board's own URL after the add. */
+async function backToTasks(tab: Page, taskUrl: string): Promise<TaskBoard> {
+  await goto(tab, taskUrl);
+  await pause("back on the task page");
+  await dismissCheckInDialog(tab);
+  return waitForTasks(tab);
 }
 
 /** Back to the task board and press "Refresh to check status" (an image link to the same page). */
@@ -809,16 +873,16 @@ async function runStickers(tab: Page, r: RewardSpec): Promise<RowResult> {
     await button.click({ timeout: 10_000 });
     await tab.waitForLoadState("domcontentloaded").catch(() => {});
     await pause("letting the task's page load");
-    if (!(await addAnyItemToCart(tab))) {
-      console.log(`[bot] rewards: no working Add to cart on ${tab.url()}`);
+    if (!(await addProductFromDeals(tab))) {
+      console.log(`[bot] rewards: no product would add to the cart from ${tab.url()}`);
       return { ok: false, reason: `Sticker task "${card.title}": could not add an item to the cart` };
     }
     await pause("after adding to cart");
-    board = await refreshTasks(tab, taskUrl);
+    board = await backToTasks(tab, taskUrl);
     // Progress can lag the add by a few seconds: look once more before retrying the card.
     if (board.cards.find((c) => c.active)?.index === card.index && !board.viewReward) {
       await sleep(5000);
-      board = await refreshTasks(tab, taskUrl);
+      board = await backToTasks(tab, taskUrl);
     }
   }
   return { ok: false, reason: `Sticker reward not reached after ${MAX_TASK_ROUNDS} rounds` };

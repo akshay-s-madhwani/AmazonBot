@@ -1,4 +1,5 @@
 @echo off
+if defined NVM_SYMLINK set "PATH=%NVM_SYMLINK%;%PATH%"
 cd /d "%~dp0bot"
 title Bot manager
 start "" http://127.0.0.1:7800

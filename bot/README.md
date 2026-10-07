@@ -116,14 +116,17 @@ setup.bat                        REM asks for the control panel URL
 setup.bat http://1.2.3.4:8080    REM or pass it in
 ```
 
-It checks Node.js, writes `MASTER_URL` into `.env`, installs and builds the two
-shared packages and this one, downloads the ShardX browser engine, creates the
-per-account profile store, writes a `start.bat` for future starts, and launches
-the bot.
+It installs Node.js (current LTS, through nvm for Windows) when it is missing
+or older than 20.6, writes `MASTER_URL` into `.env`, asks for this machine's
+**node id** (Enter takes the machine name) and saves it in `.node-id`, installs
+and builds the two shared packages and this one, downloads the ShardX browser
+engine, creates the profile store, writes a `start.bat` for future starts, and
+launches the bot. Windows asks for approval when nvm and Node are installed.
 
 **macOS** (Apple Silicon only — ShardX has no Intel Mac build): double-click
 [`setup.command`](../setup.command) at the AmazonBot root, or run
-`./setup.command http://1.2.3.4:8080`. It does the same steps and writes a
+`./setup.command http://1.2.3.4:8080`. It does the same steps (Node through
+nvm-sh, node id defaulting to the LocalHostName) and writes a
 `start.command`; [`run-manager.command`](../run-manager.command) and
 [`stop-manager.command`](../stop-manager.command) mirror the `.bat` pair. A copy
 that did not come through git (zip, AirDrop) loses the run permission and
@@ -144,7 +147,7 @@ Slow machines: the login waits can be raised in `.env` with `LOGIN_STEP_WAIT_MS`
 (45s), `LOGIN_NAV_TIMEOUT_MS` (45s), `LOGIN_TIMEOUT_MS` (200s) and
 `LOGIN_FINAL_CHECK_MS` (30s).
 
-Nothing else is configured on the machine. No token, no password, no node id.
+Nothing else is configured on the machine. No token, no password.
 
 ### Joining the fleet
 
@@ -162,9 +165,9 @@ version — over plain HTTP. Then it waits, printing that short id:
 
 In the panel, the header shows *"1 bot waiting to join"*. **Bot Grid** lists the
 request with the machine name, the IP the master observed, and the short id.
-Match that short id against the console above, set the bot id (prefilled from
-the hostname — this is the value the sheet's `node_id` column must match), and
-approve. Within five seconds the bot has its credentials and is in the grid.
+Match that short id against the console above and approve. The machine is
+approved as its own `.node-id` — the panel does not edit it, and it is the
+value the sheet's `node_id` column must match. Within five seconds the bot has its credentials and is in the grid.
 
 The secret never leaves this machine: the master keeps only its hash, and both
 sides derive the short id the same way, so what the operator approves is
@@ -174,8 +177,16 @@ Two files hold the result, both gitignored:
 
 | File | What |
 |---|---|
-| `.bot-identity.json` | the secret and short id. Delete it to ask again as a new machine. |
+| `.bot-identity.json` | the secret, short id and the machine it was made on. Delete it to ask again as a new machine. |
 | `.fleet-credentials.json` | bot id, API token, NATS coordinates. Delete it to re-enroll. |
+
+**The node id is `.node-id` and nothing else.** At start, a bot that finds an
+identity made on another machine (the folder was copied) or an approval for a
+different id deletes both files and asks to join again as `.node-id`. A request
+whose id another machine already holds is rejected by the master and listed in
+the Bot Grid — *"Rejected machine with id … as it already exists"* — and the bot
+console says the same. Write a unique id into `.node-id` (or rerun setup); the
+waiting bot picks it up on its next announce, no restart needed.
 
 Once joined, [`src/fleet.ts`](src/fleet.ts) dials **out** to the master, registers, heartbeats
 every 5s, streams step telemetry through a crash-safe on-disk outbox, pushes
