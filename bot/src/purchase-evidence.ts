@@ -131,48 +131,83 @@ const sameTitle = (a: string, b: string) => normalized(a).slice(0, 40) === norma
  * item's `shares`, else an even split of the quantity), and nothing ships
  * anywhere else.
  */
-export function reviewError(expected: BasketItem[], targets: TargetAddress[], shipments: Shipment[]): string | null {
+/**
+ * THE PRE-PURCHASE CHECK. What checkout is about to buy against the basket
+ * add_items built. The basket may SHRINK on the way — an item went
+ * unavailable, the operator removed one by hand, a free item went with its
+ * product (2026-10-08: refusing that was "too many locks"). It may never GROW
+ * or go elsewhere: an item nobody asked for, more units than asked, or an
+ * address not in the sheet stops the purchase.
+ *
+ * `changes` lists what shrank, for the log and the step detail; `shipping`
+ * is the addresses that still get something — the orders to look for after.
+ */
+export function reviewBasket(
+  expected: BasketItem[],
+  targets: TargetAddress[],
+  shipments: Shipment[],
+): { ok: false; error: string } | { ok: true; changes: string[]; shipping: TargetAddress[] } {
+  const fail = (error: string) => ({ ok: false as const, error });
   if (!expected.length || expected.some((i) => !i.title || !Number.isInteger(i.quantity) || i.quantity < 1)) {
-    return "expected basket identity is incomplete";
+    return fail("expected basket identity is incomplete");
   }
-  if (!targets.length) return "no delivery address to check against";
-  if (!shipments.length) return "the review page shows no delivery address";
+  if (!targets.length) return fail("no delivery address to check against");
+  if (!shipments.length) return fail("the review page shows no delivery address");
   const want = new Map(targets.map((t) => [sheetAddressKey(t), t]));
   const stray = shipments.find((s) => !s.key || !want.has(s.key));
-  if (stray) return `checkout ships to an address that is not in the sheet: ${stray.name}`;
+  if (stray) return fail(`checkout ships to an address that is not in the sheet: ${stray.name}`);
+  const changes: string[] = [];
+  const shipping: TargetAddress[] = [];
   for (const [a, t] of targets.entries()) {
     const key = sheetAddressKey(t);
     const here = shipments.filter((s) => s.key === key).flatMap((s) => s.items);
-    if (!here.length) return `nothing ships to ${t.fullName}`;
+    if (!here.length) {
+      changes.push(`nothing ships to ${t.fullName}`);
+      continue;
+    }
+    shipping.push(t);
     const extra = here.find((it) => !expected.some((e) => sameTitle(e.title, it.title)));
-    if (extra) return `${t.fullName} gets an item that was not requested: ${extra.title.slice(0, 50)}`;
+    if (extra) return fail(`${t.fullName} gets an item that was not requested: ${extra.title.slice(0, 50)}`);
     for (const e of expected) {
       let per: number;
       if (e.shares) {
-        if (e.shares.length !== targets.length) return "expected basket does not match the delivery addresses";
+        if (e.shares.length !== targets.length) return fail("expected basket does not match the delivery addresses");
         per = e.shares[a]!;
       } else {
-        if (e.quantity % targets.length !== 0) return `${e.title.slice(0, 40)}: quantity ${e.quantity} does not split over ${targets.length} addresses`;
+        if (e.quantity % targets.length !== 0) return fail(`${e.title.slice(0, 40)}: quantity ${e.quantity} does not split over ${targets.length} addresses`);
         per = e.quantity / targets.length;
       }
       const got = here.filter((it) => sameTitle(e.title, it.title)).reduce((n, it) => n + it.quantity, 0);
-      if (got !== per) return `${t.fullName}: ${e.title.slice(0, 40)} x${got}, expected x${per}`;
+      if (got > per) return fail(`${t.fullName}: ${e.title.slice(0, 40)} x${got}, more than the x${per} asked`);
+      if (got < per) changes.push(`${t.fullName}: ${e.title.slice(0, 40)} x${got} of x${per}`);
     }
   }
-  return null;
+  if (!shipping.length) return fail("nothing ships to any sheet address");
+  return { ok: true, changes, shipping };
 }
 
-/** One card on Your Orders: its id, who it ships to and its item titles. */
-export interface OrderCard { id: string; shipTo: string; titles: string[]; cancelled: boolean }
+/** reviewBasket's verdict alone: the reason it refuses, else null. */
+export function reviewError(expected: BasketItem[], targets: TargetAddress[], shipments: Shipment[]): string | null {
+  const r = reviewBasket(expected, targets, shipments);
+  return r.ok ? null : r.error;
+}
+
+/**
+ * One card on Your Orders: its id, who it ships to, its item titles, and the
+ * "Order placed" date as printed ("8 October 2026"; "" if not shown).
+ */
+export interface OrderCard { id: string; shipTo: string; titles: string[]; cancelled: boolean; placed?: string }
 
 export async function readOrderCards(page: Page): Promise<OrderCard[]> {
   return page.evaluate(() => [...document.querySelectorAll(".order-card, .js-order-card")].map((card) => {
     const text = (card as HTMLElement).innerText;
     const lines = text.split("\n").map((l) => l.trim()).filter(Boolean);
     const at = lines.findIndex((l) => /^ship to$/i.test(l));
+    const on = lines.findIndex((l) => /^order placed$/i.test(l));
     return {
       id: text.match(/\b\d{3}-\d{7}-\d{7}\b/)?.[0] ?? "",
       shipTo: at >= 0 ? lines[at + 1] ?? "" : "",
+      placed: on >= 0 ? lines[on + 1] ?? "" : "",
       titles: [...card.querySelectorAll('a[href*="/dp/"], a[href*="/gp/product/"]')]
         .map((a) => (a as HTMLElement).innerText.trim()).filter(Boolean),
       cancelled: /\bcancelled\b/i.test(text),
@@ -189,6 +224,44 @@ export function shipsTo(c: Pick<OrderCard, "shipTo">, t: Pick<TargetAddress, "fu
   const ship = nameOf(c.shipTo);
   if (!ship) return false;
   return /\.{3}|…/.test(c.shipTo) ? nameOf(t.fullName).startsWith(ship) : nameOf(t.fullName) === ship;
+}
+
+/**
+ * THE ORDERS FOR THIS ROW, BY NAME (note_order_id, 2026-10-08): on Your
+ * Orders, the orders shipping to the sheet's address names. Per address, its
+ * newest order — and any others placed the same day (Amazon can split one
+ * address's purchase into several orders). Cancelled orders do not count.
+ *
+ * `before`: Your Orders as select_payment / Pay Now saw it, when known. An
+ * order already there was not made by this run (the same address name can be
+ * reused on another day), so only newer ones count. Unknown (null): any order
+ * with the name counts.
+ *
+ * `shipping`: the addresses that have an order — the basket can have shrunk.
+ */
+export function ordersByName(
+  cards: OrderCard[],
+  targets: TargetAddress[],
+  before: string[] | null,
+): { ok: true; orders: OrderCard[]; shipping: TargetAddress[] } | { ok: false; reason: string } {
+  const old = new Set(before ?? []);
+  const pool = cards.filter((c) => !c.cancelled && !old.has(c.id));
+  const orders: OrderCard[] = [];
+  const shipping: TargetAddress[] = [];
+  for (const t of targets) {
+    const mine = pool.filter((c) => shipsTo(c, t));
+    if (!mine.length) continue;
+    // Your Orders lists newest first.
+    const newest = mine[0]!;
+    const same = newest.placed ? mine.filter((c) => c.placed === newest.placed) : [newest];
+    for (const o of same) if (!orders.includes(o)) orders.push(o);
+    shipping.push(t);
+  }
+  if (!orders.length) {
+    const names = targets.map((t) => t.fullName).join(", ");
+    return { ok: false, reason: `no order on Your Orders for ${names}${before ? " since Pay Now" : ""}` };
+  }
+  return { ok: true, orders, shipping };
 }
 
 /**

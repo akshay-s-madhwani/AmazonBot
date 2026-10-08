@@ -1,5 +1,5 @@
 import type { ProductSpec } from "./config.js";
-import { pause, shortPause } from "./human.js";
+import { pause, shortPause, sleep } from "./human.js";
 import type { Page } from "./pw.js";
 
 
@@ -23,6 +23,8 @@ interface BuyBox {
   explicitlyOutOfStock: boolean;
   availability: string;
   rows: Array<{ id: string; name: string; active: boolean; label: string }>;
+  /** How the page offers its coupon (see readCouponInPage); null = no control to press. */
+  couponKind: "checkbox" | "card" | "button" | null;
   hasCoupon: boolean;
   couponChecked: boolean;
   couponApplied: boolean;
@@ -34,8 +36,79 @@ interface BuyBox {
   priceText: string;
 }
 
+/** Set on the coupon control readCoupon picked, so it is clicked without a second search. */
+const COUPON_MARK = "data-fleet-coupon";
+
+/**
+ * The product page's coupon, whichever way Amazon draws it:
+ *   checkbox  "Apply 5% coupon" tick box in #promoPriceBlockMessage_feature_div
+ *   card      "Coupon Discount · Save 5% now · [Apply Coupon]" (#couponsCard_feature_div,
+ *             seen on B078T4KPBQ 2026-10-08); turns "Coupon Applied · ₹4.50 discount."
+ *   button    anything else on the buy area reading "Apply … coupon"
+ * Runs in the page (passed to evaluate), so it is self-contained. Marks the
+ * control to press with COUPON_MARK.
+ */
+function readCouponInPage(mark: string): {
+  kind: "checkbox" | "card" | "button" | null;
+  checked: boolean;
+  applied: boolean;
+  label: string;
+} {
+  const clean = (t: string | null | undefined) => (t ?? "").trim().replace(/\s+/g, " ");
+  const shown = (e: Element | null): e is HTMLElement =>
+    !!e && e.getClientRects().length > 0 && getComputedStyle(e).visibility !== "hidden" && !e.closest(".aok-hidden");
+  document.querySelectorAll(`[${mark}]`).forEach((e) => e.removeAttribute(mark));
+
+  // The old tick box. "5% off coupon applied" (span#done<id>) once Amazon took it.
+  const promo = document.querySelector("#promoPriceBlockMessage_feature_div");
+  const box = promo?.querySelector('input[type="checkbox"]') as HTMLInputElement | null;
+  if (box) {
+    const applied = [...promo!.querySelectorAll('[id^="done"]')].some(
+      (e) => shown(e) && /applied/i.test((e as HTMLElement).innerText),
+    );
+    return { kind: "checkbox", checked: box.checked, applied, label: clean((promo as HTMLElement).innerText).slice(0, 80) };
+  }
+
+  // The coupon card: ids repeat when Amazon renders it twice (centre column
+  // and buy box), so every copy is looked at and the visible one used.
+  const cards = [...document.querySelectorAll('[id="coupons-card-feature"]')].filter(shown);
+  const after = [...document.querySelectorAll('[id="coupons-card-heading-after-apply"]')].filter(shown);
+  const clipped = !!document.querySelector('[data-couponclippedstatus="true"]');
+  if (after.length > 0 || clipped) {
+    const card = (after[0]?.closest('[id="coupons-card-feature"]') ?? cards[0]) as HTMLElement | undefined;
+    return { kind: "card", checked: false, applied: true, label: clean(card?.innerText).slice(0, 80) };
+  }
+  const cardButton = [...document.querySelectorAll('[id="coupons-card-apply-button"]')].find(shown);
+  if (cardButton) {
+    cardButton.setAttribute(mark, "1");
+    const card = (cardButton.closest('[id="coupons-card-feature"]') ?? cardButton) as HTMLElement;
+    return { kind: "card", checked: false, applied: false, label: clean(card.innerText).slice(0, 80) };
+  }
+
+  // Any other "Apply coupon" control on the product's own area (not the
+  // carousels, not a closed quick-view popover).
+  const area = document.querySelectorAll("#centerCol, #rightCol, #desktop_buybox, #ppd");
+  for (const root of area) {
+    for (const el of root.querySelectorAll('button, input[type="submit"], input[type="button"], .a-button, label, a')) {
+      const text = clean((el as HTMLElement).innerText || (el as HTMLInputElement).value || el.getAttribute("aria-label"));
+      if (!/^apply\b.{0,20}\bcoupons?$/i.test(text) || !shown(el)) continue;
+      el.setAttribute(mark, "1");
+      const holder = (el.closest(".a-section") ?? el) as HTMLElement;
+      return { kind: "button", checked: false, applied: false, label: clean(holder.innerText).slice(0, 80) };
+    }
+  }
+  // Applied, with no control left to press.
+  const appliedText = [...document.querySelectorAll("#centerCol *, #rightCol *")].some(
+    (e) => e.children.length === 0 && /^coupon applied$/i.test(clean((e as HTMLElement).innerText)) && shown(e),
+  );
+  return { kind: null, checked: false, applied: appliedText, label: appliedText ? "Coupon Applied" : "" };
+}
+
 async function readBuyBox(page: Page): Promise<BuyBox> {
-  return page.evaluate(() => {
+  const coupon = await page
+    .evaluate(readCouponInPage, COUPON_MARK)
+    .catch(() => ({ kind: null, checked: false, applied: false, label: "" }));
+  const box = await page.evaluate(() => {
     const q = (s: string) => document.querySelector(s);
     const clean = (t: string | null | undefined) =>
       (t ?? "").trim().replace(/\s+/g, " ");
@@ -46,11 +119,6 @@ async function readBuyBox(page: Page): Promise<BuyBox> {
       active: el.classList.contains("a-accordion-active"),
       label: clean((el as HTMLElement).innerText).slice(0, 60),
     }));
-
-    const couponBox = q("#promoPriceBlockMessage_feature_div");
-    const couponInput = couponBox?.querySelector(
-      'input[type="checkbox"]',
-    ) as HTMLInputElement | null;
 
     const availability = clean((q("#availability") as HTMLElement | null)?.innerText).slice(0, 80);
     const outOfStock =
@@ -70,13 +138,6 @@ async function readBuyBox(page: Page): Promise<BuyBox> {
       explicitlyOutOfStock: outOfStock,
       availability,
       rows,
-      hasCoupon: !!couponInput,
-      couponChecked: couponInput?.checked ?? false,
-      // "5% off coupon applied" (span#done<id>), shown once Amazon took it.
-      couponApplied: [...(couponBox?.querySelectorAll('[id^="done"]') ?? [])].some(
-        (e) => (e as HTMLElement).getClientRects().length > 0 && /applied/i.test((e as HTMLElement).innerText),
-      ),
-      couponLabel: clean((couponBox as HTMLElement | null)?.innerText).slice(0, 80),
       hasBuyNow: !!q("#buy-now-button"),
       hasAddToCart: !!q("#add-to-cart-button"),
       quantityValue: qty ? qty.value : null,
@@ -94,6 +155,14 @@ async function readBuyBox(page: Page): Promise<BuyBox> {
       ).slice(0, 40),
     };
   });
+  return {
+    ...box,
+    couponKind: coupon.kind,
+    hasCoupon: coupon.kind !== null || coupon.applied,
+    couponChecked: coupon.checked,
+    couponApplied: coupon.applied,
+    couponLabel: coupon.label,
+  };
 }
 
 function chooseRow(box: BuyBox, pref: PurchaseOption): { id: string; why: string } | null {
@@ -266,31 +335,55 @@ export async function runApplyCoupon(page: Page): Promise<ProductResult> {
   }
 
   await pause("applying coupon");
-  console.log(`[bot] coupon found: ${box.couponLabel}`);
-  // The real checkbox is invisible (opacity 0) under a drawn white box; a
-  // scripted click on it did not reach Amazon's handler (B078T4KPBQ,
-  // 2026-10-08). Click the visible box the way a person does.
-  const visibleBox = page
-    .locator('#promoPriceBlockMessage_feature_div label:has(input[type="checkbox"]) i.a-icon-checkbox')
-    .first();
-  const target = (await visibleBox.isVisible().catch(() => false))
-    ? visibleBox
-    : page.locator('#promoPriceBlockMessage_feature_div label:has(input[type="checkbox"])').first();
-  await target.scrollIntoViewIfNeeded({ timeout: 5_000 }).catch(() => { });
-  await shortPause();
-  const clicked = await target.click({ timeout: 10_000 }).then(() => true).catch(() => false);
-  if (!clicked) {
-    await page.locator('#promoPriceBlockMessage_feature_div input[type="checkbox"]').first()
-      .click({ force: true, timeout: 10_000 }).catch(() => { });
+  console.log(`[bot] coupon found (${box.couponKind}): ${box.couponLabel}`);
+  await pressCoupon(page, box.couponKind);
+
+  // The card applies over ajax (POST /promotion/redeem/): give it a moment.
+  let after = box;
+  for (const deadline = Date.now() + 12_000; Date.now() < deadline; ) {
+    await sleep(1000);
+    if (/\/ap\/signin/.test(page.url())) {
+      return { ok: false, reason: "applying the coupon asked to sign in again" };
+    }
+    after = await readBuyBox(page);
+    if (after.couponChecked || after.couponApplied) break;
   }
   await pause("coupon toggled");
-
-  if (/\/ap\/signin/.test(page.url())) {
-    return { ok: false, reason: "applying the coupon asked to sign in again" };
-  }
-  const after = await readBuyBox(page);
   if (!after.couponChecked && !after.couponApplied) {
     return { ok: false, reason: `coupon did not apply (${box.couponLabel})` };
   }
-  return { ok: true, detail: `coupon applied: ${box.couponLabel}` };
+  console.log(`[bot] coupon applied: ${after.couponLabel || box.couponLabel}`);
+  return { ok: true, detail: `coupon applied: ${after.couponLabel || box.couponLabel}` };
+}
+
+/** Clicks the coupon control readBuyBox found, the way a person does. */
+async function pressCoupon(page: Page, kind: BuyBox["couponKind"]): Promise<void> {
+  if (kind === "checkbox") {
+    // The real checkbox is invisible (opacity 0) under a drawn white box; a
+    // scripted click on it did not reach Amazon's handler (B078T4KPBQ,
+    // 2026-10-08). Click the visible box.
+    const visibleBox = page
+      .locator('#promoPriceBlockMessage_feature_div label:has(input[type="checkbox"]) i.a-icon-checkbox')
+      .first();
+    const target = (await visibleBox.isVisible().catch(() => false))
+      ? visibleBox
+      : page.locator('#promoPriceBlockMessage_feature_div label:has(input[type="checkbox"])').first();
+    await target.scrollIntoViewIfNeeded({ timeout: 5_000 }).catch(() => { });
+    await shortPause();
+    const clicked = await target.click({ timeout: 10_000 }).then(() => true).catch(() => false);
+    if (!clicked) {
+      await page.locator('#promoPriceBlockMessage_feature_div input[type="checkbox"]').first()
+        .click({ force: true, timeout: 10_000 }).catch(() => { });
+    }
+    return;
+  }
+  // The "Apply Coupon" button readBuyBox marked. On an a-button the
+  // transparent input on top takes the click.
+  const button = page.locator(`[${COUPON_MARK}]`).first();
+  const input = button.locator("input.a-button-input");
+  const target = (await input.count().catch(() => 0)) > 0 ? input.first() : button;
+  await target.scrollIntoViewIfNeeded({ timeout: 5_000 }).catch(() => { });
+  await shortPause();
+  const clicked = await target.click({ timeout: 10_000 }).then(() => true).catch(() => false);
+  if (!clicked) await button.click({ force: true, timeout: 10_000 }).catch(() => { });
 }

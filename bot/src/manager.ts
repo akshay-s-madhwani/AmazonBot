@@ -37,6 +37,8 @@ import { describeNodeId, resolveNodeId } from "./node-id.js";
 import { JobClient, requireJobClient, type SheetJob } from "./job-client.js";
 import { sheetDirectMode } from "./sheet-direct.js";
 import { STEPS } from "./steps.js";
+import { describe as describeProc, fleetProcesses, fleetRoots, killAll, listProcesses, orphans, type FleetProc } from "./procs.js";
+import { profileIdForRun } from "./shardx.js";
 
 
 loadDotEnv();
@@ -314,6 +316,15 @@ function pidAlive(pid: number | null): boolean {
   }
 }
 
+async function isOurSlot(pid: number | null): Promise<boolean> {
+  if (!pid) return false;
+  try {
+    return fleetProcesses(await listProcesses(), fleetRoots()).some((p) => p.pid === pid && p.kind === "slot");
+  } catch {
+    return false;
+  }
+}
+
 async function reattachSlots(): Promise<void> {
   const entries = readRegistry();
   if (entries.length === 0) return;
@@ -329,7 +340,9 @@ async function reattachSlots(): Promise<void> {
 
     const status = entry.port ? await probeSlot(entry) : null;
     if (!status) {
-      const starting = !entry.port && pidAlive(entry.pid);
+      // After a reboot pids are reused: a live pid is only this slot if it
+      // still runs this folder's slot.js.
+      const starting = !entry.port && pidAlive(entry.pid) && (await isOurSlot(entry.pid));
       if (!starting) {
         dropRegistry(entry.runId);
         dropped++;
@@ -468,6 +481,8 @@ function spawnSlot(
   startDelayMs = 0,
   restoreOnly = false,
   stopAfter?: number,
+  /** A restored browser that runs on at once from this step (Remove blocks). */
+  restore?: { from?: number; unblocked?: boolean },
 ): SlotState {
   const slotIndex = freeSlotIndex();
   const runId = masterRunId ?? `run-${Date.now()}-${slotIndex}`;
@@ -496,6 +511,8 @@ function spawnSlot(
       // A checkpoint: the runner parks after this step instead of running on
       // to checkout. Absent means run to the end.
       ...(stopAfter !== undefined ? { SLOT_STOP_AFTER: String(stopAfter) } : {}),
+      ...(restore?.from !== undefined ? { SLOT_START_FROM: String(restore.from) } : {}),
+      ...(restore?.unblocked ? { SLOT_UNBLOCKED: "true" } : {}),
     },
   });
 
@@ -685,6 +702,64 @@ function reapExpiredSlots(now: number): void {
   }
 }
 
+// ---------------------------------------------------------------------------
+// ORPHAN SWEEP (2026-10-08). Slots, runners and browsers are detached so a
+// manager restart can reattach to them, which also means nothing collected
+// one whose owner died: runners parked on their control port forever,
+// browsers left open, machines unusable after a few runs. Right after boot
+// (once reattach has claimed what is still live) and every ORPHAN_SWEEP_MS
+// after, every process of this folder that no live slot owns is killed — on
+// the second sweep that sees it, so nothing caught mid-launch is touched.
+// ---------------------------------------------------------------------------
+const ORPHAN_SWEEP_MS = Number(process.env.ORPHAN_SWEEP_MS ?? 60_000);
+/** pid -> when a sweep first saw it orphaned. */
+const suspects = new Map<number, number>();
+let sweeping = false;
+
+function liveSet(): { slotPids: Set<number>; runIds: Set<string>; profileIds: Set<string> } {
+  const live = [...slots.values()].filter(slotAlive);
+  return {
+    slotPids: new Set(live.flatMap((s) => (s.pid ? [s.pid] : []))),
+    runIds: new Set(live.map((s) => s.runId)),
+    profileIds: new Set(live.map((s) => profileIdForRun(s.runId))),
+  };
+}
+
+/**
+ * Kills this folder's processes no live slot owns. `now`: no second look
+ * (boot, Reset, the cleanup button). `everything`: live slots' too.
+ */
+async function sweepOrphans(opts: { now?: boolean; everything?: boolean; dryRun?: boolean } = {}): Promise<FleetProc[]> {
+  if (sweeping) return [];
+  sweeping = true;
+  try {
+    const all = await listProcesses();
+    const fleetNow = fleetProcesses(all, fleetRoots());
+    const found = opts.everything ? fleetNow : orphans(fleetNow, liveSet());
+    const seen = new Set(found.map((p) => p.pid));
+    for (const pid of [...suspects.keys()]) if (!seen.has(pid)) suspects.delete(pid);
+    const doomed = found.filter((p) => {
+      if (opts.now) return true;
+      if (!suspects.has(p.pid)) {
+        suspects.set(p.pid, Date.now());
+        return false;
+      }
+      return true;
+    });
+    if (doomed.length === 0) return [];
+    if (opts.dryRun) return doomed;
+    const killed = await killAll(doomed, all);
+    for (const p of killed) suspects.delete(p.pid);
+    if (killed.length) log(`cleanup: killed ${killed.length} orphaned process(es): ${killed.map(describeProc).join(", ")}`);
+    return killed;
+  } catch (err) {
+    log(`cleanup sweep failed: ${(err as Error).message}`);
+    return [];
+  } finally {
+    sweeping = false;
+  }
+}
+
 function watchdogTick(): void {
   const now = Date.now();
   reapExpiredSlots(now);
@@ -777,6 +852,19 @@ app.post("/fleet/stop", async (_req: Request, res: Response) => {
     }
     res.json({ ok: true, stopped });
   } catch (err) { res.status(409).json({ error: (err as Error).message }); }
+});
+
+/**
+ * The cleanup button / script: kills this folder's orphaned slots, runners
+ * and browsers now. ?all=1 also takes the live ones (their runs are told
+ * session.closed as their slots exit). ?dry=1 only lists.
+ */
+app.post("/fleet/cleanup", async (req: Request, res: Response) => {
+  const everything = req.query.all === "1";
+  const dryRun = req.query.dry === "1";
+  if (everything && !dryRun) await hooks.reset().catch(() => 0);
+  const hit = await sweepOrphans({ now: true, everything, dryRun });
+  res.json({ ok: true, dry_run: dryRun, processes: hit.map((p) => ({ kind: p.kind, pid: p.pid, run_id: p.runId, profile: p.profileId })) });
 });
 
 function killPid(pid: number): void {
@@ -1230,11 +1318,12 @@ const hooks: FleetHooks = {
     return started.map((s) => s.runId);
   },
 
-  resumeRun: async (run_id, from, stopAfter) => {
+  resumeRun: async (run_id, from, stopAfter, unblocked) => {
     const s = liveSlotFor(run_id, "resume");
     const query = [
       ...(from === undefined ? [] : [`from=${from}`]),
       ...(stopAfter === undefined ? [] : [`stop_after=${stopAfter}`]),
+      ...(unblocked ? ["unblocked=1"] : []),
     ].join("&");
     await slotCall(s, "/resume", query);
     s.status = "BUSY";
@@ -1348,10 +1437,13 @@ const hooks: FleetHooks = {
     slots.clear();
     draining = false;
     log(`reset: ${freed} slot(s) freed and their browsers closed`);
+    // Whatever the slots left behind — and anything no slot was tracking any
+    // more — goes too. After the ack: listing processes can take seconds.
+    setTimeout(() => void sweepOrphans({ now: true }), 500);
     return freed;
   },
 
-  openBrowser: async (run_id, job_id) => {
+  openBrowser: async (run_id, job_id, opts) => {
     const existing = slotByRun(run_id);
     if (existing && slotAlive(existing)) {
       log(`open_browser: ${run_id} already has a live slot — nothing to do`);
@@ -1368,8 +1460,11 @@ const hooks: FleetHooks = {
     const job = JSON.parse(readFileSync(snapshot, "utf8")) as SheetJob;
     if (job.id !== job_id) throw new Error("run snapshot does not match the requested row");
     admitOneOrThrow(`restore of ${run_id}`);
-    spawnSlot(job, run_id, 0, true);
-    log(`open_browser: respawned a slot for ${run_id} (sheet row ${job.rowNumber})`);
+    spawnSlot(job, run_id, 0, true, undefined, opts);
+    log(
+      `open_browser: respawned a slot for ${run_id} (sheet row ${job.rowNumber})` +
+        (opts?.from !== undefined ? `, running from step ${opts.from}${opts.unblocked ? " with blocks removed" : ""}` : ""),
+    );
   },
 
   drain: async () => {
@@ -1506,6 +1601,9 @@ app.listen(PORT, "127.0.0.1", () => {
       pruneArtifacts();
       setInterval(pruneArtifacts, ARTIFACT_PRUNE_TICK_MS);
       setInterval(watchdogTick, WATCHDOG_TICK_MS);
+      // Reattach has claimed every slot still live: the rest is nobody's.
+      void sweepOrphans({ now: true });
+      if (ORPHAN_SWEEP_MS > 0) setInterval(() => void sweepOrphans(), ORPHAN_SWEEP_MS);
       void linkToMaster();
     });
 });

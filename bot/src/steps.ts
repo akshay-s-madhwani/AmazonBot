@@ -19,10 +19,15 @@ import { runCheckReward } from "./reward.js";
 import { runAddresses } from "./address.js";
 import { runApplyCoupon, runOpenProduct, runSetQuantity } from "./product.js";
 import {
+  openCart,
+  readFreebieMessages,
   readOfferedFreebie,
   runAddToCart,
   runApplyPayment,
+  saveOrdersBefore,
   runClearCart,
+  lookUpOrders,
+  recordOrders,
   runNoteOrderId,
   runPlaceOrder,
   runProceedToBuy,
@@ -31,6 +36,7 @@ import {
 import { classifyFailure, type StepResult } from "./protocol.js";
 import { allocate, placeFreeItems, type FreeItem } from "./allocation.js";
 import { runAddVouchers } from "./vouchers.js";
+import { pause, sleep } from "./human.js";
 
 /**
  * A hard stop for local debugging only. Keep it null in anything the panel
@@ -56,6 +62,8 @@ export interface StepContext {
   proxy?: Proxy | null;
   runId: string;
   artifactsDir: string;
+  /** Remove blocks: the operator aligned the checkout by hand (RunnerConfig.unblocked). */
+  unblocked?: boolean;
 }
 
 export function idempotencyKey(ctx: StepContext): string {
@@ -189,7 +197,7 @@ export const STEPS: StepDef[] = [
        * brought one shampoo, 2026-10-08). Taken from the product page alone —
        * the cart does not list them; Amazon adds them at checkout.
        */
-      const freeItems: FreeItem[] = [];
+      const pageOffers: FreeItem[] = [];
       const expectsFree = plan.free.some((q) => q > 0);
       for (const [i, item] of ctx.products.entries()) {
         // The Items quantity, with several addresses too: allocate() checked
@@ -214,24 +222,41 @@ export const STEPS: StepDef[] = [
         const coupon = item.applyCoupon === true ? await runApplyCoupon(page) : { ok: true as const };
         if (!coupon.ok) return toResult({ ok: false, reason: `${label}: ${coupon.reason}` });
 
-        // The product page's "Free with this product", read last before the
-        // add: it draws late. Long wait only when the sheet expects one.
-        const freebie = await readOfferedFreebie(page, expectsFree ? 15_000 : 2_000);
+        // The product page's "Free with this product" — a lenient look: it is
+        // not always shown, and the cart's own message is checked after the adds.
+        const freebie = await readOfferedFreebie(page, 3_000);
         if (freebie?.sku) {
-          console.log(`[bot] ${label}: comes with a free ${freebie.title.slice(0, 60) || freebie.sku} (${freebie.sku})`);
-          const same = freeItems.find((f) => f.sku === freebie.sku);
+          console.log(`[bot] ${label}: product page offers a free ${freebie.title.slice(0, 60) || freebie.sku} (${freebie.sku})`);
+          const same = pageOffers.find((f) => f.sku === freebie.sku);
           if (same) same.quantity += 1;
-          else freeItems.push({ sku: freebie.sku, title: freebie.title || freebie.sku, quantity: 1 });
-        } else if (expectsFree) {
-          console.log(`[bot] ${label}: no "Free with this product" on the product page`);
+          else pageOffers.push({ sku: freebie.sku, title: freebie.title || freebie.sku, quantity: 1 });
         }
 
         const added = await runAddToCart(page);
         if (!added.ok) return toResult({ ok: false, reason: `${label}: ${added.reason}` });
       }
 
-      // Free products Amazon will add at checkout: routed by "*_N", and part
-      // of the basket every later check holds checkout to.
+      // Free products Amazon will add at checkout. The "N FREE item(s) will be
+      // added to your order" box covers the whole cart, so it decides when
+      // shown: first on the "Added to cart" page the last add landed on, then
+      // (only if nothing was found anywhere yet and the sheet expects one) on
+      // the cart page. Else the product pages' offers. Fails only when the
+      // sheet expects a free item and none of the three shows one.
+      let freeItems: FreeItem[] = await readFreebieMessages(page);
+      let source = "the Added to cart page";
+      if (freeItems.length === 0 && pageOffers.length === 0 && expectsFree) {
+        await pause("checking the cart for the free item");
+        await openCart(page);
+        await sleep(1500);
+        freeItems = await readFreebieMessages(page);
+        source = "the cart page";
+      }
+      if (freeItems.length === 0 && pageOffers.length > 0) {
+        freeItems = pageOffers;
+        source = "the product page";
+      }
+      if (freeItems.length > 0) console.log(`[bot] free item(s) from ${source}`);
+      // Routed by "*_N", and part of the basket every later check holds checkout to.
       const freeShares = placeFreeItems(plan, freeItems);
       if (typeof freeShares === "string") {
         return { status: "failed", failure_code: "missing_field", detail: freeShares, retriable: false };
@@ -273,33 +298,60 @@ export const STEPS: StepDef[] = [
     inactivityMs: 60_000,
     run: async (page, ctx) => {
       const targets = deliveryAddresses(ctx);
-      if (targets.length < 2) return toResult(await runSelectAddresses(page, targets, []));
+      const opts = { unblocked: ctx.unblocked === true };
+      if (targets.length < 2) return toResult(await runSelectAddresses(page, targets, [], opts));
       const basket = readBasket(ctx.artifactsDir);
       if (!basket?.length || basket.some((b) => b.shares?.length !== targets.length)) {
         return toResult({ ok: false, reason: "no per-address basket from add_items - run add_items again" });
       }
-      return toResult(await runSelectAddresses(page, targets, basket));
+      return toResult(await runSelectAddresses(page, targets, basket, opts));
     },
   },
   {
     key: "select_payment",
     timeoutMs: 120_000,
     inactivityMs: 90_000,
-    run: async (page, ctx) => toResult(await runApplyPayment(page, ctx.payment)),
+    run: async (page, ctx) => {
+      const paid = await runApplyPayment(page, ctx.payment);
+      // Your Orders before Pay Now can be pressed — by the next step, or by
+      // hand while the run is parked here (note_order_id then finds the
+      // order). Taken even when this step fails: Remove blocks goes on past it.
+      await saveOrdersBefore(page, ctx.artifactsDir).catch((err: Error) =>
+        console.warn(`[bot] could not note Your Orders before Pay Now: ${err.message.split("\n")[0]}`));
+      return toResult(paid);
+    },
   },
   {
-    // Pay Now (skipped when this run already pressed it), then the ids from
-    // Your Orders. Was confirm_order + note_order_id until 2026-10-07.
+    // Your Orders FIRST: an order for the sheet's address names (placed by
+    // hand, or by an earlier press) is taken and the row is DONE — no Pay
+    // Now. Otherwise Pay Now, then the ids the same way. Was confirm_order +
+    // note_order_id until 2026-10-07; orders-first since 2026-10-08.
     key: "note_order_id",
     timeoutMs: 300_000,
     inactivityMs: 180_000,
     run: async (page, ctx) => {
-      const placed = await runPlaceOrder(page, idempotencyKey(ctx), ctx.artifactsDir, deliveryAddresses(ctx));
+      const key = idempotencyKey(ctx);
+      const targets = deliveryAddresses(ctx);
+      const existing = await lookUpOrders(page, ctx.artifactsDir, key, targets);
+      if (existing.ok) {
+        console.log(`[bot] Your Orders already has ${existing.detail} — taking it, no Pay Now`);
+        return toResult(await recordOrders(page, key, ctx.artifactsDir, targets, existing));
+      }
+      console.log(`[bot] ${existing.reason} — pressing Pay Now`);
+      const placed = await runPlaceOrder(page, key, ctx.artifactsDir, targets, { unblocked: ctx.unblocked === true });
       if (!placed.ok) return toResult(placed);
-      return toResult(await runNoteOrderId(page, idempotencyKey(ctx), ctx.artifactsDir, deliveryAddresses(ctx)));
+      return toResult(await runNoteOrderId(page, key, ctx.artifactsDir, targets));
     },
   },
 ];
+
+/**
+ * REMOVE BLOCKS — the steps whose failures are passed over (proceed_to_buy up
+ * to, not including, note_order_id; that step drops its own checks). The
+ * panel's Remove blocks also starts the run here.
+ */
+export const UNBLOCKABLE_FROM: number = STEPS.findIndex((s) => s.key === "proceed_to_buy");
+export const UNBLOCKABLE_UNTIL: number = STEPS.findIndex((s) => s.key === "note_order_id");
 
 export function stepAt(index: number): StepDef | undefined {
   return STEPS[index];

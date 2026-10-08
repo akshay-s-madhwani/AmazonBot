@@ -45,6 +45,12 @@ export interface RunnerConfig {
    * Absent means run to the end — which includes placing the order.
    */
   stop_after?: number;
+  /**
+   * REMOVE BLOCKS: the operator has aligned the checkout by hand. Checks that
+   * would stop the run between proceed_to_buy and Pay Now are logged and
+   * passed over — see UNBLOCKABLE_FROM in steps.ts.
+   */
+  unblocked?: boolean;
 }
 
 export async function postEvent(

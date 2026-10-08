@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { chromium, type BrowserContext, type Page } from "./pw.js";
 import { loadAddress, loadConfig, loadDotEnv, loadProduct, parseRewardType, reloadDotEnv } from "./config.js";
 import { postEvent, type RunnerConfig, type StepResult } from "./protocol.js";
-import { LAST_STEP, LAST_STEP_INDEX, STEPS, stepAt, type StepContext } from "./steps.js";
+import { LAST_STEP, LAST_STEP_INDEX, STEPS, UNBLOCKABLE_FROM, UNBLOCKABLE_UNTIL, stepAt, type StepContext } from "./steps.js";
 import { openRewardTab } from "./reward.js";
 import { describeForOperator } from "./failures.js";
 import type { SheetJob } from "./job-client.js";
@@ -34,11 +34,30 @@ function startHeartbeat(cfg: RunnerConfig, state: { index: number; key: string }
     } catch {
     }
   };
+  // A runner outlives a slot that was killed hard (its control port keeps it
+  // up forever, parked or not): when the slot stops answering, leave too.
+  let slotMisses = 0;
+  const checkSlot = async () => {
+    const ok = await fetch(`${cfg.slot_url}/status?token=${cfg.token}`, { signal: AbortSignal.timeout(5_000) })
+      .then((r) => r.ok)
+      .catch(() => false);
+    slotMisses = ok ? 0 : slotMisses + 1;
+    if (slotMisses >= SLOT_MISSES_TO_EXIT) {
+      console.error(`[runner] slot ${cfg.slot_url} has not answered ${slotMisses} times — it is gone; exiting`);
+      process.exit(1);
+    }
+  };
   void send();
-  const timer = setInterval(() => void send(), HEARTBEAT_MS);
+  const timer = setInterval(() => {
+    void send();
+    void checkSlot();
+  }, HEARTBEAT_MS);
   timer.unref?.();
   return timer;
 }
+
+/** Consecutive unanswered slot checks (one per heartbeat) before a runner gives up. */
+const SLOT_MISSES_TO_EXIT = 6;
 
 async function reportBlocked(
   jobId: string,
@@ -152,6 +171,8 @@ function ensureControlServer(cfg: RunnerConfig, live: { index: number }): Promis
       }
       if (until === undefined) delete cfg.stop_after;
       else cfg.stop_after = until;
+      // Restated on every continue, like the checkpoint: only Remove blocks sets it.
+      cfg.unblocked = url.searchParams.get("unblocked") === "1";
       reply(202, { ok: true });
       resume(Number.isInteger(from) && from >= 0 ? from : 0);
     });
@@ -371,6 +392,9 @@ async function main(): Promise<number> {
     artifactsDir: cfg.artifacts_dir,
     ...(jobId ? { markReward: rewardMarker(jobId, cfg.run_id), markVoucher: voucherMarker(jobId, cfg.run_id) } : {}),
   };
+  // Read live: a continue can switch Remove blocks on for the rest of the run.
+  Object.defineProperty(ctx, "unblocked", { get: () => cfg.unblocked === true, enumerable: true });
+  if (cfg.unblocked) console.log("[runner] blocks removed: checks from proceed_to_buy to Pay Now will not stop this run");
 
   console.log(`[runner ${process.pid}] connecting over CDP to ${cfg.cdp_url}`);
   const browser = await chromium.connectOverCDP(cfg.cdp_url);
@@ -439,6 +463,18 @@ async function main(): Promise<number> {
           detail: (err as Error).message,
           retriable: false,
         };
+      }
+
+      // REMOVE BLOCKS: the operator aligned the checkout by hand. A check
+      // between proceed_to_buy and Pay Now that would stop the run is said in
+      // the log and passed over (skipped). A timeout still ends the runner: the
+      // step may still be acting on the page.
+      if (
+        cfg.unblocked && result.status === "failed" && result.failure_code !== "step_timeout" &&
+        i >= UNBLOCKABLE_FROM && i < UNBLOCKABLE_UNTIL
+      ) {
+        console.warn(`[runner] blocks removed — step ${i} ${step.key} would stop here, going on: ${result.detail}`);
+        result = { status: "skipped" };
       }
 
       if (result.status === "failed" && result.failure_code === "step_timeout") {

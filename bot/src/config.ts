@@ -72,7 +72,10 @@ export interface RewardSpec {
   /** Reward-tab row number, so its status can be written back. 0 = not from the sheet. */
   row: number;
   type: RewardType;
-  /** URL: the reward link. SPIN/STICKERS: overrides the default campaign page. */
+  /**
+   * The reward link, tried first whatever the type. SPIN/STICKERS fall back
+   * to their default page when it is dead, expired or already claimed.
+   */
   url: string;
   /** Reward-tab status: PENDING (or blank), BLOCKED, COMPLETED. */
   status: string;

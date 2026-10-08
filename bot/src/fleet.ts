@@ -52,7 +52,8 @@ export interface FleetHooks {
   /** stopAfter: park after this step index (a checkpoint); absent = run to the end. */
   startPushedJob(run_id: string, job: SheetJob, stopAfter?: number): Promise<string>;
   startJobs(instances: number): Promise<string[]>;
-  resumeRun(run_id: string, from?: number, stopAfter?: number): Promise<void>;
+  /** unblocked: Remove blocks (RunnerConfig.unblocked) for this resume. */
+  resumeRun(run_id: string, from?: number, stopAfter?: number, unblocked?: boolean): Promise<void>;
   reloadRow?(run_id: string): Promise<void>;
   cancelRun(run_id: string): Promise<void>;
   closeSession(run_id: string): Promise<void>;
@@ -64,7 +65,8 @@ export interface FleetHooks {
   probeRun(run_id: string): Promise<Record<string, unknown>>;
   stopAll(): Promise<number>;
   reset(): Promise<number>;
-  openBrowser(run_id: string, job_id: string | null): Promise<void>;
+  /** opts.from: run on from that step at once (Remove blocks) instead of waiting for Resume. */
+  openBrowser(run_id: string, job_id: string | null, opts?: { from?: number; unblocked?: boolean }): Promise<void>;
   drain(): Promise<void>;
   updateConfig(patch: Record<string, unknown>): Promise<void>;
   slots(): SlotSnapshot[];
@@ -488,8 +490,9 @@ export class FleetLink {
           throw new Error("payload.step_index must be a non-negative integer");
         }
         const until = stopAfter();
-        await this.hooks.resumeRun(runId(), raw, until);
-        return done(`from step ${raw}${until === undefined ? "" : ` to ${until}`}`);
+        const unblocked = cmd.payload.unblocked === true;
+        await this.hooks.resumeRun(runId(), raw, until, unblocked);
+        return done(`from step ${raw}${until === undefined ? "" : ` to ${until}`}${unblocked ? ", blocks removed" : ""}`);
       }
       case "stop_run":
         await this.hooks.stopRun(runId());
@@ -521,8 +524,15 @@ export class FleetLink {
       }
       case "open_browser": {
         const job_id = typeof cmd.payload.job_id === "string" ? cmd.payload.job_id : null;
-        await this.hooks.openBrowser(runId(), job_id);
-        return done();
+        const from = cmd.payload.resume_from;
+        if (from !== undefined && (typeof from !== "number" || !Number.isInteger(from) || from < 0)) {
+          throw new Error("payload.resume_from must be a non-negative integer");
+        }
+        await this.hooks.openBrowser(runId(), job_id, {
+          ...(typeof from === "number" ? { from } : {}),
+          unblocked: cmd.payload.unblocked === true,
+        });
+        return done(typeof from === "number" ? `browser re-opened, running from step ${from}` : null);
       }
       case "pause":
         await this.hooks.pauseRun(runId());

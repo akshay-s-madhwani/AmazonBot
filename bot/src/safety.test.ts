@@ -3,19 +3,20 @@ import assert from "node:assert/strict";
 import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { basketError, checkoutError, matchingOrder, newOrdersFor, reviewError, type OrderEvidence } from "./purchase-evidence.js";
+import { basketError, checkoutError, matchingOrder, newOrdersFor, ordersByName, reviewBasket, reviewError, type OrderEvidence } from "./purchase-evidence.js";
 import { acceptRun, wasRunAccepted } from "./start-registry.js";
 import { FleetLink, type FleetHooks } from "./fleet.js";
 import { resumeStep, inputsChanged } from "./resume-inputs.js";
 import type { SheetJob } from "./job-client.js";
-import { chooseAnswer, planCoupons } from "./reward.js";
+import { chooseAnswer, pageKey, planCoupons } from "./reward.js";
 import { couponNumbers, matchCoupon, parseWantedCoupons } from "./coupons.js";
 import { parseRewardType } from "./config.js";
 import { addressKey, targetKey } from "./address.js";
-import { checkoutAddressKey, matchBasketItem, planRowAction, sheetAddressKey } from "./checkout.js";
+import { checkoutAddressKey, fitSharesToCart, matchBasketItem, planRowAction, sheetAddressKey } from "./checkout.js";
 import { allocate, parseItemsQuantity, placeFreeItems } from "./allocation.js";
 import { planVouchers } from "./vouchers.js";
 import { parseAccountProxy } from "./proxy.js";
+import { fleetProcesses, orphans } from "./procs.js";
 
 const basket = [{ sku: "B012345678", quantity: 2, title: "Test product" }];
 test("Resume starts at the asked step; only a changed basket goes back to clear_cart", () => {
@@ -158,6 +159,13 @@ test("Reward type parsing", () => {
   assert.equal(parseRewardType("lottery"), null);
 });
 
+test("Reward fallback: a link that is the type's own default page is not retried", () => {
+  assert.equal(pageKey("https://amazon.in/game/gSUN0DE/"), pageKey("https://www.amazon.in/game/gSUN0DE"));
+  assert.equal(pageKey("https://www.amazon.in/b?ref=x&node=221530152031"), pageKey("https://www.amazon.in/b?node=221530152031"));
+  assert.notEqual(pageKey("https://www.amazon.in/game/gMHJQCC"), pageKey("https://www.amazon.in/game/gSUN0DE"));
+  assert.notEqual(pageKey("https://www.amazon.in/b?node=1"), pageKey("https://www.amazon.in/b?node=221530152031"));
+});
+
 test("Address keys: a sheet address, its address-book card and its checkout entry all key the same", () => {
   const sheet = { fullName: "nhdi naman jain", phone: "9663805777", pincode: "521333", line1: "1-66/86",
     line2: "zz kaikaluru Shabalini colony Gopa Ji Ki Dhani Pratap Nager GH Mangai garden", landmark: "",
@@ -212,7 +220,7 @@ test("Allocation: the cart takes the Items quantity; several addresses must spli
   assert.match(allocate([p("1", 2), p("2", 3)], [at("a", "1_1"), at("b", "1_1")]) as string, /item 2 is in no ItemsQuantity/);
 });
 
-test("Free items: *_N routes Amazon's free product; multi-address needs it exactly, single takes all", () => {
+test("Free items: *_N routes Amazon's free product, whatever count Amazon gives; single takes all", () => {
   const p = (itemId: string, quantity: number) => ({ itemId, url: `https://amazon.in/dp/${itemId}`, quantity, purchaseOption: "auto" as const });
   const at = (fullName: string, itemsQuantity = "") => ({ fullName, phone: "", pincode: "521333", line1: "1", line2: "",
     landmark: "", city: "", state: "", country: "India", itemsQuantity });
@@ -223,8 +231,11 @@ test("Free items: *_N routes Amazon's free product; multi-address needs it exact
   assert.deepEqual(plan, { multi: true, shares: [[2, 2, 0]], totals: [4], free: [0, 0, 1] });
   if (typeof plan === "string") return;
   assert.deepEqual(placeFreeItems(plan, [shampoo]), [[0, 0, 1]]);
-  assert.deepEqual(placeFreeItems(plan, []) , "ItemsQuantity sends 1 free item(s) (*_N) but no product page offers a free item");
-  assert.match(placeFreeItems(plan, [{ ...shampoo, quantity: 2 }]) as string, /2 free item\(s\) offered .* sends 1/);
+  assert.deepEqual(placeFreeItems(plan, []) , "ItemsQuantity sends 1 free item(s) (*_N) but neither the product page nor the cart shows a free item");
+  // Amazon gave 2 where the sheet expected 1: both go to the "*" address.
+  assert.deepEqual(placeFreeItems(plan, [{ ...shampoo, quantity: 2 }]), [[0, 0, 2]]);
+  // Two different free products where one was expected: both to the "*" address too.
+  assert.deepEqual(placeFreeItems(plan, [shampoo, { sku: "B000000002", title: "Other", quantity: 1 }]), [[0, 0, 1], [0, 0, 1]]);
   // A free item and no "*" anywhere: multi-address fails at add_items.
   const noStar = allocate([p("11", 4)], [at("a", "11_2"), at("b", "11_2")]);
   if (typeof noStar === "string") throw new Error(noStar);
@@ -238,6 +249,10 @@ test("Free items: *_N routes Amazon's free product; multi-address needs it exact
   const two = allocate([p("1", 2)], [at("a", "1_1\n*_1"), at("b", "1_1\n*_1")]);
   if (typeof two === "string") throw new Error(two);
   assert.deepEqual(placeFreeItems(two, [shampoo, { sku: "B000000002", title: "Other", quantity: 1 }]), [[1, 0], [0, 1]]);
+  // Three where two "*" addresses expect one each: each takes its one, the extra goes to the first.
+  assert.deepEqual(placeFreeItems(two, [{ ...shampoo, quantity: 3 }]), [[2, 1]]);
+  // Fewer than expected is fine.
+  assert.deepEqual(placeFreeItems(two, [shampoo]), [[1, 0]]);
 });
 
 test("Multi-address rows: one row per address, at that address's share", () => {
@@ -280,14 +295,23 @@ const ship = (t: typeof nhdi, items: Array<[string, number]>) => ({
   key: checkoutAddressKey(`${t.fullName} ${t.line1}, ${t.line2.slice(0, 60)}, KAIKALUR, ANDHRA PRADESH, 521333, IN`),
   name: t.fullName, items: items.map(([title, quantity]) => ({ title, quantity })) });
 
-test("Review check: every sheet address gets every item at its quantity, nothing ships elsewhere", () => {
+test("Review check: the basket may shrink, never grow or go elsewhere", () => {
   const basket = [{ sku: "B0FY6KL849", title: lamp, quantity: 2 }, { sku: "B0CKZ7MBBT", title: study, quantity: 2 }];
   const good = [ship(nhdi, [[lamp, 1], [study, 1]]), ship(jypj, [[study, 1], [lamp, 1]])];
   assert.equal(reviewError(basket, [nhdi, jypj], good), null);
   // One address split over two delivery dates is still fine.
   assert.equal(reviewError(basket, [nhdi, jypj], [ship(nhdi, [[lamp, 1]]), ship(nhdi, [[study, 1]]), good[1]!]), null);
-  assert.match(reviewError(basket, [nhdi, jypj], [good[0]!])!, /nothing ships to jypj/);
-  assert.match(reviewError(basket, [nhdi, jypj], [ship(nhdi, [[lamp, 2], [study, 1]]), good[1]!])!, /x2, expected x1/);
+  // An address left with nothing (its items removed or unavailable): allowed, and said.
+  const shrunk = reviewBasket(basket, [nhdi, jypj], [good[0]!]);
+  assert.ok(shrunk.ok);
+  assert.deepEqual(shrunk.shipping, [nhdi]);
+  assert.match(shrunk.changes.join("; "), /nothing ships to jypj/);
+  // One unit fewer: allowed. One more, an unrequested item, or no address at all: refused.
+  const fewer = reviewBasket(basket, [nhdi, jypj], [ship(nhdi, [[lamp, 1]]), good[1]!]);
+  assert.ok(fewer.ok && /x0 of x1/.test(fewer.changes.join("; ")));
+  assert.match(reviewError(basket, [nhdi, jypj], [ship(nhdi, [[lamp, 2], [study, 1]]), good[1]!])!, /x2, more than the x1 asked/);
+  assert.match(reviewError(basket, [nhdi, jypj], [ship(nhdi, [[lamp, 1], ["Some other product", 1]]), good[1]!])!, /not requested/);
+  assert.match(reviewError(basket, [nhdi, jypj], [])!, /no delivery address/);
   assert.match(reviewError(basket, [nhdi], [good[0]!, good[1]!])!, /not in the sheet/);
 });
 
@@ -298,8 +322,10 @@ test("Review check: with shares, each address gets its ItemsQuantity", () => {
   ];
   assert.equal(reviewError(basket, [nhdi, jypj], [ship(nhdi, [[lamp, 2]]), ship(jypj, [[lamp, 1], [study, 1]])]), null);
   assert.match(reviewError(basket, [nhdi, jypj], [ship(nhdi, [[lamp, 2], [study, 1]]), ship(jypj, [[lamp, 1]])])!,
-    /nhdi naman jain: Xech 4-in-1 .* x1, expected x0/);
-  assert.match(reviewError(basket, [nhdi, jypj], [ship(nhdi, [[lamp, 1]]), ship(jypj, [[lamp, 2], [study, 1]])])!, /x1, expected x2/);
+    /nhdi naman jain: Xech 4-in-1 .* x1, more than the x0 asked/);
+  // A share that came out short (unavailable) is allowed; one that came out long is not.
+  assert.equal(reviewError(basket, [nhdi, jypj], [ship(nhdi, [[lamp, 1]]), ship(jypj, [[lamp, 1], [study, 1]])]), null);
+  assert.match(reviewError(basket, [nhdi, jypj], [ship(nhdi, [[lamp, 1]]), ship(jypj, [[lamp, 2], [study, 1]])])!, /x2, more than the x1 asked/);
 });
 
 test("New orders: the ones not on Your Orders before, one per sheet address", () => {
@@ -315,6 +341,34 @@ test("New orders: the ones not on Your Orders before, one per sheet address", ()
   assert.ok(!newOrdersFor(cards, [], [nhdi, jypj]).ok);
 });
 
+test("note_order_id: orders by the sheet's address names; same-day splits kept; older ones skipped once 'before' is known", () => {
+  const cards = [
+    { id: "403-0000000-0000003", shipTo: "nhdi naman jain", titles: [lamp], cancelled: false, placed: "8 October 2026" },
+    { id: "403-0000000-0000002", shipTo: "nhdi naman jain", titles: [study], cancelled: false, placed: "8 October 2026" },
+    { id: "403-0000000-0000001", shipTo: "nhdi naman jain", titles: [lamp], cancelled: false, placed: "1 October 2026" },
+    { id: "403-0000000-0000009", shipTo: "jypj vidhi singh", titles: [lamp], cancelled: true, placed: "8 October 2026" },
+  ];
+  // Nothing known: any order with the name — the newest day's, both of its orders.
+  const any = ordersByName(cards, [nhdi, jypj], null);
+  assert.ok(any.ok);
+  assert.deepEqual(any.orders.map((o) => o.id), ["403-0000000-0000003", "403-0000000-0000002"]);
+  // The cancelled one does not count, so only nhdi ships.
+  assert.deepEqual(any.shipping, [nhdi]);
+  // Known "before": orders already there are not this run's.
+  const before = ["403-0000000-0000003", "403-0000000-0000002", "403-0000000-0000001"];
+  assert.ok(!ordersByName(cards, [nhdi, jypj], before).ok);
+  assert.match((ordersByName(cards, [nhdi], before) as { reason: string }).reason, /since Pay Now/);
+  const fresh = ordersByName(cards, [nhdi], ["403-0000000-0000001"]);
+  assert.ok(fresh.ok && fresh.orders.length === 2);
+});
+
+test("Remove blocks: per-address shares cut to what the cart holds, never more than asked", () => {
+  const rows = [{ item: 0, qty: 3 }, { item: 0, qty: 2 }, { item: 2, qty: 1 }];
+  // Item 0 has 5 of 8 left; item 1 is gone; item 2 has more than asked.
+  assert.deepEqual(fitSharesToCart([[4, 4], [1, 1], [0, 1]], rows), [[4, 1], [0, 0], [0, 1]]);
+  assert.deepEqual(fitSharesToCart([[2, 3]], [{ item: 0, qty: 5 }]), [[2, 3]]);
+});
+
 test("Vouchers: every code goes to the claim page, whatever its type; Used ones left alone", () => {
   const plan = planVouchers([
     { code: "AP1", row: 2, type: "apay", status: "" },
@@ -327,6 +381,15 @@ test("Vouchers: every code goes to the claim page, whatever its type; Used ones 
   ], new Set(["RETRY"]));
   assert.deepEqual(plan.todo.map((v) => v.code), ["AP1", "CP1", "ODD", "LEGACY"]);
   assert.equal(plan.alreadyUsed, 2);
+});
+
+test("Vouchers: nothing on the voucher path reloads a page — a reload re-sends the claim form's POST", () => {
+  // Reloading the claim page after Add submitted the same code again ("already
+  // used", then a captcha) — 2026-10-08. Each code must open the form with a GET.
+  const src = readFileSync(new URL("../src/vouchers.ts", import.meta.url), "utf8")
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .replace(/\/\/.*$/gm, "");
+  assert.doesNotMatch(src, /\.reload\(/);
 });
 
 test("Proxy: http://host:port, bare host:port means http, anything else refuses", () => {
@@ -364,4 +427,37 @@ test("Resume: a master that starts sending each address's sheet row does not rew
   assert.equal(inputsChanged(before, job([{ ...a, row: 30 } as typeof a])), false);
   // A changed split is a changed basket: back to clear_cart.
   assert.equal(resumeStep(before, job([{ ...a, itemsQuantity: "9_2" }]), 9), 3);
+});
+
+test("Cleanup: finds this folder's slots, runners and browsers; orphans are the ones no live slot owns", () => {
+  // Command lines as Windows reports them (Win32_Process.CommandLine).
+  const win = { dist: String.raw`C:\bots\AmazonBot\bot\dist`, profiles: String.raw`C:\bots\AmazonBot\bot\browser-profiles` };
+  const procs = [
+    { pid: 10, ppid: 1, cmd: "node  dist/manager.js" },
+    { pid: 20, ppid: 1, cmd: String.raw`"C:\Program Files\nodejs\node.exe" C:\bots\AmazonBot\bot\dist\slot.js` },
+    { pid: 21, ppid: 20, cmd: String.raw`"node.exe" C:\bots\AmazonBot\bot\dist\runner.js "{\"run_id\":\"run-live\",\"cdp_url\":\"ws://x\"}"` },
+    { pid: 22, ppid: 20, cmd: String.raw`chrome.exe --fleet-bot-browser --user-data-dir=C:\bots\AmazonBot\bot\browser-profiles\run-aaa --remote-debugging-port=0` },
+    { pid: 23, ppid: 22, cmd: String.raw`chrome.exe --type=renderer --user-data-dir=C:\bots\AmazonBot\bot\browser-profiles\run-aaa` },
+    // A runner whose slot died hours ago, and a browser nobody owns.
+    { pid: 30, ppid: 999, cmd: String.raw`"node.exe" C:\bots\AmazonBot\bot\dist\runner.js "{\"run_id\":\"run-dead\"}"` },
+    { pid: 31, ppid: 998, cmd: String.raw`chrome.exe --user-data-dir=C:\bots\AmazonBot\bot\browser-profiles\run-bbb` },
+    // Not ours: another bot folder, the operator's own Chrome.
+    { pid: 40, ppid: 1, cmd: String.raw`node C:\other\bot\dist\runner.js {}` },
+    { pid: 41, ppid: 1, cmd: String.raw`chrome.exe --user-data-dir=C:\Users\me\AppData\Local\Google\Chrome` },
+  ];
+  const fleet = fleetProcesses(procs, win);
+  assert.deepEqual(fleet.map((p) => `${p.kind}:${p.pid}`), ["slot:20", "runner:21", "browser:22", "runner:30", "browser:31"]);
+  assert.equal(fleet.find((p) => p.pid === 21)!.runId, "run-live");
+  assert.equal(fleet.find((p) => p.pid === 31)!.profileId, "run-bbb");
+  const live = { slotPids: new Set([20]), runIds: new Set(["run-live"]), profileIds: new Set(["run-aaa"]) };
+  assert.deepEqual(orphans(fleet, live).map((p) => p.pid), [30, 31]);
+  // The manager gone or reset: nothing is live, everything of ours goes.
+  assert.deepEqual(orphans(fleet, { slotPids: new Set(), runIds: new Set(), profileIds: new Set() }).map((p) => p.pid), [20, 21, 22, 30, 31]);
+  // macOS command lines.
+  const mac = { dist: "/Users/a/AmazonBot/bot/dist", profiles: "/Users/a/AmazonBot/bot/browser-profiles" };
+  const macFleet = fleetProcesses([
+    { pid: 5, ppid: 1, cmd: "/usr/local/bin/node /Users/a/AmazonBot/bot/dist/runner.js {\"run_id\":\"run-x\"}" },
+    { pid: 6, ppid: 1, cmd: "/Users/a/Library/shardx/Chromium.app/Contents/MacOS/Chromium --user-data-dir=/Users/a/AmazonBot/bot/browser-profiles/run-ccc" },
+  ], mac);
+  assert.deepEqual(macFleet.map((p) => [p.kind, p.runId ?? p.profileId]), [["runner", "run-x"], ["browser", "run-ccc"]]);
 });

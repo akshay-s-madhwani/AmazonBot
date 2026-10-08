@@ -5,8 +5,9 @@ import { checkoutAddressKey, sheetAddressKey } from "./address.js";
 export { checkoutAddressKey, sheetAddressKey } from "./address.js";
 import { pause, shortPause, sleep } from "./human.js";
 import { requireJobClient } from "./job-client.js";
-import { newOrdersFor, readOrderCards, readReviewShipments, reviewError, shipsTo, type BasketItem, type OrderCard } from "./purchase-evidence.js";
+import { ordersByName, readOrderCards, readReviewShipments, reviewBasket, shipsTo, type BasketItem, type OrderCard } from "./purchase-evidence.js";
 import type { Locator, Page } from "./pw.js";
+import type { FreeItem } from "./allocation.js";
 
 
 const CART_URL = "https://www.amazon.in/gp/cart/view.html?ref_=nav_cart";
@@ -54,7 +55,7 @@ type CartState = { navCount: number; activeItems: number; emptyText: boolean };
  * Opens the cart. Amazon can redirect the cart URL (e.g. to /cart/ref=...)
  * while it loads, which aborts the goto even though the cart then shows.
  */
-async function openCart(page: Page): Promise<void> {
+export async function openCart(page: Page): Promise<void> {
   for (let attempt = 1; ; attempt++) {
     try {
       await page.goto(CART_URL, { waitUntil: "domcontentloaded", timeout: NAV_TIMEOUT_MS });
@@ -136,6 +137,39 @@ export async function readOfferedFreebie(
     }
     await sleep(1000);
   }
+}
+
+/**
+ * The free products the WHOLE CART brings, from Amazon's "N FREE item(s) will
+ * be added to your order" box: on the "Added to cart" page right after an add
+ * (smart-wagon) and on the cart page (data-feature-id="imb-message-container",
+ * each free product an li with input[name=imb-type][value=freebieMessage]).
+ * Empty when the page has no such box.
+ */
+export async function readFreebieMessages(page: Page): Promise<FreeItem[]> {
+  return page
+    .evaluate(() => {
+      const out: Array<{ sku: string; title: string; quantity: number }> = [];
+      for (const box of document.querySelectorAll('[data-feature-id="imb-message-container"]')) {
+        const msgs = [...box.querySelectorAll('input[name="imb-type"][value="freebieMessage"]')]
+          .map((i): Element | null => i.closest("li") ?? i.parentElement)
+          .filter((li): li is Element => li !== null);
+        if (msgs.length === 0) continue;
+        const header = (box.querySelector('[data-feature-id="grouped-imb-header"]')?.textContent ?? "").replace(/\s+/g, " ");
+        const count = Number(header.match(/(\d+)\s+FREE item/i)?.[1] ?? "1");
+        for (const li of msgs) {
+          const href = li.querySelector('a[href*="/gp/product/"], a[href*="/dp/"]')?.getAttribute("href") ?? "";
+          const sku = href.match(/\/(?:gp\/product|dp)\/([A-Z0-9]{10})/i)?.[1]?.toUpperCase() ?? "";
+          const title = (li.querySelector(".sc-product-title")?.textContent ?? li.querySelector("a")?.textContent ?? "")
+            .replace(/\s+/g, " ").trim();
+          if (!sku && !title) continue;
+          // One message naming one product carries the header's count; several share it one each.
+          out.push({ sku: sku || title.slice(0, 40), title: title || sku, quantity: msgs.length === 1 ? Math.max(1, count) : 1 });
+        }
+      }
+      return out;
+    })
+    .catch(() => []);
 }
 
 async function readFreebieBox(page: Page): Promise<{ sku: string; title: string; seller: string } | null> {
@@ -404,6 +438,24 @@ export async function runProceedToBuy(page: Page): Promise<CheckoutResult> {
 
 const ITEMSELECT_ROW = 'span[id^="line-item-address-"]';
 
+/** The rows still showing, in page order — the same ones readItemRows indexes. */
+function shownRows(page: Page): Locator {
+  return page.locator(ITEMSELECT_ROW).filter({ visible: true });
+}
+
+/**
+ * The "Delivering to multiple addresses" section's Change link: aria-label
+ * just "Change", leading to /itemselect — not "Change delivery address",
+ * which a checkout set to several addresses no longer shows (2026-10-08).
+ */
+async function multiAddressChange(page: Page): Promise<Locator | null> {
+  const link = page
+    .locator('a[data-topage="itemselect"], #checkout-javaItemSelectPanel a[aria-label="Change"]')
+    .filter({ visible: true })
+    .first();
+  return (await link.count().catch(() => 0)) > 0 ? link : null;
+}
+
 async function openAddressPicker(page: Page): Promise<CheckoutResult> {
   if (/\/checkout\/p\/[^/]+\/address/.test(page.url())) return { ok: true, detail: "address list open" };
   const change = page.locator('a[aria-label="Change delivery address"]').filter({ visible: true }).first();
@@ -418,10 +470,36 @@ async function openAddressPicker(page: Page): Promise<CheckoutResult> {
     : { ok: false, reason: `the address list did not open (at ${page.url()})` };
 }
 
+/**
+ * Waits for the multi-address list to finish drawing: no "Updating your
+ * order" spinner, and the same rows (count and text) on two reads a second
+ * apart. Checkout's "Make updates to your items" box draws its rows one by one
+ * while it updates; a read in the middle saw only some of them and failed
+ * "item 1 is not on the multi-address page" (2026-10-08).
+ */
+export async function waitForRowsSettled(page: Page, budgetMs = 20_000): Promise<void> {
+  const deadline = Date.now() + budgetMs;
+  let last = "";
+  while (Date.now() < deadline) {
+    const now = await page
+      .evaluate((rowSel) => {
+        const busy = /updating your order/i.test(document.body.innerText);
+        const rows = [...document.querySelectorAll(rowSel)].filter((r) => r.getBoundingClientRect().width > 0);
+        return { busy, sig: `${rows.length}|${rows.map((r) => (r as HTMLElement).innerText.slice(0, 40)).join("|")}` };
+      }, ITEMSELECT_ROW)
+      .catch(() => ({ busy: true, sig: "" }));
+    if (!now.busy && now.sig !== "0|" && now.sig === last) return;
+    last = now.busy ? "" : now.sig;
+    await sleep(1000);
+  }
+  console.log("[bot] the multi-address list did not settle — reading it as it is");
+}
+
 /** Rows on the multi-address page, in page order, with the product each belongs to. */
 async function readItemRows(page: Page): Promise<Array<{ item: string; asin: string | null; qty: number; key: string | null }>> {
   return page.evaluate((rowSel) => {
-    return [...document.querySelectorAll(rowSel)].map((dd) => {
+    // Shown rows only: Remove item hides its group; the page drops it on Continue.
+    return [...document.querySelectorAll(rowSel)].filter((r) => r.getBoundingClientRect().width > 0).map((dd) => {
       let card: Element | null = dd;
       for (let i = 0; i < 12 && card && !card.querySelector('[data-a-selector="value"]'); i++) card = card.parentElement;
       let product: Element | null = dd;
@@ -487,6 +565,22 @@ export type RowAction =
  * split into single units: an item with a minimum quantity (2) cannot be,
  * and a row of 8 to one address is one row, not eight.
  */
+/**
+ * Shares cut down to what the multi-address page shows per item: an item
+ * with no row gets none; one with fewer units than its shares keeps them in
+ * address order until they run out. Never more than asked.
+ */
+export function fitSharesToCart(shares: number[][], rows: Array<{ item: number; qty: number }>): number[][] {
+  return shares.map((share, item) => {
+    let left = rows.filter((r) => r.item === item).reduce((n, r) => n + r.qty, 0);
+    return share.map((q) => {
+      const take = Math.min(q, left);
+      left -= take;
+      return take;
+    });
+  });
+}
+
 export function planRowAction(
   rows: Array<{ item: number; qty: number; key: string | null }>,
   wantKeys: string[],
@@ -525,7 +619,7 @@ export function planRowAction(
 async function stepRowQuantity(page: Page, row: number, dir: "increment" | "decrement"): Promise<boolean> {
   const marked = await page.evaluate(([rowSel, n]) => {
     document.querySelectorAll("[data-bot-qty]").forEach((e) => e.removeAttribute("data-bot-qty"));
-    let card: Element | null = document.querySelectorAll(rowSel)[n] ?? null;
+    let card: Element | null = [...document.querySelectorAll(rowSel)].filter((r) => r.getBoundingClientRect().width > 0)[n] ?? null;
     for (let i = 0; i < 12 && card && !card.querySelector('[data-a-selector="value"]'); i++) card = card.parentElement;
     card?.setAttribute("data-bot-qty", "1");
     return !!card;
@@ -551,7 +645,7 @@ async function markRowControl(page: Page, row: number, what: "split" | "delete")
   return page.evaluate(([rowSel, n, kind]) => {
     document.querySelectorAll("[data-bot-ctl]").forEach((e) => e.removeAttribute("data-bot-ctl"));
     const shown = (e: Element) => (e as HTMLElement).getClientRects().length > 0;
-    const start = document.querySelectorAll(rowSel)[n as number];
+    const start = [...document.querySelectorAll(rowSel)].filter((r) => r.getBoundingClientRect().width > 0)[n as number];
     if (!start) return false;
     if (kind === "split") {
       // The nearest card up from the row that holds a split link is its item's.
@@ -565,7 +659,7 @@ async function markRowControl(page: Page, row: number, what: "split" | "delete")
     }
     // Delete: the row's own remove control (the "x" beside its address), not
     // anything in the quantity stepper, and not in a neighbouring row.
-    const rows = [...document.querySelectorAll(rowSel)];
+    const rows = [...document.querySelectorAll(rowSel)].filter((r) => r.getBoundingClientRect().width > 0);
     for (let el: Element | null = start.parentElement; el && el !== document.body; el = el.parentElement) {
       if (rows.some((r) => r !== start && el!.contains(r))) break;
       const del = [...el.querySelectorAll("a, button, span[role=button], i, input[type=image]")].find((c) => {
@@ -579,6 +673,50 @@ async function markRowControl(page: Page, row: number, what: "split" | "delete")
   }, [ITEMSELECT_ROW, row, what] as [string, number, string]);
 }
 
+/** Each item group's own "Remove item" on the multi-address page. */
+const LINE_GROUP_DELETE = '[data-action="item-select-delete-linegroup-and-children"]';
+
+/**
+ * Removes every item the multi-address page shows a red error on (an
+ * a-alert-inline-error inside its rows) with that item's own "Remove item" —
+ * the nearest box around the error holding exactly one. An error not inside
+ * one item (a page-wide alert) is left alone. Returns what was removed.
+ */
+async function removeFlaggedItems(page: Page): Promise<string[]> {
+  const removed: string[] = [];
+  for (let round = 0; round < 6; round++) {
+    const hit = await page
+      .evaluate((del) => {
+        const squash = (t: string) => t.replace(/\s+/g, " ").trim();
+        document.querySelectorAll("[data-bot-ctl]").forEach((e) => e.removeAttribute("data-bot-ctl"));
+        const shown = (e: Element) => e.getBoundingClientRect().width > 0;
+        for (const alert of [...document.querySelectorAll(".a-alert-inline-error, .a-alert-error")].filter(shown)) {
+          let box: Element | null = alert.parentElement;
+          while (box && box !== document.body && box.querySelectorAll(del).length === 0) box = box.parentElement;
+          if (!box || box === document.body || box.querySelectorAll(del).length !== 1) continue;
+          const link = box.querySelector(`${del} a`) ?? box.querySelector(del);
+          if (!link || !shown(link)) continue;
+          link.setAttribute("data-bot-ctl", "1");
+          const title = (box as HTMLElement).innerText.split("\n").map((l) => l.trim()).find((l) => l.length > 3) ?? "item";
+          return { title: title.slice(0, 60), error: squash((alert as HTMLElement).innerText).slice(0, 120) };
+        }
+        return null;
+      }, LINE_GROUP_DELETE)
+      .catch(() => null);
+    if (!hit) break;
+    console.log(`[bot] "${hit.title}" flagged: "${hit.error}" — removing it`);
+    const before = await shownRows(page).count().catch(() => -1);
+    await clickMarked(page);
+    for (const deadline = Date.now() + 15_000; Date.now() < deadline; ) {
+      await sleep(600);
+      if ((await shownRows(page).count().catch(() => before)) !== before) break;
+    }
+    await pause("flagged item removed");
+    removed.push(hit.title);
+  }
+  return removed;
+}
+
 async function clickMarked(page: Page): Promise<void> {
   const el = page.locator("[data-bot-ctl]").first();
   await el.scrollIntoViewIfNeeded({ timeout: 5_000 }).catch(() => { });
@@ -588,7 +726,7 @@ async function clickMarked(page: Page): Promise<void> {
 
 /** Picks one address for one row through its dropdown list, the way a person does. */
 async function pickRowAddress(page: Page, row: number, want: string, label: string): Promise<boolean> {
-  const dd = page.locator(ITEMSELECT_ROW).nth(row);
+  const dd = shownRows(page).nth(row);
   await dd.scrollIntoViewIfNeeded().catch(() => { });
   await shortPause();
   await dd.click({ timeout: NAV_TIMEOUT_MS });
@@ -618,37 +756,85 @@ async function pickRowAddress(page: Page, row: number, want: string, label: stri
  * single units — an item with a minimum quantity of 2 cannot be, and 8 to
  * one address is one row of 8.
  */
-async function selectMultipleAddresses(page: Page, targets: TargetAddress[], basket: BasketItem[]): Promise<CheckoutResult> {
-  const open = await openAddressPicker(page);
-  if (!open.ok) return open;
-  const multi = page.getByText("Deliver to multiple addresses", { exact: true }).filter({ visible: true }).first();
-  // The URL flips to /address before the list finishes drawing; wait, don't peek.
-  const shown = await multi.waitFor({ timeout: 20_000 }).then(() => true).catch(() => false);
-  if (!shown) return { ok: false, reason: "Multiple address button not found" };
-  await shortPause();
-  await multi.click({ timeout: NAV_TIMEOUT_MS });
-  await page.waitForURL(/itemselect/, { timeout: NAV_TIMEOUT_MS }).catch(() => { });
+async function selectMultipleAddresses(
+  page: Page,
+  targets: TargetAddress[],
+  basket: BasketItem[],
+  unblocked = false,
+): Promise<CheckoutResult> {
+  // Amazon can send checkout straight to the multi-address page itself (an
+  // item's quantity changed under it, 2026-10-08): no picker to open then.
+  if (/\/itemselect/.test(page.url())) {
+    console.log("[bot] checkout is already on the multi-address page");
+  } else if (await multiAddressChange(page)) {
+    // Already delivering to several addresses (a rerun of this step): its
+    // Change goes straight to the multi-address page.
+    console.log("[bot] checkout already delivers to multiple addresses — reopening that page");
+    await shortPause();
+    await multiAddressChange(page).then((l) => l!.click({ timeout: NAV_TIMEOUT_MS }));
+    await page.waitForURL(/itemselect/, { timeout: NAV_TIMEOUT_MS }).catch(() => { });
+  } else {
+    const open = await openAddressPicker(page);
+    if (!open.ok) return open;
+    const multi = page.getByText("Deliver to multiple addresses", { exact: true }).filter({ visible: true }).first();
+    // The URL flips to /address before the list finishes drawing; wait, don't peek.
+    const shown = await multi.waitFor({ timeout: 20_000 }).then(() => true).catch(() => false);
+    if (!shown) return { ok: false, reason: "Multiple address button not found" };
+    await shortPause();
+    await multi.click({ timeout: NAV_TIMEOUT_MS });
+    await page.waitForURL(/itemselect/, { timeout: NAV_TIMEOUT_MS }).catch(() => { });
+  }
   await page.locator(ITEMSELECT_ROW).first().waitFor({ timeout: NAV_TIMEOUT_MS }).catch(() => { });
   await pause("multi-address page open");
+  await waitForRowsSettled(page);
+
+  // An item Amazon flags in red ("the quantity you requested is no longer
+  // available", or anything else) is removed, whatever the message says.
+  const flagged = await removeFlaggedItems(page);
+  if (flagged.length) await waitForRowsSettled(page);
 
   let read = await readBasketRows(page, basket);
   if (typeof read === "string") return { ok: false, reason: read };
   let rows = read;
 
   // The product page promised it; Amazon adds it only here. Say so by name.
-  const missingFree = basket.find((b, i) => b.free && !rows.some((r) => r.item === i));
-  if (missingFree) {
-    return { ok: false, reason: `free item "${missingFree.title.slice(0, 40)}" (offered on the product page) is not at checkout` };
+  // Amazon decides the free items, not the sheet: one counted in the cart can
+  // be missing (or fewer) here. Not a reason to stop — its shares are fitted
+  // to what this page shows, below.
+  const missingFree = basket.filter((b, i) => b.free && !rows.some((r) => r.item === i));
+  if (missingFree.length) {
+    console.log(`[bot] free item(s) not on the multi-address page, going without: ${missingFree.map((b) => b.title.slice(0, 40)).join(", ")}`);
   }
 
   // One change at a time, re-reading the page after each: picking an address
   // redraws the page and REORDERS the rows, so nothing is done by position.
   const wantKeys = targets.map(sheetAddressKey);
-  const shares = basket.map((b) => b.shares!);
+  // Remove blocks: what the cart holds now decides — an item gone (unavailable,
+  // removed by hand) is dropped and a short one shrinks its shares, so the
+  // page is never stepped back up to units the cart no longer has.
+  const asked = basket.map((b) => b.shares!);
+  const fitted = fitSharesToCart(asked, rows);
+  // Free items always follow the page; everything else when an item was
+  // removed for an error here, or with blocks removed.
+  const shares = unblocked || flagged.length ? fitted : asked.map((share, i) => (basket[i]!.free ? fitted[i]! : share));
+  if (flagged.length) console.log(`[bot] per-address units fitted to what is left: ${JSON.stringify(shares)}`);
+  if (unblocked) console.log(`[bot] blocks removed — per-address units fitted to the cart: ${JSON.stringify(shares)}`);
   const sig = (r: ItemRow[]) => JSON.stringify(r);
   const totalUnits = shares.flat().reduce((n, q) => n + q, 0);
+  let reread = false;
   for (let guard = 0; guard < totalUnits * 2 + rows.length * 3 + 20; guard++) {
     const act = planRowAction(rows, wantKeys, shares);
+    if (typeof act === "string" && !reread) {
+      // Most often the list was still drawing ("Updating your order"): look
+      // again once it has settled before calling an item missing.
+      reread = true;
+      console.log(`[bot] ${act} — waiting for the page to settle and reading it again`);
+      await waitForRowsSettled(page, 30_000);
+      const again = await readBasketRows(page, basket);
+      if (typeof again === "string") return { ok: false, reason: again };
+      rows = again;
+      continue;
+    }
     if (typeof act === "string") return { ok: false, reason: act };
     if (!act) break;
     const r = rows[act.row]!;
@@ -750,15 +936,36 @@ async function selectSingleAddress(page: Page, target: TargetAddress): Promise<C
 }
 
 /** `basket` (with per-address shares) is needed only for several addresses. */
-export async function runSelectAddresses(page: Page, targets: TargetAddress[], basket: BasketItem[]): Promise<CheckoutResult> {
+export async function runSelectAddresses(
+  page: Page,
+  targets: TargetAddress[],
+  basket: BasketItem[],
+  opts: { unblocked?: boolean } = {},
+): Promise<CheckoutResult> {
   await pause("selecting delivery address");
   const at = await ensureAtCheckout(page);
   if (!at.ok) return at;
+  // Remove blocks: the operator may have set the addresses by hand. Checkout
+  // already delivering where the sheet says is left exactly as it is.
+  if (opts.unblocked) {
+    const shown = (await page.evaluate(() => document.body.innerText.slice(0, 8000)).catch(() => ""))
+      .replace(/\s+/g, " ")
+      .toLowerCase();
+    const multi = shown.includes("delivering to multiple addresses");
+    // "Delivering to suresh 1421", and not "suresh 14210".
+    const name = `delivering to ${(targets[0]?.fullName ?? "").replace(/\s+/g, " ").trim().toLowerCase()}`;
+    const pos = shown.indexOf(name);
+    const single = targets.length === 1 && pos >= 0 && !/[a-z0-9]/.test(shown.charAt(pos + name.length));
+    if ((targets.length > 1 && multi) || single) {
+      console.log("[bot] blocks removed — checkout already delivers to the sheet's address(es); left as set");
+      return { ok: true, detail: "addresses left as set by hand" };
+    }
+  }
   if (targets.length > 1) {
     // Shares are per address: dropping one would send its units nowhere.
     const bad = targets.find((t) => !t.pincode || !t.line1);
     if (bad) return { ok: false, reason: `address ${bad.fullName || "(no name)"} has no PIN or line 1` };
-    return selectMultipleAddresses(page, targets, basket);
+    return selectMultipleAddresses(page, targets, basket, opts.unblocked === true);
   }
   const usable = targets.filter((t) => t.pincode && t.line1);
   if (usable.length === 0) return { ok: false, reason: "no delivery address for this account" };
@@ -940,11 +1147,91 @@ export async function waitForCheckoutPipeline(page: Page, timeoutMs = 45_000): P
   }
 }
 
+/** Set on the modal button dismissCheckoutModal picked, so Playwright clicks it for real. */
+const MODAL_MARK = "data-fleet-modal-close";
+/** Never pressed to close a popup: it would sign up, buy or pay. */
+const MODAL_NEVER = /join|sign ?up|subscribe|start|try|buy|pay|place|order|upgrade|accept|yes/i;
+
+/**
+ * The Prime upsell ("Prime Shopping Edition at ₹399/year" — No Thanks / Join)
+ * pops up over checkout. Its buttons carry data-class "a-button-popover"; the
+ * first is No Thanks (user, 2026-10-08). It is a fixed-position a-popover, so
+ * offsetParent is null for it — visibility is read from its box instead.
+ * Pressed with a real Playwright click, then checked gone.
+ */
+async function closePopoverByButton(page: Page): Promise<string | null> {
+  const hit = await page
+    .evaluate(([mark, neverSrc]) => {
+      const never = new RegExp(neverSrc, "i");
+      const shown = (e: Element) => {
+        const r = e.getBoundingClientRect();
+        const cs = getComputedStyle(e);
+        return r.width > 0 && r.height > 0 && cs.visibility !== "hidden" && cs.display !== "none";
+      };
+      const squash = (s: string) => s.replace(/\s+/g, " ").trim();
+      document.querySelectorAll(`[${mark}]`).forEach((e) => e.removeAttribute(mark));
+      const modals = [...document.querySelectorAll('.a-popover, [role="dialog"], .a-modal-scroller')].filter(
+        (m) => shown(m) && !m.closest("#navbar, #nav-main, header") && squash((m as HTMLElement).innerText ?? "").length > 0,
+      );
+      for (const m of modals) {
+        const buttons = [
+          ...m.querySelectorAll('[data-class~="a-button-popover"], [data-class*="a-button-popover"], .a-button-popover'),
+        ].filter(shown);
+        const text = (b: Element) =>
+          squash((b as HTMLElement).innerText || (b as HTMLInputElement).value || b.getAttribute("aria-label") || "");
+        // The first in the series, unless that one signs up / buys; else the
+        // popover's own close (document.querySelectorAll('[data-action="a-popover-close"]')).
+        const pick =
+          buttons.find((b) => !never.test(text(b))) ??
+          [...m.querySelectorAll('[data-action="a-popover-close"]')].find(shown) ??
+          (m.closest(".a-popover")
+            ? [...document.querySelectorAll(`[data-action="a-popover-close"]`)].find(
+              (c) => shown(c) && m.closest(".a-popover")!.contains(c),
+            )
+            : undefined);
+        if (!pick) continue;
+        // On an a-button the transparent input on top takes the click.
+        const target = pick.querySelector("input, button") ?? pick;
+        target.setAttribute(mark, "1");
+        return {
+          label: squash((m as HTMLElement).innerText ?? "").slice(0, 60),
+          button: text(pick) || "(no text)",
+          all: buttons.map((b) => `${text(b) || "?"} [${b.getAttribute("data-class") ?? (b as HTMLElement).className}]`).join(" | "),
+        };
+      }
+      return null;
+    }, [MODAL_MARK, MODAL_NEVER.source] as const)
+    .catch(() => null);
+  if (!hit) return null;
+  console.log(`[bot] checkout popup "${hit.label}" — pressing "${hit.button}" (buttons: ${hit.all})`);
+  const target = page.locator(`[${MODAL_MARK}]`).first();
+  await shortPause();
+  const clicked = await target.click({ timeout: 5_000 }).then(() => true).catch(() => false);
+  if (!clicked) await target.dispatchEvent("click").catch(() => { });
+  // Gone within a few seconds, or it did not take.
+  for (const deadline = Date.now() + 4_000; Date.now() < deadline; ) {
+    await sleep(400);
+    if (!(await target.isVisible().catch(() => false))) return hit.label;
+  }
+  console.log(`[bot] checkout popup still showing after "${hit.button}"`);
+  return null;
+}
+
 export async function dismissCheckoutModal(page: Page): Promise<void> {
+  const quick = await closePopoverByButton(page);
+  if (quick) {
+    console.log(`[bot] dismissed checkout modal: "${quick}"`);
+    await pause("modal dismissed");
+    return;
+  }
   const closed = await page
     .evaluate(() => {
+      // Box-based: a fixed-position popover has a null offsetParent while showing.
       const modals = [...document.querySelectorAll('.a-popover, [role="dialog"], .a-modal-scroller')]
-        .filter((m) => (m as HTMLElement).offsetParent !== null);
+        .filter((m) => {
+          const r = m.getBoundingClientRect();
+          return r.width > 0 && r.height > 0 && getComputedStyle(m).visibility !== "hidden";
+        });
       if (modals.length === 0) return null;
       for (const m of modals) {
         const label = (m as HTMLElement).innerText.replace(/\s+/g, " ").trim().slice(0, 60);
@@ -985,18 +1272,25 @@ export async function dismissCheckoutModal(page: Page): Promise<void> {
 }
 
 const PLACE_ORDER_SELECTOR =
-  '#placeYourOrder, #placeYourOrder input, input[name="placeYourOrder1"], ' +
+  '#placeOrder, #placeYourOrder, #placeYourOrder input, input[name="placeYourOrder1"], ' +
   "#submitOrderButtonId, #submitOrderButtonId input, #turbo-checkout-place-order-button";
 
 async function whatCoversPlaceOrder(page: Page): Promise<string | null> {
   return page
     .evaluate((sel) => {
-      const btn = document.querySelector(sel) as HTMLElement | null;
+      // The ₹0 checkout's "Pay Now" may not carry the Place Order ids: its text finds it too.
+      const shown = (e: Element) => e.getBoundingClientRect().width > 0;
+      const btn = ([...document.querySelectorAll(sel)].find(shown) ??
+        [...document.querySelectorAll('input[type="submit"], button, span.a-button-text, span.a-button-inner')].find(
+          (e) => shown(e) && /^(pay now|place your order|place order)$/i.test(((e as HTMLElement).innerText || (e as HTMLInputElement).value || "").trim()),
+        )) as HTMLElement | undefined;
       if (!btn) return null;
       const r = btn.getBoundingClientRect();
       if (r.width === 0 || r.height === 0) return null;
       const at = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
-      if (!at || at === btn || btn.contains(at) || at.contains(btn)) return null;
+      // Inside its own a-button (the transparent input on top) is not covered.
+      const own = btn.closest(".a-button") ?? btn;
+      if (!at || at === btn || btn.contains(at) || at.contains(btn) || own.contains(at)) return null;
       const owner = (at.closest('[role="dialog"], .a-popover, .a-modal-scroller') ??
         at) as HTMLElement;
       return (owner.innerText || owner.tagName).replace(/\s+/g, " ").trim().slice(0, 80);
@@ -1153,6 +1447,8 @@ export async function runApplyPayment(page: Page, payment: PaymentSpec): Promise
   // Vouchers and balance can cover everything: Amazon then shows ₹0.00 and
   // "Pay Now", with no payment method left to choose.
   if (totalNum === 0) {
+    const cover = await clearOverPayNow(page);
+    if (cover) return { ok: false, reason: `a popup is still over Pay Now: "${cover}"` };
     return { ok: true, detail: "order total ₹0 — nothing left to pay" };
   }
 
@@ -1200,7 +1496,25 @@ export async function runApplyPayment(page: Page, payment: PaymentSpec): Promise
     return { ok: false, reason: '"Use this payment method" button not found' };
   }
   await pause("advanced to order review");
+  const cover = await clearOverPayNow(page);
+  if (cover) return { ok: false, reason: `a popup is still over Place Order: "${cover}"` };
   return { ok: true, detail: `paid with the Amazon Pay balance (₹${balNum} for ₹${totalNum})` };
+}
+
+/**
+ * select_payment only succeeds with Pay Now clear: a Prime upsell left over it
+ * swallowed the next step's press (2026-10-08). Closes what covers it; the
+ * label of whatever still does, else null.
+ */
+export async function clearOverPayNow(page: Page): Promise<string | null> {
+  let cover = await whatCoversPlaceOrder(page);
+  if (!cover) return null;
+  console.log(`[bot] Pay Now is covered by "${cover}" — closing it`);
+  await dismissCheckoutModal(page);
+  cover = await whatCoversPlaceOrder(page);
+  if (!cover) return null;
+  await dismissBlockingOverlay(page);
+  return whatCoversPlaceOrder(page);
 }
 
 export async function readPageErrors(page: Page): Promise<string[]> {
@@ -1234,7 +1548,7 @@ async function waitForOrderReview(page: Page, timeoutMs = 90_000): Promise<boole
         const applying = /setting your payment method/i.test(document.body.innerText);
         const hasPlace =
           !!document.querySelector(
-            '#placeYourOrder, input[name="placeYourOrder1"], #submitOrderButtonId, #turbo-checkout-place-order-button',
+            '#placeOrder, #placeYourOrder, input[name="placeYourOrder1"], #submitOrderButtonId, #bottomSubmitOrderButtonId, #turbo-checkout-place-order-button',
           ) ||
           [...document.querySelectorAll('input[type="submit"], button, span')].some((n) => {
             const el = n as HTMLElement;
@@ -1314,6 +1628,8 @@ interface LedgerEntry {
   basket?: BasketItem[];
   /** Order ids already on Your Orders just before placing: the new ones are ours. */
   known_orders?: string[];
+  /** Full names of the sheet addresses checkout still shipped to (the basket can shrink). */
+  ship_to?: string[];
 }
 
 /** Ids on Your Orders right now, read in a separate tab so checkout stays put. */
@@ -1329,27 +1645,197 @@ async function knownOrderIds(page: Page): Promise<string[]> {
   }
 }
 
-/** The new orders, polled: Your Orders can take a little while to list them. */
-async function findNewOrders(
-  page: Page,
-  known: string[],
-  targets: TargetAddress[],
-): Promise<{ ok: true; ids: string[]; orders: OrderCard[]; detail: string } | { ok: false; reason: string }> {
-  let last = "no new order on Your Orders";
-  // A multi-address purchase can take a minute to list every order.
-  for (let attempt = 1; attempt <= 8; attempt++) {
-    await page.goto(ORDERS_URL, { waitUntil: "domcontentloaded", timeout: NAV_TIMEOUT_MS });
-    await pause("reading Your Orders");
-    const found = newOrdersFor(await readOrderCards(page), known, targets);
-    if (found.ok) {
-      const ids = found.orders.map((o) => o.id);
-      return { ok: true, ids, orders: found.orders, detail: found.orders.map((o) => `${o.id} -> ${o.shipTo}`).join(", ") };
-    }
-    last = found.reason;
-    await sleep(5000);
-  }
-  return { ok: false, reason: last };
+/**
+ * Your Orders just before Pay Now could be pressed — taken by select_payment,
+ * so a Pay Now pressed BY HAND while the run is parked still has a "before"
+ * to count the new orders against. Written once per run: a later
+ * select_payment (a resume) may already be past an order.
+ */
+function ordersBeforePath(artifactsDir: string): string {
+  return join(artifactsDir, "orders-before.json");
 }
+
+export function readOrdersBefore(artifactsDir: string): string[] | null {
+  try {
+    const ids: unknown = JSON.parse(readFileSync(ordersBeforePath(artifactsDir), "utf8"));
+    return Array.isArray(ids) ? (ids as string[]) : null;
+  } catch {
+    return null;
+  }
+}
+
+export async function saveOrdersBefore(page: Page, artifactsDir: string): Promise<void> {
+  if (existsSync(ordersBeforePath(artifactsDir)) || /thankyou/i.test(page.url())) return;
+  const ids = await knownOrderIds(page);
+  mkdirSync(artifactsDir, { recursive: true });
+  writeFileSync(ordersBeforePath(artifactsDir), JSON.stringify(ids), { mode: 0o600 });
+  console.log(`[bot] Your Orders before Pay Now: ${ids.length} order(s) noted`);
+}
+
+/**
+ * Your Orders as it was before this run's Pay Now: the ledger's (taken just
+ * before the bot pressed), else select_payment's snapshot, else unknown.
+ */
+function ordersBefore(artifactsDir: string, idempotencyKey: string): string[] | null {
+  return readLedger(artifactsDir).find((e) => e.key === idempotencyKey)?.known_orders ?? readOrdersBefore(artifactsDir);
+}
+
+export type FoundOrders = { ok: true; orders: OrderCard[]; shipping: TargetAddress[]; detail: string } | { ok: false; reason: string };
+
+/**
+ * The row's orders on Your Orders, by the sheet's address names (see
+ * ordersByName), polled `attempts` times. In a side tab, so a checkout in the
+ * main tab stays where it is.
+ */
+export async function lookUpOrders(
+  page: Page,
+  artifactsDir: string,
+  idempotencyKey: string,
+  targets: TargetAddress[],
+  attempts = 1,
+): Promise<FoundOrders> {
+  const before = ordersBefore(artifactsDir, idempotencyKey);
+  const tab = await page.context().newPage();
+  await tab.bringToFront().catch(() => { });
+  let last = "no order on Your Orders";
+  try {
+    for (let i = 1; i <= attempts; i++) {
+      await tab.goto(ORDERS_URL, { waitUntil: "domcontentloaded", timeout: NAV_TIMEOUT_MS });
+      await pause("reading Your Orders");
+      const found = ordersByName(await readOrderCards(tab), targets, before);
+      if (found.ok) {
+        return { ...found, detail: found.orders.map((o) => `${o.id} -> ${o.shipTo}`).join(", ") };
+      }
+      last = found.reason;
+      // A multi-address purchase can take a minute to list every order.
+      if (i < attempts) await sleep(5000);
+    }
+    return { ok: false, reason: last };
+  } finally {
+    await tab.close().catch(() => { });
+    await page.bringToFront().catch(() => { });
+  }
+}
+
+/**
+ * The orders found are this row's: each address row gets its order id(s),
+ * the purchase is recorded on the master (opened here if the bot never
+ * pressed Pay Now itself — placed by hand, or by an earlier attempt), and the
+ * row is DONE.
+ */
+export async function recordOrders(
+  page: Page,
+  idempotencyKey: string,
+  artifactsDir: string,
+  targets: TargetAddress[],
+  found: Extract<FoundOrders, { ok: true }>,
+): Promise<CheckoutResult> {
+  const jobId = process.env.JOB_ID ?? "";
+  const runId = process.env.RUN_ID ?? "";
+  if (!jobId || !runId) return { ok: false, reason: "a master-owned row is required to record the order" };
+  const client = requireJobClient();
+  const orderIds = found.orders.map((o) => o.id).join("\n");
+  // One order (or more) per delivery address, one per line on its Address row.
+  const perAddress = targets.flatMap((t) => {
+    const ids = found.orders.filter((o) => shipsTo(o, t)).map((o) => o.id);
+    return t.row !== undefined && ids.length ? [{ row_number: t.row, order_id: ids.join("\n") }] : [];
+  });
+  if (perAddress.length) await client.markAddressOrders(jobId, runId, perAddress);
+
+  const ledger = readLedger(artifactsDir);
+  let entry = ledger.find((e) => e.key === idempotencyKey);
+  if (!entry?.token) {
+    try {
+      const intent = await client.beginPurchase(runId, jobId);
+      entry = { key: idempotencyKey, order_id: null, placed_at: intent.attempted_at, token: intent.token, known_orders: ordersBefore(artifactsDir, idempotencyKey) ?? [] };
+      ledger.push(entry);
+    } catch (err) {
+      console.log(`[bot] no purchase record opened for ${orderIds.replace(/\n/g, ", ")}: ${(err as Error).message}`);
+    }
+  }
+  if (entry?.token && entry.order_id !== orderIds) {
+    try {
+      await client.completePurchase(runId, jobId, entry.token, orderIds, { orders: found.detail, basket: entry.basket ?? null });
+      entry.order_id = orderIds;
+    } catch (err) {
+      console.log(`[bot] purchase record not completed: ${(err as Error).message}`);
+    }
+  }
+  if (entry) writeLedger(artifactsDir, ledger);
+  writeFileSync(join(artifactsDir, "order-id.txt"), orderIds, "utf8");
+  await client.reportResult(jobId, { status: "DONE", order_id: orderIds, run_id: runId });
+  return { ok: true, detail: `order id(s) ${found.detail}` };
+}
+
+/**
+ * PAY NOW, BY ITS ID. The ₹0 checkout shows it twice (top and bottom); a
+ * card checkout calls it Place Your Order. Ids first, its label second.
+ */
+const PAY_NOW_IDS = [
+  "#placeOrder",
+  'input[name="placeYourOrder1"]',
+  "#submitOrderButtonId input",
+  "#bottomSubmitOrderButtonId input",
+  'input[aria-labelledby="submitOrderButtonId-announce"]',
+  'input[aria-labelledby="bottomSubmitOrderButtonId-announce"]',
+  "#placeYourOrder input",
+  "#turbo-checkout-place-order-button",
+];
+const PAY_NOW_TEXT = /^(pay now|place your order|place order)$/i;
+const PAY_NOW_MARK = "data-fleet-pay-now";
+
+async function findPayNow(page: Page): Promise<Locator | null> {
+  const byId = await firstVisible(page, PAY_NOW_IDS);
+  if (byId) return byId;
+  const marked = await page
+    .evaluate(([src, mark]) => {
+      const re = new RegExp(src, "i");
+      document.querySelectorAll(`[${mark}]`).forEach((e) => e.removeAttribute(mark));
+      const label = [...document.querySelectorAll("span.a-button-text, span, button, input[type='submit']")].find((e) => {
+        const r = e.getBoundingClientRect();
+        return r.width > 0 && r.height > 0 && re.test(((e as HTMLElement).innerText || (e as HTMLInputElement).value || "").trim());
+      });
+      if (!label) return false;
+      // On an a-button the transparent input on top is the control.
+      const control = label.closest(".a-button")?.querySelector("input, button") ?? label;
+      control.setAttribute(mark, "1");
+      return true;
+    }, [PAY_NOW_TEXT.source, PAY_NOW_MARK] as const)
+    .catch(() => false);
+  return marked ? page.locator(`[${PAY_NOW_MARK}]`).first() : null;
+}
+
+/**
+ * One press of Pay Now. Popups first (the Prime upsell reappears at will);
+ * then a real click. If a popup still intercepts it, close it and press the
+ * button's own click(), which submits its form whatever lies on top — unless
+ * the page already left checkout, so it is never pressed twice.
+ */
+export async function pressPayNow(page: Page): Promise<void> {
+  await dismissCheckoutModal(page);
+  const button = await findPayNow(page);
+  if (!button) {
+    console.log("[bot] Pay Now not found to press");
+    return;
+  }
+  const what = await button
+    .evaluate((el) => `${el.tagName.toLowerCase()}${el.id ? `#${el.id}` : ""}${el.getAttribute("name") ? `[name=${el.getAttribute("name")}]` : ""}`)
+    .catch(() => "?");
+  await button.scrollIntoViewIfNeeded({ timeout: 5_000 }).catch(() => { });
+  await shortPause();
+  const clicked = await button.click({ timeout: 8_000 }).then(() => true).catch(() => false);
+  if (!clicked) {
+    const cover = await whatCoversPlaceOrder(page);
+    console.log(`[bot] Pay Now (${what}) did not take a click${cover ? ` — covered by "${cover}"` : ""}`);
+    await dismissCheckoutModal(page);
+    if (/thankyou/i.test(page.url()) || !(await atCheckoutPipeline(page))) return;
+    await button.evaluate((el) => (el as HTMLElement).click()).catch(() => { });
+  }
+  console.log(`[bot] pressed Pay Now (${what})${clicked ? "" : " directly"}`);
+  await page.waitForLoadState("domcontentloaded", { timeout: NAV_TIMEOUT_MS }).catch(() => { });
+  await pause("order submitted");
+}
+
 
 function ledgerPath(artifactsDir: string): string {
   return join(artifactsDir, "orders-placed.json");
@@ -1374,33 +1860,52 @@ function writeLedger(artifactsDir: string, entries: LedgerEntry[]): void {
   renameSync(path + ".tmp", path);
 }
 
+/**
+ * PAY NOW. note_order_id has already looked on Your Orders by the sheet's
+ * address names and found nothing, so this is the press.
+ *
+ * `unblocked` (Remove blocks): the operator aligned the checkout by hand.
+ * The basket checks are logged, not obeyed; a press this run recorded before
+ * that placed no order does not stop another; a review page still applying
+ * its payment method is pressed anyway.
+ */
 export async function runPlaceOrder(
   page: Page,
   idempotencyKey: string,
   artifactsDir: string,
   addresses: TargetAddress[],
+  opts: { unblocked?: boolean } = {},
 ): Promise<CheckoutResult> {
   const ledger = readLedger(artifactsDir);
   const prior = ledger.find((e) => e.key === idempotencyKey);
-  // Never clicks twice. A resume after the click moves on: note_order_id finds
-  // the orders. A second purchase is PENDING / New attempt in the panel.
-  if (prior) {
+  // Never clicks twice. A resume after the click moves on: the order ids are
+  // read next. Remove blocks presses again: Your Orders had nothing for it.
+  if (prior && !opts.unblocked) {
     return { ok: true, detail: `already submitted at ${prior.placed_at}; order ids are read next` };
   }
+  const basketFile = join(artifactsDir, "expected-basket.json");
+  const basket = existsSync(basketFile) ? (JSON.parse(readFileSync(basketFile, "utf8")) as BasketItem[]) : [];
+  const jobId = process.env.JOB_ID ?? "";
+  const runId = process.env.RUN_ID ?? "";
+  if (!jobId || !runId) return { ok: false, reason: "a master-owned row and purchase ledger are required to place an order" };
 
+  // The thank-you page lives under /gp/buy/, so it passes for checkout. Pay
+  // Now was pressed (by hand) and Your Orders does not list it yet.
+  if (/thankyou/i.test(page.url())) {
+    return { ok: false, reason: "on the thank-you page, but Your Orders has no order for the sheet's address names yet — run note_order_id again, or Mark completed" };
+  }
   const atOrder = await ensureAtCheckout(page);
   if (!atOrder.ok) return atOrder;
 
   const ready = await waitForOrderReview(page);
   if (!ready) {
     const said = await readPageErrors(page);
-    return {
-      ok: false,
-      reason:
-        (said.length > 0 ? `Amazon says: ${said.join(" | ")} — ` : "") +
-        `checkout never finished applying the payment method (still showing ` +
-        `"Setting your payment method...") at ${page.url().slice(0, 80)}`,
-    };
+    const why =
+      (said.length > 0 ? `Amazon says: ${said.join(" | ")} — ` : "") +
+      `checkout never finished applying the payment method (still showing ` +
+      `"Setting your payment method...") at ${page.url().slice(0, 80)}`;
+    if (!opts.unblocked) return { ok: false, reason: why };
+    console.warn(`[bot] blocks removed — ${why}; pressing Pay Now anyway`);
   }
 
   await pause("reviewing order before placing");
@@ -1411,62 +1916,46 @@ export async function runPlaceOrder(
     .catch(() => "");
   console.log(`[bot] order total: ${total.replace(/\s+/g, " ").trim().slice(0, 80) || "unknown"}`);
 
-  const place = await firstVisible(page, [
-    "#placeYourOrder input",
-    'input[name="placeYourOrder1"]',
-    "#submitOrderButtonId input",
-    "#turbo-checkout-place-order-button",
-    'input[aria-labelledby="submitOrderButtonId-announce"]',
-  ]);
-  const haveTextButton =
-    !place &&
-    (await page.evaluate(() =>
-      [...document.querySelectorAll('input[type="submit"], button')].some((n) => {
-        const el = n as HTMLElement;
-        return (
-          el.offsetParent !== null &&
-          /place your order|place order|^pay now$/i.test(
-            (el.innerText || (el as unknown as HTMLInputElement).value || "").trim(),
-          )
-        );
-      }),
-    ));
-  if (!place && !haveTextButton) {
+  if (!(await findPayNow(page))) {
     return {
       ok: false,
       reason:
-        `Place Your Order button not found at ${page.url()}. ` +
+        `Pay Now / Place Your Order button not found at ${page.url()}. ` +
         `If this is the /pay page, the payment method still needs selecting first.`,
     };
   }
 
-  await dismissBlockingOverlay(page);
-  const basket = JSON.parse(readFileSync(join(artifactsDir, "expected-basket.json"), "utf8")) as BasketItem[];
-  const mismatch = reviewError(basket, addresses, await readReviewShipments(page));
-  if (mismatch) return { ok: false, reason: `PRE-PURCHASE STOP: ${mismatch}` };
-  const jobId = process.env.JOB_ID ?? "";
-  const runId = process.env.RUN_ID ?? "";
-  if (!jobId || !runId) return { ok: false, reason: "a master-owned row and purchase ledger are required to place an order" };
+  // The basket may have shrunk since add_items (unavailable, removed by hand);
+  // it may not have grown or moved — see reviewBasket.
+  const review = basket.length
+    ? reviewBasket(basket, addresses, await readReviewShipments(page))
+    : ({ ok: false, error: "no basket from add_items to check against" } as const);
+  if (!review.ok) {
+    if (!opts.unblocked) return { ok: false, reason: `PRE-PURCHASE STOP: ${review.error}` };
+    console.warn(`[bot] blocks removed — pre-purchase check would stop here, pressing anyway: ${review.error}`);
+  } else if (review.changes.length) {
+    console.log(`[bot] basket changed since add_items (allowed): ${review.changes.join("; ")}`);
+  }
+  const shipping = review.ok ? review.shipping : addresses;
   const known = await knownOrderIds(page);
-  const intent = await requireJobClient().beginPurchase(runId, jobId);
-  ledger.push({ key: idempotencyKey, order_id: null, placed_at: intent.attempted_at, token: intent.token, basket, known_orders: known });
+  if (prior) {
+    // Remove blocks, pressing again: the same purchase record, a fresh "before".
+    prior.known_orders = known;
+    prior.ship_to = shipping.map((t) => t.fullName);
+  } else {
+    const intent = await requireJobClient().beginPurchase(runId, jobId);
+    ledger.push({
+      key: idempotencyKey, order_id: null, placed_at: intent.attempted_at, token: intent.token, basket,
+      known_orders: known, ship_to: shipping.map((t) => t.fullName),
+    });
+  }
   writeLedger(artifactsDir, ledger);
 
-  const finalMismatch = reviewError(basket, addresses, await readReviewShipments(page));
-  if (finalMismatch) return { ok: false, reason: `purchase intent reserved but checkout changed: ${finalMismatch}; reconcile before retrying` };
+  if (!opts.unblocked && basket.length) {
+    const final = reviewBasket(basket, addresses, await readReviewShipments(page));
+    if (!final.ok) return { ok: false, reason: `purchase intent reserved but checkout changed: ${final.error}; reconcile before retrying` };
+  }
 
-  const PLACE_TEXT = /place your order|place order|^pay now$/;
-  const clickPlace = async (): Promise<void> => {
-    // A Prime upsell can pop up at any moment on checkout and swallow the click.
-    await dismissCheckoutModal(page);
-    await dismissBlockingOverlay(page);
-    if (place && (await place.isVisible().catch(() => false))) {
-      await clickAndSettle(place, page, "order submitted");
-    } else {
-      if (!(await clickAmazonButton(page, PLACE_TEXT))) await clickByText(page, PLACE_TEXT);
-      await pause("order submitted");
-    }
-  };
   // The thank-you page is not read: note_order_id takes the ids from Your
   // Orders. All this waits for is checkout letting go of the order.
   // The thank-you page lives under /gp/buy/ too (/gp/buy/thankyou/...).
@@ -1477,14 +1966,20 @@ export async function runPlaceOrder(
       .catch(() => false);
 
   console.log("[bot] *** PLACING ORDER — irreversible ***");
-  await clickPlace();
+  await pressPayNow(page);
   let left = await leftCheckout(30_000);
   if (!left && (await readPageErrors(page)).length === 0) {
-    // Still on checkout, no error: a popup most likely ate the click. Amazon
-    // places one order per checkout, so pressing again cannot buy twice.
-    console.log("[bot] still on checkout after Pay Now — closing any popup and pressing it again");
-    await clickPlace();
-    left = await leftCheckout(60_000);
+    // Still on checkout, no error. Before pressing again, Your Orders: if the
+    // press did go through, there is nothing to press.
+    const placed = await lookUpOrders(page, artifactsDir, idempotencyKey, shipping, 1);
+    if (placed.ok) {
+      console.log(`[bot] still on checkout, but Your Orders has ${placed.detail} — not pressing again`);
+      left = true;
+    } else {
+      console.log("[bot] still on checkout after Pay Now, no new order — closing any popup and pressing it again");
+      await pressPayNow(page);
+      left = await leftCheckout(60_000);
+    }
   }
   if (!left) {
     const said = await readPageErrors(page);
@@ -1493,7 +1988,7 @@ export async function runPlaceOrder(
       reason:
         (said.length > 0 ? `Amazon says: ${said.join(" | ")} — ` : "") +
         `still at checkout after Pay Now. ` +
-        `The attempt IS recorded in the ledger — verify in Your Orders before retrying.`,
+        `The attempt IS recorded — check Your Orders, then run note_order_id again (it takes any order it finds) or Mark completed.`,
     };
   }
   await pause("order submitted");
@@ -1515,35 +2010,16 @@ export function orderIdFromUrl(url: string): string | null {
   return url.match(ORDER_ID_RE)?.[1] ?? null;
 }
 
+/**
+ * After Pay Now: the orders on Your Orders for the sheet's address names
+ * (Your Orders can take a minute to list a multi-address purchase), recorded
+ * and the row DONE. The basket may have shrunk: any address with an order is
+ * enough; one without gets none.
+ */
 export async function runNoteOrderId(
   page: Page, idempotencyKey: string, artifactsDir: string, addresses: TargetAddress[],
 ): Promise<CheckoutResult> {
-  const ledger = readLedger(artifactsDir);
-  const entry = ledger.find(e => e.key === idempotencyKey);
-  if (!entry?.token || !entry.basket || !entry.known_orders) {
-    return { ok: false, reason: "purchase intent cache missing; reconcile the master ledger manually" };
-  }
-  const found = await findNewOrders(page, entry.known_orders, addresses);
-  if (!found.ok) return { ok: false, reason: `order outcome UNKNOWN: ${found.reason}; human reconciliation required` };
-  // One order per delivery address, one per line in the sheet's order_id cell.
-  const orderIds = found.ids.join("\n");
-  const jobId = process.env.JOB_ID ?? "";
-  const runId = process.env.RUN_ID ?? "";
-  const client = requireJobClient();
-  // Each Address row gets the order(s) shipping to it. First, while the run
-  // still owns the row: a failure here leaves the purchase open to resume.
-  const perAddress = addresses.flatMap((t) => {
-    const ids = found.orders.filter((o) => shipsTo(o, t)).map((o) => o.id);
-    return t.row !== undefined && ids.length ? [{ row_number: t.row, order_id: ids.join("\n") }] : [];
-  });
-  if (perAddress.length) await client.markAddressOrders(jobId, runId, perAddress);
-  // Re-run after the ids were reported: the addresses are written again, the
-  // purchase is already complete on the master.
-  if (entry.order_id) return { ok: true, detail: `order id(s) ${found.detail}` };
-  await client.completePurchase(runId, jobId, entry.token, orderIds, { orders: found.detail, basket: entry.basket });
-  entry.order_id = orderIds;
-  writeLedger(artifactsDir, ledger);
-  writeFileSync(join(artifactsDir, "order-id.txt"), orderIds, "utf8");
-  await client.reportResult(jobId, { status: "DONE", order_id: orderIds, run_id: runId });
-  return { ok: true, detail: `order id(s) ${found.detail}` };
+  const found = await lookUpOrders(page, artifactsDir, idempotencyKey, addresses, 8);
+  if (!found.ok) return { ok: false, reason: `order outcome UNKNOWN: ${found.reason}; check Your Orders, then Mark completed` };
+  return recordOrders(page, idempotencyKey, artifactsDir, addresses, found);
 }

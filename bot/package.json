@@ -13,7 +13,8 @@
     "test:totp": "npm run build && node dist/totp.test.js",
     "test:fleet": "npm run build && node dist/fleet.test.js",
     "test:safety": "npm run build && node --test dist/safety.test.js",
-    "manager": "npm run build && node dist/manager.js"
+    "manager": "npm run build && node dist/manager.js",
+    "cleanup": "npm run build && node dist/cleanup.js"
   },
   "dependencies": {
     "@app/contracts": "file:../packages/contracts",

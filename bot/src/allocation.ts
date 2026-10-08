@@ -93,9 +93,14 @@ export interface FreeItem {
 
 /**
  * Where the free units go. One address: there, with everything else (no
- * shares). Several: exactly where "*_N" says — every free unit needs a "*"
- * share and every "*" share needs a free unit, else add_items fails. Several
- * free products share the "*" pool in address order.
+ * shares). Several: to the address(es) with "*_N".
+ *
+ * HOW MANY Amazon gives is not the sheet's to decide (2026-10-08: the cart
+ * offered 2 free items where 1 was expected, and refusing that stopped the
+ * run). Whatever count shows, the "*" addresses take it: each up to its N, in
+ * address order, and whatever is left over goes to the first "*" address. Fewer
+ * than expected is fine too. Still refused: a free item and no "*" address at
+ * all (nowhere to send it), and a "*" with no free item anywhere.
  */
 export function placeFreeItems(plan: Allocation, items: FreeItem[]): number[][] | null | string {
   const units = items.reduce((n, f) => n + f.quantity, 0);
@@ -103,12 +108,10 @@ export function placeFreeItems(plan: Allocation, items: FreeItem[]): number[][] 
   const wanted = plan.free.reduce((n, q) => n + q, 0);
   const names = items.map((f) => f.title.slice(0, 40)).join(", ");
   if (units === 0) {
-    return wanted === 0 ? [] : `ItemsQuantity sends ${wanted} free item(s) (*_N) but no product page offers a free item`;
+    return wanted === 0 ? [] : `ItemsQuantity sends ${wanted} free item(s) (*_N) but neither the product page nor the cart shows a free item`;
   }
-  if (wanted === 0) return `${units} free item(s) offered (${names}) but no address has *_${units} in ItemsQuantity`;
-  if (wanted !== units) {
-    return `${units} free item(s) offered (${names}) but ItemsQuantity sends ${wanted} with *_N (${plan.free.join("/")})`;
-  }
+  if (wanted === 0) return `${units} free item(s) offered (${names}) but no address has *_1 in ItemsQuantity`;
+  const first = plan.free.findIndex((q) => q > 0);
   const left = [...plan.free];
   return items.map((f) => {
     const share = left.map(() => 0);
@@ -119,6 +122,8 @@ export function placeFreeItems(plan: Allocation, items: FreeItem[]): number[][] 
       left[a]! -= take;
       need -= take;
     }
+    // More than the sheet expected: the rest to the first "*" address.
+    share[first]! += need;
     return share;
   });
 }

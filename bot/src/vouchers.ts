@@ -10,8 +10,9 @@ import type { Page } from "./pw.js";
  * account's vouchers are the Vouchers-tab rows sharing its batch_id. Every
  * code, whatever its type, is added on Amazon's claim-code page ("Add to
  * Amazon Pay Balance") — never in checkout's promo-code field — one at a
- * time, reloading the page after every submit. The checkout is reloaded
- * afterwards so it shows the new balance.
+ * time, each submitted once on a freshly opened form (never a reload: that
+ * re-sends the code). The checkout is reloaded afterwards so it shows the
+ * new balance.
  *
  * Every code added (or that Amazon says is already added) is marked Used on
  * its Vouchers row, and remembered in this run's artifacts so a retry of the
@@ -96,21 +97,51 @@ export async function runAddVouchers(
   const at = await ensureAtCheckout(page);
   if (!at.ok) return { status: "failed", reason: at.reason };
 
-  const applied: string[] = [];
-  const failed: string[] = [];
   const record = async (v: PaymentCode): Promise<void> => {
     used.add(v.code.trim());
     writeFileSync(usedPath(artifactsDir), JSON.stringify([...used]), { mode: 0o600 });
     await markUsed?.(v);
   };
+  const { applied, failed } = await claimVouchers(page, plan.todo, record);
 
+  // The checkout was opened before the balance changed.
+  if (applied.length > 0) {
+    // A GET of the same URL, not reload(): a reload re-sends a page that came from a form POST.
+    await page.goto(page.url(), { waitUntil: "domcontentloaded", timeout: NAV_TIMEOUT_MS }).catch(() => { });
+    await waitForCheckoutPipeline(page);
+    await dismissCheckoutModal(page);
+    await pause("checkout reloaded with the new balance");
+  }
+
+  if (failed.length > 0) {
+    return {
+      status: "failed",
+      reason:
+        `${failed.length} voucher(s) did not go through — ${failed.join("; ")}` +
+        ` (added: ${applied.join(", ") || "none"})`,
+    };
+  }
+  return { status: "done", detail: `vouchers added: ${applied.join(", ")}` };
+}
+
+/**
+ * Each code, once, on the claim-code page in a side tab. `record` runs for
+ * every code that went in (or Amazon says was already in).
+ */
+export async function claimVouchers(
+  page: Page,
+  todo: PaymentCode[],
+  record: (v: PaymentCode) => Promise<void>,
+): Promise<{ applied: string[]; failed: string[] }> {
+  const applied: string[] = [];
+  const failed: string[] = [];
   // A side tab, so the checkout stays where it is. In front: a new tab can
   // open behind the checkout, where clicks never land ("element is outside of
   // the viewport" until the step times out — seen 2026-10-08).
   const tab = await page.context().newPage();
   await tab.bringToFront().catch(() => { });
   try {
-    for (const v of plan.todo) {
+    for (const v of todo) {
       const r = await claimToBalance(tab, v.code);
       if (r.ok) {
         applied.push(label(v));
@@ -129,24 +160,7 @@ export async function runAddVouchers(
     await tab.close().catch(() => { });
     await page.bringToFront().catch(() => { });
   }
-
-  // The checkout was opened before the balance changed.
-  if (applied.length > 0) {
-    await page.reload({ waitUntil: "domcontentloaded", timeout: NAV_TIMEOUT_MS }).catch(() => { });
-    await waitForCheckoutPipeline(page);
-    await dismissCheckoutModal(page);
-    await pause("checkout reloaded with the new balance");
-  }
-
-  if (failed.length > 0) {
-    return {
-      status: "failed",
-      reason:
-        `${failed.length} voucher(s) did not go through — ${failed.join("; ")}` +
-        ` (added: ${applied.join(", ") || "none"})`,
-    };
-  }
-  return { status: "done", detail: `vouchers added: ${applied.join(", ")}` };
+  return { applied, failed };
 }
 
 type CodeResult =
@@ -191,7 +205,16 @@ async function readClaimState(tab: Page): Promise<ClaimState> {
     .catch(() => ({ error: null, captcha: false, alerts: [], balances: "", text: "" }));
 }
 
-/** One code into the Amazon Pay balance, on the claim-code page; reloads the page after. */
+/**
+ * One code into the Amazon Pay balance, on the claim-code page, submitted
+ * exactly once.
+ *
+ * The form is a plain POST to the claim-code URL, so after Add the tab shows
+ * the POST's answer. Reloading that page sends the form again — the same code
+ * a second time, which Amazon answers "already used" and which brought up a
+ * captcha (operators saw it, 2026-10-08). So the page is never reloaded: each
+ * code opens the form fresh with a GET.
+ */
 async function claimToBalance(tab: Page, code: string): Promise<CodeResult> {
   await tab.goto(CLAIM_CODE_URL, { waitUntil: "domcontentloaded", timeout: NAV_TIMEOUT_MS });
   await pause("claim-code page loaded");
@@ -212,13 +235,25 @@ async function claimToBalance(tab: Page, code: string): Promise<CodeResult> {
   if (!(await button.isVisible().catch(() => false))) {
     return { ok: false, reason: '"Add to Amazon Pay Balance" button not found', fatal: true };
   }
-  await button.click();
+  // One press only. A click that errors may still have submitted the form, so
+  // it is never repeated: the page's answer below decides.
+  const clickError = await button
+    .click({ timeout: 15_000 })
+    .then(() => null)
+    .catch((err: Error) => err.message.split("\n")[0]!);
+  if (clickError) console.warn(`[bot] vouchers: Add press reported "${clickError}" — reading the page, not pressing again`);
+  await tab.waitForLoadState("domcontentloaded").catch(() => { });
 
   let result: CodeResult | null = null;
   const deadline = Date.now() + VERDICT_TIMEOUT_MS;
   while (!result) {
     await tab.waitForTimeout(1000);
     const now = await readClaimState(tab);
+    // Between the form page and the POST's answer: nothing to read yet.
+    if (!now.text) {
+      if (Date.now() >= deadline) result = { ok: false, reason: "the claim-code page did not come back after Add" };
+      continue;
+    }
     const said = [now.error ?? "", ...now.alerts.filter((a) => !before.alerts.includes(a))].join(" ").trim();
     if (now.captcha) result = { ok: false, reason: "the claim-code page wants a captcha", fatal: true };
     else if (ALREADY_USED.test(said)) result = { ok: false, reason: said, alreadyUsed: true };
@@ -232,8 +267,8 @@ async function claimToBalance(tab: Page, code: string): Promise<CodeResult> {
     }
   }
 
-  // Each code starts from a fresh form.
-  await tab.reload({ waitUntil: "domcontentloaded", timeout: NAV_TIMEOUT_MS }).catch(() => { });
-  await pause("claim-code page refreshed");
+  // Never tab.reload() here: it re-sends the POST (see above). The next code
+  // opens the form with a fresh GET.
+  await pause("claim-code page answered");
   return result;
 }

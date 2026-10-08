@@ -61,6 +61,8 @@ let runnerControlPort: number | null = null;
  * where the operator asked, instead of running on into checkout.
  */
 let stopAfter: number | undefined = parseStopAfter(process.env.SLOT_STOP_AFTER ?? null);
+/** Remove blocks (RunnerConfig.unblocked). Restated by every resume, like stopAfter. */
+let unblocked = process.env.SLOT_UNBLOCKED === "true";
 
 function parseStopAfter(raw: string | null): number | undefined {
   if (raw === null || raw.trim() === "") return undefined;
@@ -252,6 +254,7 @@ function spawnRunner(startIndex: number): void {
     storage_state_path: storageStatePath,
     artifacts_dir: artifactsDir,
     ...(stopAfter !== undefined ? { stop_after: stopAfter } : {}),
+    ...(unblocked ? { unblocked: true } : {}),
   };
 
   status = "BUSY";
@@ -497,6 +500,7 @@ const http = createServer(async (req, res) => {
       return json(res, 400, { error: `bad 'stop_after': ${untilRaw}` });
     }
     stopAfter = until;
+    unblocked = url.searchParams.get("unblocked") === "1";
     if (JOB_ID) {
       const fresh = await requireJobClient().resumeInputs(runId);
       if (fresh.fresh_attempt) {
@@ -520,7 +524,9 @@ const http = createServer(async (req, res) => {
       // to rebuild the cart. Only a New attempt buys again.
       const placed = existsSync(join(artifactsDir, "orders-placed.json")) &&
         readFileSync(join(artifactsDir, "orders-placed.json"), "utf8").trim().length > 2;
-      if (!placed) from = resumeStep(previous, fresh.job, from);
+      // Remove blocks starts where the operator said (proceed_to_buy): the cart
+      // they aligned by hand is not rebuilt, whatever the sheet says now.
+      if (!placed && !unblocked) from = resumeStep(previous, fresh.job, from);
       // Says what the master answered, so "the sheet edit was not picked up" can be told
       // apart from "the master had not seen the edit yet".
       log(
@@ -544,7 +550,7 @@ const http = createServer(async (req, res) => {
     if (runnerWaitingPort) {
       const ok = await fetch(
         `http://127.0.0.1:${runnerWaitingPort}/continue?token=${token}&from=${from}` +
-          `&stop_after=${stopAfter ?? ""}`,
+          `&stop_after=${stopAfter ?? ""}&unblocked=${unblocked ? 1 : ""}`,
         { method: "POST" },
       )
         .then((r) => r.ok)
@@ -799,8 +805,17 @@ async function main(): Promise<void> {
   updateRegistry();
   record("slot.ready", { port: actualPort, token, jobId: JOB_ID || null });
 
-  if (process.env.SLOT_RESTORE_ONLY === "true") markStuck("browser restored; press Resume to execute steps");
-  else spawnRunner(resumeIndex());
+  // A restored browser waits for Resume — unless it was restored to run on
+  // from a given step (Remove blocks: from proceed_to_buy, the session from
+  // storage-state.json).
+  const startFrom = parseStopAfter(process.env.SLOT_START_FROM ?? null);
+  if (process.env.SLOT_RESTORE_ONLY === "true" && startFrom === undefined) {
+    markStuck("browser restored; press Resume to execute steps");
+  } else if (startFrom !== undefined) {
+    for (const s of steps) if (s.index >= startFrom) s.status = "PENDING";
+    log(`restored browser runs on from step ${startFrom}${unblocked ? " with blocks removed" : ""}`);
+    spawnRunner(startFrom);
+  } else spawnRunner(resumeIndex());
 }
 
 for (const stream of [process.stdout, process.stderr]) {
