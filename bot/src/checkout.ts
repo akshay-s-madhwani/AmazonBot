@@ -477,7 +477,7 @@ async function openAddressPicker(page: Page): Promise<CheckoutResult> {
  * while it updates; a read in the middle saw only some of them and failed
  * "item 1 is not on the multi-address page" (2026-10-08).
  */
-export async function waitForRowsSettled(page: Page, budgetMs = 45_000): Promise<void> {
+export async function waitForRowsSettled(page: Page, budgetMs = 45_000): Promise<boolean> {
   const deadline = Date.now() + budgetMs;
   let last = "";
   while (Date.now() < deadline) {
@@ -488,62 +488,158 @@ export async function waitForRowsSettled(page: Page, budgetMs = 45_000): Promise
         return { busy, sig: `${rows.length}|${rows.map((r) => (r as HTMLElement).innerText.slice(0, 40)).join("|")}` };
       }, ITEMSELECT_ROW)
       .catch(() => ({ busy: true, sig: "" }));
-    if (!now.busy && now.sig !== "0|" && now.sig === last) return;
+    if (!now.busy && now.sig !== "0|" && now.sig === last) return true;
     last = now.busy ? "" : now.sig;
     await sleep(1000);
   }
-  console.log("[bot] the multi-address list did not settle — reading it as it is");
+  return false;
 }
 
-/** Rows on the multi-address page, in page order, with the product each belongs to. */
-async function readItemRows(page: Page): Promise<Array<{ item: string; asin: string | null; qty: number; key: string | null }>> {
-  return page.evaluate((rowSel) => {
+/**
+ * waitForRowsSettled, and when the list never settles, the page reloaded
+ * (twice at most): "Updating your order" can spin with no rows until the page
+ * is loaded again, while the change itself has gone through (2026-10-09).
+ * Amazon keeps the multi-address state server-side, so a reload loses nothing.
+ */
+async function settleRows(page: Page, budgetMs = 45_000): Promise<void> {
+  for (let reload = 1; !(await waitForRowsSettled(page, budgetMs)); reload++) {
+    if (reload > 2) {
+      console.log("[bot] the multi-address list did not settle — reading it as it is");
+      return;
+    }
+    console.log(`[bot] the multi-address list is stuck updating — reloading the page (${reload}/2)`);
+    await page.reload({ waitUntil: "domcontentloaded", timeout: NAV_TIMEOUT_MS }).catch(() => { });
+    // A reload that lands back on payment: its Change reopens the list.
+    if (!/\/itemselect/.test(page.url())) {
+      await pause("checkout reloaded");
+      const change = await multiAddressChange(page);
+      if (change) {
+        await shortPause();
+        await change.click({ timeout: NAV_TIMEOUT_MS }).catch(() => { });
+        await page.waitForURL(/itemselect/, { timeout: NAV_TIMEOUT_MS }).catch(() => { });
+      }
+    }
+    await page.locator(ITEMSELECT_ROW).first().waitFor({ timeout: NAV_TIMEOUT_MS }).catch(() => { });
+    await pause("multi-address page reloaded");
+  }
+}
+
+type RawRow = { item: string; asins: string[]; qty: number; key: string | null };
+
+/**
+ * Rows on the multi-address page, in page order, with the product each belongs to.
+ *
+ * A row's product is the item card holding its own "Remove item" — the widest
+ * box around that link with no other item's in it. It used to be the first
+ * box up from the row whose text had a "₹", which after Amazon redrew the list
+ * (a split, an address picked) could be a box around BOTH products: the
+ * Santoor rows then read the free shampoo's ASIN and title, and the step
+ * failed "item 1 is not on the multi-address page" on a settled page that a
+ * fresh read matched fine (2026-10-08/09).
+ */
+async function readItemRows(page: Page): Promise<RawRow[]> {
+  return page.evaluate(([rowSel, del]) => {
+    const shown = (e: Element) => e.getBoundingClientRect().width > 0;
+    const squash = (s: string) => s.replace(/\s+/g, " ").trim();
+    // Each item's "Remove item": Amazon's line-group delete, else a control labelled so; innermost only.
+    const all = [...document.querySelectorAll(`${del}, a, button, span[role=button]`)].filter(
+      (e) => shown(e) && (e.matches(del!) || /^remove item$/i.test(squash((e as HTMLElement).innerText ?? ""))),
+    );
+    const removes = all.filter((e) => !all.some((o) => o !== e && e.contains(o)));
+    const cards = removes.map((r) => {
+      let c: Element = r;
+      while (c.parentElement && c.parentElement !== document.body &&
+        !removes.some((o) => o !== r && c.parentElement!.contains(o))) c = c.parentElement;
+      return c;
+    });
+    const mid = (e: Element) => { const b = e.getBoundingClientRect(); return (b.top + b.bottom) / 2; };
+    /** The item card a row belongs to: the one card around it, else the one beside it on the page. */
+    const cardFor = (row: Element): Element | null => {
+      const around = cards.filter((c) => c.contains(row));
+      if (around.length > 0) return around[0]!;
+      let box: Element | null = row.parentElement;
+      while (box && box !== document.body && !removes.some((r) => box!.contains(r))) box = box.parentElement;
+      const inBox = box && box !== document.body ? cards.filter((c) => box!.contains(c)) : [];
+      if (inBox.length === 1) return inBox[0]!;
+      const pool = inBox.length ? inBox : cards;
+      if (pool.length === 0) return null;
+      // Rows sit to the right of their card: the card level with the row.
+      const y = mid(row);
+      const dist = (c: Element) => { const b = c.getBoundingClientRect(); return y < b.top ? b.top - y : y > b.bottom ? y - b.bottom : 0; };
+      return pool.reduce((best, c) => (dist(c) < dist(best) ? c : best));
+    };
+
     // Shown rows only: Remove item hides its group; the page drops it on Continue.
-    return [...document.querySelectorAll(rowSel)].filter((r) => r.getBoundingClientRect().width > 0).map((dd) => {
-      let card: Element | null = dd;
-      for (let i = 0; i < 12 && card && !card.querySelector('[data-a-selector="value"]'); i++) card = card.parentElement;
-      let product: Element | null = dd;
-      for (let i = 0; i < 14 && product && !/₹/.test((product as HTMLElement).innerText); i++) product = product.parentElement;
-      const select = card?.querySelector('select[name="line-item-address"]') as HTMLSelectElement | null;
+    return [...document.querySelectorAll(rowSel!)].filter(shown).map((dd) => {
+      let stepper: Element | null = dd;
+      for (let i = 0; i < 12 && stepper && !stepper.querySelector('[data-a-selector="value"]'); i++) stepper = stepper.parentElement;
+      let product: Element | null = cardFor(dd);
+      if (!product) {
+        // No "Remove item" on the page at all: the old way, up to the first price.
+        product = dd;
+        for (let i = 0; i < 14 && product && !/₹/.test((product as HTMLElement).innerText); i++) product = product.parentElement;
+      }
+      const select = stepper?.querySelector('select[name="line-item-address"]') as HTMLSelectElement | null;
       const chosen = select ? select.options[select.selectedIndex]?.text ?? "" : (dd as HTMLElement).innerText;
-      const link = product?.querySelector('a[href*="/dp/"], a[href*="/gp/product/"]')?.getAttribute("href") ?? "";
+      const links = [...(product?.querySelectorAll('a[href*="/dp/"], a[href*="/gp/product/"]') ?? [])];
+      const asins = new Set<string>();
+      for (const e of product?.querySelectorAll("[data-asin]") ?? []) {
+        const a = e.getAttribute("data-asin") ?? "";
+        if (/^[A-Z0-9]{10}$/i.test(a)) asins.add(a.toUpperCase());
+      }
+      for (const l of links) {
+        const a = l.getAttribute("href")?.match(/\/(?:dp|gp\/product)\/([A-Z0-9]{10})/i)?.[1];
+        if (a) asins.add(a.toUpperCase());
+      }
+      const titled = links.map((l) => squash((l as HTMLElement).innerText ?? "")).find((t) => t.length > 15);
       return {
-        item: ((product as HTMLElement | null)?.innerText ?? "").split("\n").map((l) => l.trim()).find((l) => l.length > 15) ?? "",
-        asin: product?.querySelector("[data-asin]")?.getAttribute("data-asin") ||
-          link.match(/\/(?:dp|gp\/product)\/([A-Z0-9]{10})/i)?.[1] || null,
-        qty: Number(card?.querySelector('[data-a-selector="value"]')?.textContent?.trim() ?? "1"),
+        item: titled ?? ((product as HTMLElement | null)?.innerText ?? "").split("\n").map((l) => l.trim()).find((l) => l.length > 15) ?? "",
+        asins: [...asins],
+        qty: Number(stepper?.querySelector('[data-a-selector="value"]')?.textContent?.trim() ?? "1"),
         chosen,
       };
     });
-  }, ITEMSELECT_ROW).then((rows) =>
-    rows.map((r) => ({ item: r.item, asin: r.asin, qty: r.qty, key: checkoutAddressKey(r.chosen) })),
+  }, [ITEMSELECT_ROW, LINE_GROUP_DELETE] as [string, string]).then((rows) =>
+    rows.map((r) => ({ item: r.item, asins: r.asins, qty: r.qty, key: checkoutAddressKey(r.chosen) })),
   );
 }
 
-/** Which basket item a multi-address row is: by ASIN, else by title prefix. -1 = none, or more than one. */
-export function matchBasketItem(row: { item: string; asin: string | null }, basket: BasketItem[]): number {
-  if (row.asin) {
-    const i = basket.findIndex((b) => b.sku.toUpperCase() === row.asin!.toUpperCase());
-    if (i >= 0) return i;
-  }
+/**
+ * Which basket item a multi-address row is: by the title its card shows,
+ * then — when no title or several match — by an ASIN in its card. Title
+ * first: a card can carry another product's ASIN (a free item drawn inside
+ * it), never another product's title. -1 = none, or more than one.
+ */
+export function matchBasketItem(row: { item: string; asins: string[] }, basket: BasketItem[]): number {
   const norm = (v: string) => v.toLowerCase().replace(/\.{3}|…/g, "").replace(/[^a-z0-9]/g, "");
   const t = norm(row.item);
-  const hits = basket.flatMap((b, i) => {
+  const byTitle = basket.flatMap((b, i) => {
     const bt = norm(b.title);
     const n = Math.min(t.length, bt.length, 40);
     return n >= 10 && t.slice(0, n) === bt.slice(0, n) ? [i] : [];
   });
-  return hits.length === 1 ? hits[0]! : -1;
+  if (byTitle.length === 1) return byTitle[0]!;
+  const pool = byTitle.length > 1 ? byTitle : basket.map((_, i) => i);
+  const want = new Set(row.asins.map((a) => a.toUpperCase()));
+  const byAsin = pool.filter((i) => want.has(basket[i]!.sku.toUpperCase()));
+  return byAsin.length === 1 ? byAsin[0]! : -1;
 }
 
 type ItemRow = { item: number; qty: number; key: string | null };
 
+/** The last raw read, printed when an item cannot be found on the page. */
+let lastRawRows: RawRow[] = [];
+
 /** readItemRows with each row as its basket index; a string names a row that matches no basket item. */
 async function readBasketRows(page: Page, basket: BasketItem[]): Promise<ItemRow[] | string> {
   const out: ItemRow[] = [];
-  for (const r of await readItemRows(page)) {
+  lastRawRows = await readItemRows(page);
+  for (const r of lastRawRows) {
     const item = matchBasketItem(r, basket);
-    if (item < 0) return `"${r.item.slice(0, 40)}" on the multi-address page is not a basket item`;
+    if (item < 0) {
+      console.log(`[bot] multi-address rows read: ${JSON.stringify(lastRawRows)}`);
+      return `"${r.item.slice(0, 40)}" on the multi-address page is not a basket item`;
+    }
     out.push({ item, qty: r.qty, key: r.key });
   }
   return out;
@@ -816,12 +912,12 @@ async function selectMultipleAddresses(
   }
   await page.locator(ITEMSELECT_ROW).first().waitFor({ timeout: NAV_TIMEOUT_MS }).catch(() => { });
   await pause("multi-address page open");
-  await waitForRowsSettled(page);
+  await settleRows(page);
 
   // An item Amazon flags in red ("the quantity you requested is no longer
   // available", or anything else) is removed, whatever the message says.
   const flagged = await removeFlaggedItems(page);
-  if (flagged.length) await waitForRowsSettled(page);
+  if (flagged.length) await settleRows(page);
 
   let read = await readBasketRows(page, basket);
   if (typeof read === "string") return { ok: false, reason: read };
@@ -862,13 +958,16 @@ async function selectMultipleAddresses(
       // again once it has settled before calling an item missing.
       rereads++;
       console.log(`[bot] ${act} — waiting for the page to settle and reading it again (${rereads}/3)`);
-      await waitForRowsSettled(page, 45_000);
+      await settleRows(page);
       const again = await readBasketRows(page, basket);
       if (typeof again === "string") return { ok: false, reason: again };
       rows = again;
       continue;
     }
-    if (typeof act === "string") return { ok: false, reason: act };
+    if (typeof act === "string") {
+      console.log(`[bot] multi-address rows read: ${JSON.stringify(lastRawRows)}`);
+      return { ok: false, reason: act };
+    }
     if (!act) break;
     const r = rows[act.row]!;
     const name = `"${basket[r.item]!.title.slice(0, 40)}"`;
@@ -901,7 +1000,7 @@ async function selectMultipleAddresses(
     let now: ItemRow[] | string = rows;
     for (const deadline = Date.now() + 20_000; Date.now() < deadline; ) {
       await sleep(600);
-      await waitForRowsSettled(page, 45_000);
+      await settleRows(page);
       const got = await readBasketRows(page, basket).catch(() => null);
       if (got !== null) now = got;
       if (typeof now === "string" || sig(now) !== before) break;

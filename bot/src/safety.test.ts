@@ -279,11 +279,25 @@ test("Multi-address rows: one row per address, at that address's share", () => {
   assert.match(planRowAction([], keys, [[8, 0]]) as string, /item 1 is not on the multi-address page/);
 });
 
-test("Multi-address rows match basket items by ASIN, else by title", () => {
+test("Multi-address rows match basket items by title, else by ASIN", () => {
   const basket = [{ sku: "B0FY6KL849", title: lamp, quantity: 3 }, { sku: "B0CKZ7MBBT", title: study, quantity: 1 }];
-  assert.equal(matchBasketItem({ item: "anything", asin: "b0ckz7mbbt" }, basket), 1);
-  assert.equal(matchBasketItem({ item: "XECH Quest PRO Table Lamp with 15W…", asin: null }, basket), 0);
-  assert.equal(matchBasketItem({ item: "FREE Delivery Tomorrow", asin: null }, basket), -1);
+  assert.equal(matchBasketItem({ item: "anything", asins: ["b0ckz7mbbt"] }, basket), 1);
+  assert.equal(matchBasketItem({ item: "XECH Quest PRO Table Lamp with 15W…", asins: [] }, basket), 0);
+  assert.equal(matchBasketItem({ item: "FREE Delivery Tomorrow", asins: [] }, basket), -1);
+  // 2026-10-09: the Santoor card carried the free shampoo's ASIN; its title still says Santoor.
+  const santoor = {
+    sku: "B08K95SV28",
+    title: "Santoor Fresh Skin Aloe Vera & Lime Bathing Soap with Nourishing & Anti-Aging Properties| 125g, Pack of 6",
+    quantity: 5,
+  };
+  const shampoo = { sku: "B0D6BNL45S", title: "WishCare Multi Peptide Anti Hairfall Shampoo - Rice Water, Rosemary", quantity: 1, free: true };
+  const row = "Santoor Fresh Skin Aloe Vera & Lime Bathing Soap with";
+  assert.equal(matchBasketItem({ item: row, asins: ["B0D6BNL45S"] }, [santoor, shampoo]), 0);
+  assert.equal(matchBasketItem({ item: row, asins: ["B0D6BNL45S", "B08K95SV28"] }, [santoor, shampoo]), 0);
+  // A title that fits two basket items: the ASIN picks between them.
+  const twin = { ...santoor, sku: "B08K95SV29" };
+  assert.equal(matchBasketItem({ item: row, asins: ["B08K95SV29"] }, [santoor, twin]), 1);
+  assert.equal(matchBasketItem({ item: row, asins: [] }, [santoor, twin]), -1);
 });
 
 const nhdi = { fullName: "nhdi naman jain", phone: "", pincode: "521333", line1: "1-66/86",
