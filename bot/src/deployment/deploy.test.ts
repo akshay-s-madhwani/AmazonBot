@@ -138,3 +138,30 @@ test("HTTP receiver authenticates, serializes deployments and persists deduplica
     await rm(history, { recursive: true, force: true });
   }
 });
+
+test("unzipEntry reads one file out of a deflated or stored zip", async () => {
+  const { unzipEntry } = await import("./zip.js");
+  const { deflateRawSync, crc32 } = await import("node:zlib");
+  const zip = (name: string, body: Buffer, method: 0 | 8): Buffer => {
+    const data = method === 8 ? deflateRawSync(body) : body;
+    const n = Buffer.from(name);
+    const head = (sig: number, len: number) => { const b = Buffer.alloc(len); b.writeUInt32LE(sig, 0); return b; };
+    const local = head(0x04034b50, 30);
+    local.writeUInt16LE(method, 8); local.writeUInt32LE(crc32(body), 14);
+    local.writeUInt32LE(data.length, 18); local.writeUInt32LE(body.length, 22); local.writeUInt16LE(n.length, 26);
+    const central = head(0x02014b50, 46);
+    central.writeUInt16LE(method, 10); central.writeUInt32LE(crc32(body), 16);
+    central.writeUInt32LE(data.length, 20); central.writeUInt32LE(body.length, 24); central.writeUInt16LE(n.length, 28);
+    const dirAt = 30 + n.length + data.length;
+    const end = head(0x06054b50, 22);
+    end.writeUInt16LE(1, 8); end.writeUInt16LE(1, 10); end.writeUInt32LE(46 + n.length, 12); end.writeUInt32LE(dirAt, 16);
+    return Buffer.concat([local, n, data, central, n, end]);
+  };
+  const body = Buffer.from(JSON.stringify({ sha: "a".repeat(40), files: { x: "y".repeat(5000) } }));
+  for (const method of [0, 8] as const) {
+    assert.deepEqual(unzipEntry(zip("deployment.json", body, method), "deployment.json", 1 << 20), body);
+    assert.equal(unzipEntry(zip("other.json", body, method), "deployment.json", 1 << 20), null);
+    assert.throws(() => unzipEntry(zip("deployment.json", body, method), "deployment.json", 100), /too large/);
+  }
+  assert.throws(() => unzipEntry(Buffer.from("not a zip at all, just text here"), "deployment.json", 100), /Not a zip/);
+});

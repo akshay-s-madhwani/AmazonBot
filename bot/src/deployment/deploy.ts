@@ -4,7 +4,7 @@ import { existsSync } from "node:fs";
 import { mkdir, readFile, writeFile, rename, rm, lstat, symlink } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { unzipSync } from "fflate";
+import { unzipEntry } from "./zip.js";
 import { releaseId, runDeployment, type Release } from "./protocol.js";
 import { restoreRuntime, switchRuntime, validateTransaction, type Transaction } from "./runtime.js";
 
@@ -148,9 +148,9 @@ export async function deploy(release: Release): Promise<void> {
       if (archive.length > 50 * 1024 * 1024) throw new Error("Archive too large");
       if (artifact.digest && artifact.digest !== `sha256:${createHash("sha256").update(archive).digest("hex")}`)
         throw new Error("Artifact checksum mismatch");
-      const unpacked = unzipSync(archive, { filter: (file) => file.name === "deployment.json" && file.originalSize < 110 * 1024 * 1024 });
-      if (!unpacked["deployment.json"]) throw new Error("Missing deployment manifest");
-      const files = validateBuild(JSON.parse(Buffer.from(unpacked["deployment.json"]).toString("utf8")), release.sha, packagesSha);
+      const manifest = unzipEntry(archive, "deployment.json", 110 * 1024 * 1024);
+      if (!manifest) throw new Error("Missing deployment manifest");
+      const files = validateBuild(JSON.parse(manifest.toString("utf8")), release.sha, packagesSha);
       for (const [file, content] of Object.entries(files)) {
         await mkdir(dirname(join(work, file)), { recursive: true });
         await writeFile(join(work, file), Buffer.from(content, "base64"));

@@ -25,7 +25,6 @@
     "@app/transport": "file:../packages/transport",
     "@proxyshard/shardx": "^2.0.1",
     "express": "^4.22.2",
-    "fflate": "0.8.2",
     "patchright": "^1.63.0",
     "playwright-core": "^1.49.0"
   },

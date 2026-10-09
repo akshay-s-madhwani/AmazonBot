@@ -104,9 +104,16 @@ move /y "bot\.env.tmp" "bot\.env" >nul
 echo  [ok] MASTER_URL written to bot\.env
 
 rem ---- this machine's node id -> bot\.node-id ----------------------------------
-rem Always asked; Enter takes the machine name. This is the bot id the machine
-rem is approved as. A copied folder's approval for another id is discarded by
-rem the bot at start, and an id already in use is rejected by the master.
+rem Kept without asking when this machine is already approved as bot\.node-id
+rem (scripts\approved-node-id.mjs). Otherwise asked; Enter takes the machine
+rem name. A copied folder's approval for another id is discarded by the bot at
+rem start, and an id already in use is rejected by the master.
+set "NODE_ID_APPROVED="
+for /f "delims=" %%i in ('node scripts\approved-node-id.mjs 2^>nul') do set "NODE_ID_APPROVED=%%i"
+if defined NODE_ID_APPROVED (
+  echo  [ok] node id: !NODE_ID_APPROVED! ^(already approved^)
+  goto :node_id_done
+)
 set "NODE_ID_CURRENT="
 if exist "bot\.node-id" set /p NODE_ID_CURRENT=<"bot\.node-id"
 if defined NODE_ID_CURRENT echo  current node id: !NODE_ID_CURRENT!
@@ -124,6 +131,7 @@ if errorlevel 1 (
 )
 > "bot\.node-id" echo !NODE_ID_IN!
 echo  [ok] node id: !NODE_ID_IN!
+:node_id_done
 
 rem ---- install + build, in dependency order -------------------------------------
 echo.
