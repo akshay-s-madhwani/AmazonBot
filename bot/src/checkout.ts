@@ -477,7 +477,7 @@ async function openAddressPicker(page: Page): Promise<CheckoutResult> {
  * while it updates; a read in the middle saw only some of them and failed
  * "item 1 is not on the multi-address page" (2026-10-08).
  */
-export async function waitForRowsSettled(page: Page, budgetMs = 20_000): Promise<void> {
+export async function waitForRowsSettled(page: Page, budgetMs = 45_000): Promise<void> {
   const deadline = Date.now() + budgetMs;
   let last = "";
   while (Date.now() < deadline) {
@@ -851,15 +851,18 @@ async function selectMultipleAddresses(
   if (unblocked) console.log(`[bot] blocks removed — per-address units fitted to the cart: ${JSON.stringify(shares)}`);
   const sig = (r: ItemRow[]) => JSON.stringify(r);
   const totalUnits = shares.flat().reduce((n, q) => n + q, 0);
-  let reread = false;
+  // Every change redraws the page, so a half-drawn read can come after any of
+  // them — not once per step: one look-again was spent on an early change and
+  // a later one failed outright (2026-10-09).
+  let rereads = 0;
   for (let guard = 0; guard < totalUnits * 2 + rows.length * 3 + 20; guard++) {
     const act = planRowAction(rows, wantKeys, shares);
-    if (typeof act === "string" && !reread) {
+    if (typeof act === "string" && rereads < 3) {
       // Most often the list was still drawing ("Updating your order"): look
       // again once it has settled before calling an item missing.
-      reread = true;
-      console.log(`[bot] ${act} — waiting for the page to settle and reading it again`);
-      await waitForRowsSettled(page, 30_000);
+      rereads++;
+      console.log(`[bot] ${act} — waiting for the page to settle and reading it again (${rereads}/3)`);
+      await waitForRowsSettled(page, 45_000);
       const again = await readBasketRows(page, basket);
       if (typeof again === "string") return { ok: false, reason: again };
       rows = again;
@@ -892,10 +895,13 @@ async function selectMultipleAddresses(
       }
       await clickMarked(page);
     }
-    // The page redraws after every change; wait for it to show.
+    // The page redraws after every change: read it only once the redraw is
+    // over. A read under "Updating your order" saw no rows at all and failed
+    // "item 1 is not on the multi-address page" mid-split (2026-10-09).
     let now: ItemRow[] | string = rows;
-    for (const deadline = Date.now() + 15_000; Date.now() < deadline; ) {
+    for (const deadline = Date.now() + 20_000; Date.now() < deadline; ) {
       await sleep(600);
+      await waitForRowsSettled(page, 45_000);
       const got = await readBasketRows(page, basket).catch(() => null);
       if (got !== null) now = got;
       if (typeof now === "string" || sig(now) !== before) break;
