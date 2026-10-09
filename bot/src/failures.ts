@@ -14,7 +14,7 @@ export interface FailureRule {
  * The master keeps the same list (ingest.ts FINAL_FAILURES). Only login sets
  * them: a proxy error after the first sign-in page stays proxy_unreachable.
  */
-export const FINAL_FAILURES: ReadonlySet<string> = new Set(["account_blocked", "proxy_bad"]);
+export const FINAL_FAILURES: ReadonlySet<string> = new Set(["account_blocked", "password_incorrect", "proxy_bad", "sign_in_refused"]);
 
 export const FAILURE_RULES: FailureRule[] = [
   {
@@ -29,6 +29,13 @@ export const FAILURE_RULES: FailureRule[] = [
     category: "ACCOUNT",
     match: /^proxy .*(unreachable|not https?:\/\/host:port)|ERR_PROXY|ERR_TUNNEL_CONNECTION_FAILED/i,
     fix: "The account's proxy did not answer. Fix or replace it in the Accounts tab's Proxy column; a changed proxy starts a new attempt in a new browser.",
+    adminFixable: true,
+  },
+  {
+    code: "sign_in_refused",
+    category: "ACCOUNT",
+    match: /^signed out on .* before the password step/i,
+    fix: "Amazon sent the sign-in back to a signed-out page (its 503 link) before the password was asked for.",
     adminFixable: true,
   },
   {

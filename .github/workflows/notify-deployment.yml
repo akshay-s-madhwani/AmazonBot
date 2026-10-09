@@ -1,0 +1,50 @@
+name: Deploy bot to machines
+on:
+  workflow_run:
+    workflows: [Build bot]
+    types: [completed]
+    branches: [main]
+  schedule:
+    - cron: '*/30 * * * *'
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: notify-bot-deployment
+  cancel-in-progress: false
+jobs:
+  notify:
+    if: >-
+      github.event_name != 'workflow_run' ||
+      (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push')
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Select successful build of current main
+        id: release
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const { data: branch } = await github.rest.repos.getBranch({ owner, repo, branch: 'main' });
+            const { data } = await github.rest.actions.listWorkflowRuns({
+              owner, repo, workflow_id: 'deploy.yml', branch: 'main', event: 'push',
+              status: 'success', head_sha: branch.commit.sha, per_page: 1,
+            });
+            const run = data.workflow_runs[0];
+            if (!run) { core.info('Current main has no successful build yet.'); return; }
+            core.setOutput('payload', JSON.stringify({ repository: `${owner}/${repo}`, sha: run.head_sha, runId: run.id, attempt: run.run_attempt }));
+      - name: Notify machines and wait for deployment results
+        if: steps.release.outputs.payload != ''
+        env:
+          DEPLOY_RELEASE: ${{ steps.release.outputs.payload }}
+          DEPLOY_TARGETS: ${{ secrets.DEPLOY_TARGETS }}
+        run: node scripts/notify-deployment.mjs

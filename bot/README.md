@@ -1,5 +1,9 @@
 # amazon-login-bot
 
+Automatic updates and PM2 setup are documented in
+[deployment.md](../docs/deployment.md). The Windows setup/run/stop launchers use
+PM2 on Windows. `setup.bat` configures and starts the deployment receiver too.
+
 Amazon automation using **ShardX**, with a fresh browser profile for every run and
 a separate slot process owning each browser. Fleet jobs come from the master;
 standalone diagnostics can read configuration from env. The ordered pipeline is:

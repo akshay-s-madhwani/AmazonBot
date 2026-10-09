@@ -47,6 +47,15 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 const SLOT_PATH = join(HERE, "slot.js");
 const UI_DIR = join(HERE, "..", "ui");
 const ARTIFACTS = join(HERE, "..", "artifacts");
+const DEPLOY_STATE = join(HERE, "..", "..", ".deploy");
+const deploymentMaintenance = (): boolean => existsSync(join(DEPLOY_STATE, "maintenance"));
+const DEPLOY_VERSION = (() => {
+  try { return JSON.parse(readFileSync(join(DEPLOY_STATE, "version.json"), "utf8")).sha as string; }
+  catch { return "development"; }
+})();
+let managerReady = false;
+let pendingStarts = 0;
+let deploymentClosing = false;
 const PORT = Number(process.env.MANAGER_PORT ?? 7800);
 const MANAGER_URL = process.env.MANAGER_URL ?? `http://127.0.0.1:${PORT}`;
 const WATCHDOG_TICK_MS = 5_000;
@@ -447,7 +456,7 @@ function liveSlotCount(): number {
 function admit(requested: number): { granted: number; reason: string | null } {
   if ((process.env.MASTER_URL || process.env.MASTER_NATS_URL) && !fleet)
     return { granted: 0, reason: "fleet enrollment and durable telemetry must be ready before starting jobs" };
-  if (draining) return { granted: 0, reason: "node is draining — not accepting new jobs" };
+  if (draining || deploymentClosing || deploymentMaintenance()) return { granted: 0, reason: "node is draining — not accepting new jobs" };
   if (requested <= 0) return { granted: 0, reason: "no instances requested" };
 
   let reason: string | null = null;
@@ -597,6 +606,12 @@ interface StartedSlot {
 }
 
 async function startInstances(instances: number): Promise<StartedSlot[]> {
+  pendingStarts++;
+  try { return await startInstancesImpl(instances); }
+  finally { pendingStarts--; }
+}
+
+async function startInstancesImpl(instances: number): Promise<StartedSlot[]> {
   const { granted, reason } = admit(instances);
   if (granted < 1) throw new Error(reason ?? "no capacity for a new slot");
   if (granted < instances) log(`admitting ${granted} of ${instances} instance(s): ${reason}`);
@@ -647,11 +662,12 @@ function startPushedJob(runId: string, job: SheetJob, stopAfter?: number): Start
   };
 }
 
-async function slotCall(s: SlotState, path: string, query = ""): Promise<void> {
+async function slotCall(s: SlotState, path: string, query = "", timeoutMs?: number): Promise<void> {
   if (!s.port) throw new Error(`slot ${s.slotIndex} has no control port yet`);
   const sep = query ? "&" : "";
   const res = await fetch(`http://127.0.0.1:${s.port}${path}?token=${s.token}${sep}${query}`, {
     method: "POST",
+    ...(timeoutMs ? { signal: AbortSignal.timeout(timeoutMs) } : {}),
   });
   if (!res.ok) {
     const body = await res.text().catch(() => "");
@@ -1274,6 +1290,10 @@ app.get("/logs/:runId", (req: Request, res: Response) => {
 app.get("/health", (_req: Request, res: Response) =>
   res.json({
     ok: true,
+    ready: managerReady,
+    version: DEPLOY_VERSION,
+    deploymentMaintenance: deploymentMaintenance(),
+    activeSlots: liveSlotCount() + pendingStarts,
     slots: slots.size,
     port: PORT,
     nodeId: NODE.id,
@@ -1281,6 +1301,33 @@ app.get("/health", (_req: Request, res: Response) =>
     master: fleet ? "linked" : "standalone",
   }),
 );
+
+// This server binds only to loopback. These routes also require the receiver's
+// on-disk maintenance marker; the public proxy must expose only the webhook.
+app.post("/deployment/drain", (_req: Request, res: Response) => {
+  if (!deploymentMaintenance()) return res.status(409).json({ error: "No deployment maintenance marker" });
+  return res.json({ ok: true });
+});
+app.post("/deployment/resume", (_req: Request, res: Response) => {
+  if (deploymentMaintenance() || deploymentClosing) return res.status(409).json({ error: "Deployment still in progress" });
+  return res.json({ ok: true });
+});
+app.post("/deployment/close-idle", async (_req: Request, res: Response) => {
+  if (!deploymentMaintenance() || deploymentClosing || !managerReady || liveSlotCount() !== 0 || pendingStarts !== 0)
+    return res.status(409).json({ error: "Manager is not drained" });
+  deploymentClosing = true;
+  try {
+    const previous = [...slots.values()];
+    const wasDraining = draining;
+    await hooks.reset();
+    draining = wasDraining;
+    await sweepOrphans({ now: true });
+    if ((await Promise.all(previous.map((slot) => waitForExit(slot, 2000)))).some((gone) => !gone))
+      throw new Error("Old slot processes are still running");
+    return res.json({ ok: true });
+  } catch (error) { return res.status(409).json({ error: (error as Error).message }); }
+  finally { deploymentClosing = false; }
+});
 
 
 /** The live slot holding a run, or NoSlotError — the answer that lets the master release it. */
@@ -1319,7 +1366,9 @@ const hooks: FleetHooks = {
   },
 
   resumeRun: async (run_id, from, stopAfter, unblocked) => {
+    if (deploymentClosing || deploymentMaintenance()) throw new Error("Deployment in progress; resume is disabled");
     const s = liveSlotFor(run_id, "resume");
+    s.status = "BUSY"; // Account for the in-flight resume while deployment checks drain state.
     const query = [
       ...(from === undefined ? [] : [`from=${from}`]),
       ...(stopAfter === undefined ? [] : [`stop_after=${stopAfter}`]),
@@ -1416,7 +1465,7 @@ const hooks: FleetHooks = {
     // slot runs session.stop() before exiting; killing it straight away cuts
     // that off, which loses the profile's cookie jar and never tells the
     // master the browser closed.
-    await Promise.all(live.map((s) => slotCall(s, "/cancel").catch(() => undefined)));
+    await Promise.all(live.map((s) => slotCall(s, "/cancel", "", RESET_GRACE_MS).catch(() => undefined)));
     await Promise.all(
       live.map(async (s) => {
         if (!(await waitForExit(s, RESET_GRACE_MS))) {
@@ -1596,6 +1645,7 @@ app.listen(PORT, "127.0.0.1", () => {
   log(`  start:   curl -X POST ${MANAGER_URL}/fleet/start`);
   log(`  status:  curl ${MANAGER_URL}/fleet/status`);
   void reattachSlots()
+    .then(() => { managerReady = true; })
     .catch((err: unknown) => log(`reattach failed: ${(err as Error).message}`))
     .finally(() => {
       pruneArtifacts();
@@ -1608,7 +1658,7 @@ app.listen(PORT, "127.0.0.1", () => {
     });
 });
 
-process.once("SIGINT", () => {
+function shutdownManager(): void {
   void fleet?.close().catch(() => {});
   const live = [...slots.values()].filter(slotAlive);
   if (live.length > 0) {
@@ -1620,4 +1670,7 @@ process.once("SIGINT", () => {
     log(`  or restart the manager — it reattaches to these slots — and cancel the intended slots`);
   }
   process.exit(0);
-});
+}
+process.once("SIGINT", shutdownManager);
+process.once("SIGTERM", shutdownManager);
+process.on("message", (message) => { if (message === "shutdown") shutdownManager(); });

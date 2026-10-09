@@ -677,31 +677,61 @@ async function markRowControl(page: Page, row: number, what: "split" | "delete")
 const LINE_GROUP_DELETE = '[data-action="item-select-delete-linegroup-and-children"]';
 
 /**
- * Removes every item the multi-address page shows a red error on (an
- * a-alert-inline-error inside its rows) with that item's own "Remove item" —
- * the nearest box around the error holding exactly one. An error not inside
- * one item (a page-wide alert) is left alone. Returns what was removed.
+ * What marks one item as unbuyable on the multi-address page: its red line
+ * ("Sorry, the quantity you requested is no longer available…") or a
+ * "Quantity: 0" left in place of its stepper.
+ */
+const ITEM_PROBLEM =
+  /no longer available|quantity you requested|currently unavailable|out of stock|cannot be (?:shipped|delivered)|(?:isn't|is not) available|quantity:\s*0\b/i;
+
+/**
+ * Removes every item the multi-address page flags with that item's own
+ * "Remove item" — the nearest box around the flag holding exactly one. The
+ * flag is found by its text as well as Amazon's error classes: the classes
+ * alone missed a "no longer available" row (2026-10-09), which then blocked
+ * Continue. A flag not inside one item (the page-wide "There was a problem
+ * with some of the items" alert) is left alone. Returns what was removed.
  */
 async function removeFlaggedItems(page: Page): Promise<string[]> {
   const removed: string[] = [];
   for (let round = 0; round < 6; round++) {
     const hit = await page
-      .evaluate((del) => {
+      .evaluate(([del, problemSrc]) => {
+        const problem = new RegExp(problemSrc, "i");
         const squash = (t: string) => t.replace(/\s+/g, " ").trim();
         document.querySelectorAll("[data-bot-ctl]").forEach((e) => e.removeAttribute("data-bot-ctl"));
         const shown = (e: Element) => e.getBoundingClientRect().width > 0;
-        for (const alert of [...document.querySelectorAll(".a-alert-inline-error, .a-alert-error")].filter(shown)) {
-          let box: Element | null = alert.parentElement;
-          while (box && box !== document.body && box.querySelectorAll(del).length === 0) box = box.parentElement;
-          if (!box || box === document.body || box.querySelectorAll(del).length !== 1) continue;
-          const link = box.querySelector(`${del} a`) ?? box.querySelector(del);
-          if (!link || !shown(link)) continue;
+        const textOf = (e: Element) => squash((e as HTMLElement).innerText ?? "");
+        // Each item's "Remove item": Amazon's line-group delete, else a control labelled so.
+        const removeControls = (box: Element): Element[] => {
+          const all = [...box.querySelectorAll(`${del}, a, button, span[role=button], input[type=submit]`)].filter(
+            (e) => shown(e) && (e.matches(del) || /^remove item$/i.test(textOf(e) || (e as HTMLInputElement).value || "")),
+          );
+          return all.filter((e) => !all.some((o) => o !== e && o.contains(e)));
+        };
+        // Red alerts, plus the smallest elements whose own text names a problem.
+        const flags = [...document.querySelectorAll(".a-alert-inline-error, .a-alert-error, span, div, p")]
+          .filter(shown)
+          .filter((e) => {
+            const t = textOf(e);
+            if (!t || t.length > 300) return false;
+            if (e.matches(".a-alert-inline-error, .a-alert-error")) return true;
+            return problem.test(t) && ![...e.children].some((c) => problem.test(textOf(c)));
+          });
+        for (const flag of flags) {
+          let box: Element | null = flag.parentElement;
+          while (box && box !== document.body && removeControls(box).length === 0) box = box.parentElement;
+          if (!box || box === document.body) continue;
+          const controls = removeControls(box);
+          if (controls.length !== 1) continue;
+          const link = controls[0]!.querySelector("a") ?? controls[0]!;
+          if (!shown(link)) continue;
           link.setAttribute("data-bot-ctl", "1");
           const title = (box as HTMLElement).innerText.split("\n").map((l) => l.trim()).find((l) => l.length > 3) ?? "item";
-          return { title: title.slice(0, 60), error: squash((alert as HTMLElement).innerText).slice(0, 120) };
+          return { title: title.slice(0, 60), error: textOf(flag).slice(0, 120) };
         }
         return null;
-      }, LINE_GROUP_DELETE)
+      }, [LINE_GROUP_DELETE, ITEM_PROBLEM.source] as [string, string])
       .catch(() => null);
     if (!hit) break;
     console.log(`[bot] "${hit.title}" flagged: "${hit.error}" — removing it`);

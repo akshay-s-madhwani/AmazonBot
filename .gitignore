@@ -51,3 +51,8 @@ bot/start.bat
 bot/browser-profiles/
 
 bot/.sheet-direct-ledger.json
+
+# Per-machine deployment credentials, journals, build downloads and backups.
+/deploy.env
+/.deploy/
+/deployment.json

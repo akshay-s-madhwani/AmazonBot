@@ -1,0 +1,58 @@
+name: Build bot
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+permissions:
+  contents: read
+concurrency:
+  group: bot-build-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          token: ${{ secrets.PACKAGES_READ_TOKEN || github.token }}
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: |
+            bot/package-lock.json
+            packages/contracts/package-lock.json
+            packages/transport/package-lock.json
+      - name: Start NATS for transport integration checks
+        run: docker run -d --name nats -p 4222:4222 nats:2.11-alpine -js
+      - name: Build and check packages
+        env:
+          NATS_URL: nats://127.0.0.1:4222
+        run: |
+          npm ci --prefix packages/contracts
+          npm run build --prefix packages/contracts
+          npm test --prefix packages/contracts
+          npm ci --prefix packages/transport
+          npm run build --prefix packages/transport
+          npm test --prefix packages/transport
+      - name: Build and check bot
+        run: |
+          npm ci --prefix bot
+          npm run build --prefix bot
+          node bot/dist/totp.test.js
+          node bot/dist/fleet.test.js
+          node --test bot/dist/safety.test.js bot/dist/deployment/deploy.test.js
+      - name: Package compiled files
+        if: github.event_name == 'push'
+        run: node scripts/package-build.mjs
+      - uses: actions/upload-artifact@v4
+        if: github.event_name == 'push'
+        with:
+          name: bot-${{ github.sha }}-${{ github.run_attempt }}
+          path: deployment.json
+          if-no-files-found: error
+          retention-days: 30

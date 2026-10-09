@@ -14,13 +14,18 @@
     "test:fleet": "npm run build && node dist/fleet.test.js",
     "test:safety": "npm run build && node --test dist/safety.test.js",
     "manager": "npm run build && node dist/manager.js",
-    "cleanup": "npm run build && node dist/cleanup.js"
+    "cleanup": "npm run build && node dist/cleanup.js",
+    "test:deployment": "npm run build && node --test dist/deployment/deploy.test.js",
+    "pm2:start": "cd .. && pm2 start ecosystem.config.cjs && pm2 save",
+    "pm2:stop": "cd .. && stop-manager.bat",
+    "deploy:webhook": "node dist/deployment/webhook.js"
   },
   "dependencies": {
     "@app/contracts": "file:../packages/contracts",
     "@app/transport": "file:../packages/transport",
     "@proxyshard/shardx": "^2.0.1",
     "express": "^4.22.2",
+    "fflate": "0.8.2",
     "patchright": "^1.63.0",
     "playwright-core": "^1.49.0"
   },
