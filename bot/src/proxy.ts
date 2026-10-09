@@ -40,16 +40,52 @@ export function parseAccountProxy(raw: string): Proxy | null {
   return { url: `${scheme}://${auth}${host}:${port}`, host, port, label: `${scheme}://${host}:${port}` };
 }
 
-/** Null when the proxy accepts a connection, else why not. */
+/** The Proxy-Authorization value for the url's user:pass, or null without one. */
+function basicAuth(url: string): string | null {
+  const u = new URL(url);
+  if (!u.username && !u.password) return null;
+  const creds = `${decodeURIComponent(u.username)}:${decodeURIComponent(u.password)}`;
+  return `Basic ${Buffer.from(creds).toString("base64")}`;
+}
+
+/**
+ * Null when the proxy would carry the browser to Amazon, else why not. An
+ * http proxy is asked to CONNECT to Amazon with the account's user:pass, so
+ * a wrong password (407, the browser's ERR_INVALID_AUTH_CREDENTIALS) fails
+ * here like a dead proxy; https/socks5 proxies are only checked to answer.
+ */
 export function proxyUnreachable(p: Proxy, timeoutMs = 15_000): Promise<string | null> {
   return new Promise((resolve) => {
     const socket = connect({ host: p.host, port: p.port });
+    let finished = false;
     const done = (why: string | null) => {
+      if (finished) return;
+      finished = true;
       socket.destroy();
       resolve(why);
     };
     socket.setTimeout(timeoutMs, () => done(`no answer in ${Math.round(timeoutMs / 1000)}s`));
-    socket.once("connect", () => done(null));
     socket.once("error", (err) => done(err.message));
+    socket.once("connect", () => {
+      if (!p.url.startsWith("http://")) return done(null);
+      const auth = basicAuth(p.url);
+      socket.write(
+        "CONNECT www.amazon.in:443 HTTP/1.1\r\nHost: www.amazon.in:443\r\n" +
+          (auth ? `Proxy-Authorization: ${auth}\r\n` : "") +
+          "\r\n",
+      );
+    });
+    let head = "";
+    socket.on("data", (chunk: Buffer) => {
+      head += chunk.toString("latin1");
+      const end = head.indexOf("\r\n");
+      if (end < 0) return;
+      const status = head.slice(0, end);
+      const code = Number(status.match(/^HTTP\/\d(?:\.\d)?\s+(\d{3})/)?.[1]);
+      if (!code) return done(`not an http proxy (${status.slice(0, 60)})`);
+      if (code === 407) return done("rejected the user:pass (407)");
+      done(code >= 200 && code < 300 ? null : `refused CONNECT to Amazon (${code})`);
+    });
+    socket.once("end", () => done("closed the connection"));
   });
 }

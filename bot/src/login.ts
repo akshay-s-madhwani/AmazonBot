@@ -48,6 +48,8 @@ export type LoginStep =
   | "logged_in"
   /** An Amazon page whose nav reads "Hello, sign in". */
   | "signed_out"
+  /** Amazon's "Account locked temporarily" page (locked for misuse): blocked. */
+  | "locked"
   | "unknown";
 
 const SIDE_EFFECT_STEPS: readonly LoginStep[] = ["passkey_nudge", "continue_shopping"];
@@ -71,12 +73,53 @@ export type LoginResult =
       blocked?: boolean;
       /** Amazon sent the sign-in to a signed-out page (e.g. its 503 link) before the password. */
       refused?: boolean;
+      /** Signed in, but to an Amazon Business account: never ordered from. */
+      business?: boolean;
     };
 
 const HOME_URL = "https://www.amazon.in/";
 /** How long the signed-in nav ("Hello, <name>") gets to show. */
 const GREETING_WAIT_MS = envMs("LOGIN_GREETING_WAIT_MS", 30_000);
 const BLOCKED_REASON = 'account blocked: Amazon shows "Hello, sign in" after sign-in';
+const LOCKED_REASON = 'account blocked: Amazon shows "Account locked temporarily" (locked for misuse)';
+
+const BUSINESS_REASON = 'business account: Amazon shows "Account for Your Business" after sign-in';
+
+/**
+ * An Amazon Business account (user, 2026-10-09): the nav's account link reads
+ * "Account for Your Business" (not "Account & Lists") and the logo is
+ * "amazon business". The run is cancelled, never ordered from.
+ */
+async function isBusinessAccount(page: Page): Promise<boolean> {
+  return page
+    .evaluate(() => {
+      const read = (sel: string) => {
+        const el = document.querySelector(sel) as HTMLElement | null;
+        return el ? `${el.innerText ?? ""} ${el.getAttribute("aria-label") ?? ""}` : "";
+      };
+      return /for your business/i.test(read("#nav-link-accountList")) || /amazon business/i.test(read("#nav-logo"));
+    })
+    .catch(() => false);
+}
+
+/**
+ * Amazon's lock page (2026-10-09): title and alert heading "Account locked
+ * temporarily", "Your account has been locked for misuse of Amazon's
+ * services." No nav, so it is read by its text, whatever its URL.
+ */
+async function onLockedPage(page: Page): Promise<boolean> {
+  return page
+    .evaluate(() => {
+      const text = (sel: string) =>
+        [...document.querySelectorAll(sel)].map((n) => (n as HTMLElement).innerText ?? "").join(" ");
+      return (
+        /account locked/i.test(document.title) ||
+        /account locked/i.test(text(".a-alert-heading")) ||
+        /locked for misuse/i.test(text(".a-alert-content"))
+      );
+    })
+    .catch(() => false);
+}
 
 function isLoggedInUrl(rawUrl: string): boolean {
   try {
@@ -113,6 +156,8 @@ async function readGreeting(page: Page): Promise<"name" | "signed_out" | "missin
 export async function detectStep(page: Page): Promise<LoginStep> {
   try {
     const url = page.url();
+
+    if (await onLockedPage(page)) return "locked";
 
     if (url.includes("/webauthn/nudge") || url.includes("passkeyNudgeArb")) return "passkey_nudge";
 
@@ -336,7 +381,7 @@ async function waitForActionableStep(
   while (Date.now() < deadline) {
     const step = await detectStep(page);
     last = step;
-    if (step === "logged_in") return { step, error: null };
+    if (step === "logged_in" || step === "locked") return { step, error: null };
     if (step !== previous && step !== "unknown") {
       if (candidate === step) return { step, error: null };
       candidate = step;
@@ -395,8 +440,12 @@ async function confirmGreeting(page: Page): Promise<LoginResult> {
     const deadline = Date.now() + GREETING_WAIT_MS;
     let signedOutReads = 0;
     while (Date.now() < deadline) {
+      if (await onLockedPage(page)) return { ok: false, reason: LOCKED_REASON, reachedSignIn: true, blocked: true };
       const greeting = await readGreeting(page);
       if (greeting === "name") {
+        if (await isBusinessAccount(page)) {
+          return { ok: false, reason: BUSINESS_REASON, reachedSignIn: true, business: true };
+        }
         console.log("[bot] nav reads \"Hello, <name>\" — signed in");
         return { ok: true };
       }
@@ -436,8 +485,10 @@ async function signIn(page: Page, creds: Credentials): Promise<LoginResult> {
       await pause("login complete");
       return { ok: true };
     }
+    const now = await detectStep(page);
+    if (now === "locked") return { ok: false, reason: LOCKED_REASON, reachedSignIn: true, blocked: true };
     // Password in, then an Amazon page that says "Hello, sign in": blocked.
-    if (handled.password && (await detectStep(page)) === "signed_out") {
+    if (handled.password && now === "signed_out") {
       return { ok: false, reason: BLOCKED_REASON, reachedSignIn: true, blocked: true };
     }
     return { ok: false, reason, reachedSignIn };
@@ -455,6 +506,9 @@ async function signIn(page: Page, creds: Credentials): Promise<LoginResult> {
     if (step === "logged_in") {
       await pause("login complete");
       return { ok: true };
+    }
+    if (step === "locked") {
+      return { ok: false, reason: LOCKED_REASON, reachedSignIn: true, blocked: true };
     }
     if (step === "signed_out") {
       if (handled.password) return fail(BLOCKED_REASON);

@@ -15,7 +15,8 @@ import { addressKey, targetKey } from "./address.js";
 import { checkoutAddressKey, fitSharesToCart, matchBasketItem, planRowAction, sheetAddressKey } from "./checkout.js";
 import { allocate, parseItemsQuantity, placeFreeItems } from "./allocation.js";
 import { planVouchers } from "./vouchers.js";
-import { parseAccountProxy } from "./proxy.js";
+import { createServer, type AddressInfo } from "node:net";
+import { parseAccountProxy, proxyUnreachable } from "./proxy.js";
 import { fleetProcesses, orphans } from "./procs.js";
 
 const basket = [{ sku: "B012345678", quantity: 2, title: "Test product" }];
@@ -402,6 +403,25 @@ test("Proxy: http://host:port, bare host:port means http, anything else refuses"
   assert.equal(parseAccountProxy("socks5://u:p@1.2.3.4:1080")!.label, "socks5://1.2.3.4:1080");
   assert.throws(() => parseAccountProxy("10.0.0.1"), /not http:\/\/host:port/);
   assert.throws(() => parseAccountProxy("ftp://10.0.0.1:21"));
+});
+
+test("Proxy check: CONNECT with the account's user:pass, a 407 is a bad proxy", async () => {
+  const server = createServer((sock) => {
+    sock.once("data", (req) => {
+      const ok = req.toString().includes(`Proxy-Authorization: Basic ${Buffer.from("u:p@ss").toString("base64")}`);
+      sock.end(ok ? "HTTP/1.1 200 Connection established\r\n\r\n" : "HTTP/1.1 407 Proxy Authentication Required\r\n\r\n");
+    });
+  });
+  await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+  const port = (server.address() as AddressInfo).port;
+  try {
+    assert.equal(await proxyUnreachable(parseAccountProxy(`http://u:p%40ss@127.0.0.1:${port}`)!), null);
+    assert.match((await proxyUnreachable(parseAccountProxy(`http://u:wrong@127.0.0.1:${port}`)!))!, /407/);
+    assert.match((await proxyUnreachable(parseAccountProxy(`127.0.0.1:${port}`)!))!, /407/);
+  } finally {
+    server.close();
+  }
+  assert.ok(await proxyUnreachable(parseAccountProxy(`127.0.0.1:${port}`)!, 2_000));
 });
 
 test("Your Orders: every new order matched to its address by Ship to name, exactly", () => {

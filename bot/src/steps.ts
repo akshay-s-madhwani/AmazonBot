@@ -119,13 +119,14 @@ export const STEPS: StepDef[] = [
       });
       if (ctx.proxy) {
         const why = await proxyUnreachable(ctx.proxy);
-        if (why) return badProxy(`unreachable (${why})`);
+        if (why) return badProxy(why);
         console.log(`[bot] proxy ${ctx.proxy.label} answers`);
       }
       const r = await runLogin(page, ctx.creds);
       if (r.ok) return { status: "succeeded" };
       if (r.blocked) return { status: "failed", failure_code: "account_blocked", detail: r.reason, retriable: false };
       if (r.refused) return { status: "failed", failure_code: "sign_in_refused", detail: r.reason, retriable: false };
+      if (r.business) return { status: "failed", failure_code: "business_account", detail: r.reason, retriable: false };
       // Amazon said the password is wrong: final too, like a blocked account.
       if (r.reachedSignIn && classifyFailure(r.reason) === "password_incorrect") {
         return { status: "failed", failure_code: "password_incorrect", detail: r.reason, retriable: false };
