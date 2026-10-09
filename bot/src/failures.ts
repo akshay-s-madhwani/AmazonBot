@@ -16,6 +16,7 @@ export interface FailureRule {
  */
 export const FINAL_FAILURES: ReadonlySet<string> = new Set([
   "account_blocked", "business_account", "password_incorrect", "proxy_bad", "sign_in_refused",
+  "sign_in_unconfirmed",
 ]);
 
 export const FAILURE_RULES: FailureRule[] = [
@@ -52,6 +53,15 @@ export const FAILURE_RULES: FailureRule[] = [
     category: "ACCOUNT",
     match: /^business account/i,
     fix: "The account signed in to Amazon Business (\"Account for Your Business\"). Use a personal account.",
+    adminFixable: true,
+  },
+  {
+    // Final too (user, 2026-10-09): after sign-in, neither page showed
+    // "Hello, <name>" — an account that cannot be confirmed is not ordered from.
+    code: "sign_in_unconfirmed",
+    category: "ACCOUNT",
+    match: /^sign-in not confirmed/i,
+    fix: "After sign-in neither the page nor the home page read \"Hello, <name>\". Check the screenshot; the run is cancelled.",
     adminFixable: true,
   },
   {

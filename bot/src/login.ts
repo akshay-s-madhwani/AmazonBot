@@ -89,6 +89,13 @@ const BUSINESS_REASON = 'business account: Amazon shows "Account for Your Busine
  * An Amazon Business account (user, 2026-10-09): the nav's account link reads
  * "Account for Your Business" (not "Account & Lists") and the logo is
  * "amazon business". The run is cancelled, never ordered from.
+ *
+ * The business nav is a different one (ABNavDesktop): no
+ * #nav-link-accountList-nav-line-1, so the "Hello, <name>" read never saw a
+ * name and login failed "no Hello, <name> in the nav" instead (2026-10-09).
+ * Hence read before the greeting, by what the page shows anywhere up top:
+ * the title "Amazon Business", "Account for Your Business", the business
+ * nav's own assets.
  */
 async function isBusinessAccount(page: Page): Promise<boolean> {
   return page
@@ -97,7 +104,13 @@ async function isBusinessAccount(page: Page): Promise<boolean> {
         const el = document.querySelector(sel) as HTMLElement | null;
         return el ? `${el.innerText ?? ""} ${el.getAttribute("aria-label") ?? ""}` : "";
       };
-      return /for your business/i.test(read("#nav-link-accountList")) || /amazon business/i.test(read("#nav-logo"));
+      if (/for your business/i.test(read("#nav-link-accountList")) || /amazon business/i.test(read("#nav-logo"))) return true;
+      if (/^\s*amazon business\s*$/i.test(document.title)) return true;
+      const top = (document.body?.innerText ?? "").slice(0, 3000);
+      if (/account for your business/i.test(top)) return true;
+      return [...document.querySelectorAll('link[rel="stylesheet"], script[src]')].some((e) =>
+        /AUIClients\/(ABNavDesktop|BusinessHomepageAssets)/.test(e.getAttribute("href") ?? e.getAttribute("src") ?? ""),
+      );
     })
     .catch(() => false);
 }
@@ -441,11 +454,12 @@ async function confirmGreeting(page: Page): Promise<LoginResult> {
     let signedOutReads = 0;
     while (Date.now() < deadline) {
       if (await onLockedPage(page)) return { ok: false, reason: LOCKED_REASON, reachedSignIn: true, blocked: true };
+      // Before the greeting: the business nav has no "Hello, <name>" for it to find.
+      if (await isBusinessAccount(page)) {
+        return { ok: false, reason: BUSINESS_REASON, reachedSignIn: true, business: true };
+      }
       const greeting = await readGreeting(page);
       if (greeting === "name") {
-        if (await isBusinessAccount(page)) {
-          return { ok: false, reason: BUSINESS_REASON, reachedSignIn: true, business: true };
-        }
         console.log("[bot] nav reads \"Hello, <name>\" — signed in");
         return { ok: true };
       }
@@ -454,7 +468,8 @@ async function confirmGreeting(page: Page): Promise<LoginResult> {
       await sleep(1_000);
     }
   }
-  return { ok: false, reason: `login: no "Hello, <name>" in the nav at ${page.url()}`, reachedSignIn: true };
+  // Final (failures.ts sign_in_unconfirmed): browser closed, row CANCELLED.
+  return { ok: false, reason: `sign-in not confirmed: no "Hello, <name>" in the nav at ${page.url()}`, reachedSignIn: true };
 }
 
 export async function runLogin(page: Page, creds: Credentials): Promise<LoginResult> {

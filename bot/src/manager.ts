@@ -445,7 +445,12 @@ function freeSlotIndex(): number {
   return i;
 }
 
-const MIN_FREE_MB_FLOOR = Number(process.env.MIN_FREE_MB_FLOOR ?? 1500);
+/**
+ * A new slot needs MIN_FREE_MB_PER_SLOT of free RAM, nothing held back on
+ * top: 1614MB free starts 2 slots, under 600MB starts none (user,
+ * 2026-10-09). The 1500MB floor refused starts with 1.6GB still free.
+ */
+const MIN_FREE_MB_FLOOR = Number(process.env.MIN_FREE_MB_FLOOR ?? 0);
 const MIN_FREE_MB_PER_SLOT = Number(process.env.MIN_FREE_MB_PER_SLOT ?? 600);
 const START_JITTER_MS = Number(process.env.START_JITTER_MS ?? 20_000);
 
@@ -470,9 +475,10 @@ function admit(requested: number): { granted: number; reason: string | null } {
   const freeMb = Math.round(freemem() / 1024 / 1024);
   const headroom = Math.max(0, Math.floor((freeMb - MIN_FREE_MB_FLOOR) / MIN_FREE_MB_PER_SLOT));
   if (headroom < granted) {
-    reason =
-      `only ${freeMb}MB RAM free — reserving ${MIN_FREE_MB_FLOOR}MB and budgeting ` +
-      `${MIN_FREE_MB_PER_SLOT}MB per slot leaves room for ${headroom}`;
+    reason = MIN_FREE_MB_FLOOR > 0
+      ? `only ${freeMb}MB RAM free — reserving ${MIN_FREE_MB_FLOOR}MB and budgeting ` +
+        `${MIN_FREE_MB_PER_SLOT}MB per slot leaves room for ${headroom}`
+      : `only ${freeMb}MB RAM free — a slot needs ${MIN_FREE_MB_PER_SLOT}MB`;
     granted = headroom;
   }
   return { granted, reason };
