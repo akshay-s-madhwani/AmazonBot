@@ -3,7 +3,8 @@ import { join } from "node:path";
 import type { PaymentSpec, TargetAddress } from "./config.js";
 import { checkoutAddressKey, sheetAddressKey } from "./address.js";
 export { checkoutAddressKey, sheetAddressKey } from "./address.js";
-import { pause, shortPause, sleep } from "./human.js";
+// Checkout keeps full-length pauses whatever BOT_PACE says (see steadyPause).
+import { steadyPause as pause, steadyShortPause as shortPause, sleep } from "./human.js";
 import { requireJobClient } from "./job-client.js";
 import { ordersByName, readOrderCards, readReviewShipments, reviewBasket, shipsTo, type BasketItem, type OrderCard } from "./purchase-evidence.js";
 import type { Locator, Page } from "./pw.js";
@@ -998,6 +999,8 @@ async function selectMultipleAddresses(
     // over. A read under "Updating your order" saw no rows at all and failed
     // "item 1 is not on the multi-address page" mid-split (2026-10-09).
     let now: ItemRow[] | string = rows;
+    // Give the redraw time to start before the first read.
+    await pause("multi-address page updating");
     for (const deadline = Date.now() + 20_000; Date.now() < deadline; ) {
       await sleep(600);
       await settleRows(page);
