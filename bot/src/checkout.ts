@@ -2063,14 +2063,14 @@ export async function runPlaceOrder(
     };
   }
 
-  // The basket may have shrunk since add_items (unavailable, removed by hand);
-  // it may not have grown or moved — see reviewBasket.
+  // The review against the basket only reports now: it never stops Pay Now
+  // (user, 2026-10-10 — it stopped a correct two-product order over a title
+  // printed as "POND&#39;S"). What it found is logged for the operator.
   const review = basket.length
     ? reviewBasket(basket, addresses, await readReviewShipments(page))
     : ({ ok: false, error: "no basket from add_items to check against" } as const);
   if (!review.ok) {
-    if (!opts.unblocked) return { ok: false, reason: `PRE-PURCHASE STOP: ${review.error}` };
-    console.warn(`[bot] blocks removed — pre-purchase check would stop here, pressing anyway: ${review.error}`);
+    console.warn(`[bot] pre-purchase check (not stopping): ${review.error}`);
   } else if (review.changes.length) {
     console.log(`[bot] basket changed since add_items (allowed): ${review.changes.join("; ")}`);
   }

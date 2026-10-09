@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { basketError, checkoutError, matchingOrder, newOrdersFor, ordersByName, reviewBasket, reviewError, type OrderEvidence } from "./purchase-evidence.js";
+import { basketError, checkoutError, matchingOrder, newOrdersFor, ordersByName, reviewBasket, reviewError, decodeEntities, type OrderEvidence } from "./purchase-evidence.js";
 import { acceptRun, wasRunAccepted } from "./start-registry.js";
 import { FleetLink, type FleetHooks } from "./fleet.js";
 import { resumeStep, inputsChanged } from "./resume-inputs.js";
@@ -494,4 +494,12 @@ test("Cleanup: finds this folder's slots, runners and browsers; orphans are the 
     { pid: 6, ppid: 1, cmd: "/Users/a/Library/shardx/Chromium.app/Contents/MacOS/Chromium --user-data-dir=/Users/a/AmazonBot/bot/browser-profiles/run-ccc" },
   ], mac);
   assert.deepEqual(macFleet.map((p) => [p.kind, p.runId ?? p.profileId]), [["runner", "run-x"], ["browser", "run-ccc"]]);
+});
+
+test("Pre-purchase titles: HTML codes Amazon leaves in a title still match", () => {
+  const t = { fullName: "lokesh 117", phone: "", pincode: "521333", line1: "117 amazon kaikaluru", line2: "", landmark: "", city: "", state: "", country: "India" };
+  const basket = [{ sku: "B0X", title: "POND'S Dreamflower Floral Perfumed Powder With Floral Fragrance", quantity: 1 }];
+  const ship = [{ key: sheetAddressKey(t), name: "lokesh 117", items: [{ title: "POND&#39;S Dreamflower Floral Perfumed Powder With Floral Fragrance", quantity: 1 }] }];
+  assert.equal(reviewError(basket, [t], ship), null);
+  assert.equal(decodeEntities("POND&amp;#39;S &amp; Co"), "POND'S & Co");
 });
