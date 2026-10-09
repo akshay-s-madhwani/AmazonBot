@@ -12,6 +12,8 @@ import { appendEvent, makeEvent, openLog, tee } from "./logs.js";
 import { launchForRun, touchProfile, type LaunchedBrowser } from "./shardx.js";
 import { inputsChanged, resumeStep } from "./resume-inputs.js";
 import { parseAccountProxy, type Proxy } from "./proxy.js";
+import { STALL_EXIT_CODE, STALL_RESTARTS } from "./stall.js";
+import { FINAL_FAILURES } from "./failures.js";
 
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -53,6 +55,12 @@ let deadline: NodeJS.Timeout | undefined;
 let continueAck: NodeJS.Timeout | undefined;
 let actualPort = PORT;
 let runnerWaitingPort: number | null = null;
+/** A runner asked for its step to be restarted (a stuck page, stall.ts). */
+let restartRequest: { index: number; reason: string } | null = null;
+/** Stuck-page restarts per step index, reset when the step finishes or on Resume. */
+const stallRestarts = new Map<number, number>();
+/** A step failed with a code that ends the run (blocked account, bad proxy). */
+let finalFailure: string | null = null;
 let runnerControlPort: number | null = null;
 
 /**
@@ -281,6 +289,28 @@ function spawnRunner(startIndex: number): void {
     log(`runner pid=${runnerPid} exited (code=${code} signal=${signal})`);
     runnerWaitingPort = null;
     runnerPid = null;
+    const ask = restartRequest;
+    restartRequest = null;
+    if (ask && code === STALL_EXIT_CODE && status === "BUSY" && !shuttingDown) {
+      const done = stallRestarts.get(ask.index) ?? 0;
+      if (done < STALL_RESTARTS) {
+        stallRestarts.set(ask.index, done + 1);
+        log(`step ${ask.index}: ${ask.reason} — restart ${done + 1}/${STALL_RESTARTS}`);
+        record("step.restarted", { stepIndex: ask.index, attempt: done + 1, reason: ask.reason });
+        const s = steps[ask.index];
+        if (s) s.status = "PENDING";
+        spawnRunner(ask.index);
+        return;
+      }
+      const s = steps[ask.index];
+      if (s) {
+        s.status = "FAILED";
+        s.failure_code = "page_stuck";
+        s.detail = `${ask.reason} — still stuck after ${STALL_RESTARTS} restarts`;
+      }
+      markStuck(`step ${ask.index} page stuck after ${STALL_RESTARTS} restarts`);
+      return;
+    }
     if (status === "BUSY") {
       const running = steps.find((s) => s.status === "RUNNING");
       if (running) {
@@ -302,6 +332,11 @@ async function finish(outcome: "SUCCEEDED" | "FAILED"): Promise<void> {
     status = "DONE";
     log("all steps complete — closing the browser and releasing the slot");
     await shutdown(0);
+  } else if (finalFailure) {
+    // Nothing to resume: the master cancels the run when it reads the code.
+    status = "DONE";
+    log(`run ended (${finalFailure}) — closing the browser and releasing the slot`);
+    await shutdown(1);
   } else {
     markStuck("run finished with a failed step");
   }
@@ -324,7 +359,12 @@ function handleEvent(event: RunnerEvent): void {
       break;
     }
 
+    case "step.restart":
+      restartRequest = { index: event.step_index, reason: event.reason };
+      break;
+
     case "step.finished": {
+      stallRestarts.delete(event.step_index);
       clearDeadline();
       const s = steps[event.step_index];
       if (s) {
@@ -335,6 +375,9 @@ function handleEvent(event: RunnerEvent): void {
           s.failure_code = event.result.failure_code;
           s.detail = event.result.detail;
         }
+      }
+      if (event.result.status === "failed" && FINAL_FAILURES.has(event.result.failure_code)) {
+        finalFailure = event.result.failure_code;
       }
       log(
         `step ${event.step_index} ${event.step_key} → ${event.result.status.toUpperCase()}` +
@@ -501,6 +544,8 @@ const http = createServer(async (req, res) => {
     }
     stopAfter = until;
     unblocked = url.searchParams.get("unblocked") === "1";
+    // The operator's Resume gives every step its stuck-page restarts back.
+    stallRestarts.clear();
     if (JOB_ID) {
       const fresh = await requireJobClient().resumeInputs(runId);
       if (fresh.fresh_attempt) {

@@ -46,6 +46,8 @@ export type LoginStep =
   | "passkey_nudge"
   | "continue_shopping"
   | "logged_in"
+  /** An Amazon page whose nav reads "Hello, sign in". */
+  | "signed_out"
   | "unknown";
 
 const SIDE_EFFECT_STEPS: readonly LoginStep[] = ["passkey_nudge", "continue_shopping"];
@@ -58,7 +60,21 @@ const SIDE_EFFECT_STEPS: readonly LoginStep[] = ["passkey_nudge", "continue_shop
 const MAX_REPEATS = (step: LoginStep): number => (SIDE_EFFECT_STEPS.includes(step) ? 3 : 2);
 const CODE_STEPS: readonly LoginStep[] = ["otp", "cvf"];
 
-export type LoginResult = { ok: true } | { ok: false; reason: string };
+export type LoginResult =
+  | { ok: true }
+  | {
+      ok: false;
+      reason: string;
+      /** Amazon showed a sign-in screen (or any page it recognises): the proxy works. */
+      reachedSignIn: boolean;
+      /** Signed out right after the password went in: the account is blocked. */
+      blocked?: boolean;
+    };
+
+const HOME_URL = "https://www.amazon.in/";
+/** How long the signed-in nav ("Hello, <name>") gets to show. */
+const GREETING_WAIT_MS = envMs("LOGIN_GREETING_WAIT_MS", 30_000);
+const BLOCKED_REASON = 'account blocked: Amazon shows "Hello, sign in" after sign-in';
 
 function isLoggedInUrl(rawUrl: string): boolean {
   try {
@@ -72,14 +88,20 @@ function isLoggedInUrl(rawUrl: string): boolean {
   }
 }
 
-/** The nav greeting, when the page has one: "Hello, sign in" means signed out. */
-async function greetingSaysSignedOut(page: Page): Promise<boolean> {
+/**
+ * The nav greeting: "name" for "Hello, <name>", "signed_out" for "Hello,
+ * sign in", "missing" when the page has none (yet).
+ */
+async function readGreeting(page: Page): Promise<"name" | "signed_out" | "missing"> {
   return page
     .evaluate(() => {
-      const el = document.querySelector("#nav-link-accountList-nav-line-1, #glow-ingress-line1");
-      return !!el && /sign in/i.test((el as HTMLElement).innerText ?? "");
+      const read = (sel: string) =>
+        ((document.querySelector(sel) as HTMLElement | null)?.innerText ?? "").replace(/\s+/g, " ").trim();
+      const line = read("#nav-link-accountList-nav-line-1") || read("#nav-link-accountList .nav-line-1");
+      if (/sign in/i.test(line) || /sign in/i.test(read("#glow-ingress-line1"))) return "signed_out" as const;
+      return /^hello\b/i.test(line) ? ("name" as const) : ("missing" as const);
     })
-    .catch(() => false);
+    .catch(() => "missing" as const);
 }
 
 /**
@@ -104,7 +126,7 @@ export async function detectStep(page: Page): Promise<LoginStep> {
     if (await anyPresent(page, ["#ap_password"])) return "password";
     if (await anyPresent(page, SEL.email)) return "email";
 
-    if (isLoggedInUrl(url) && !(await greetingSaysSignedOut(page))) return "logged_in";
+    if (isLoggedInUrl(url)) return (await readGreeting(page)) === "signed_out" ? "signed_out" : "logged_in";
     return "unknown";
   } catch {
     return "unknown";
@@ -309,15 +331,53 @@ async function gotoSignIn(page: Page): Promise<void> {
   }
 }
 
+/**
+ * SIGNED IN = the nav reads "Hello, <name>" (user, 2026-10-09). A blocked
+ * account lands on Amazon after the OTP but reads "Hello, sign in". Read on
+ * the page login ended on, else on the home page.
+ */
+async function confirmGreeting(page: Page): Promise<LoginResult> {
+  for (const where of ["here", "home"] as const) {
+    if (where === "home") {
+      console.log("[bot] no nav greeting on this page — reading it on the home page");
+      await page.goto(HOME_URL, { waitUntil: "domcontentloaded", timeout: NAV_TIMEOUT_MS }).catch(() => { });
+    }
+    const deadline = Date.now() + GREETING_WAIT_MS;
+    let signedOutReads = 0;
+    while (Date.now() < deadline) {
+      const greeting = await readGreeting(page);
+      if (greeting === "name") {
+        console.log("[bot] nav reads \"Hello, <name>\" — signed in");
+        return { ok: true };
+      }
+      signedOutReads = greeting === "signed_out" ? signedOutReads + 1 : 0;
+      if (signedOutReads >= 2) return { ok: false, reason: BLOCKED_REASON, reachedSignIn: true, blocked: true };
+      await sleep(1_000);
+    }
+  }
+  return { ok: false, reason: `login: no "Hello, <name>" in the nav at ${page.url()}`, reachedSignIn: true };
+}
+
 export async function runLogin(page: Page, creds: Credentials): Promise<LoginResult> {
+  const r = await signIn(page, creds);
+  return r.ok ? confirmGreeting(page) : r;
+}
+
+async function signIn(page: Page, creds: Credentials): Promise<LoginResult> {
   page.setDefaultTimeout(NAV_TIMEOUT_MS);
-  await gotoSignIn(page);
+  try {
+    await gotoSignIn(page);
+  } catch (err) {
+    return { ok: false, reason: (err as Error).message.split("\n")[0] ?? "sign-in page did not load", reachedSignIn: false };
+  }
   await pause("signin page loaded");
 
   const startedAt = Date.now();
   const handled: Partial<Record<LoginStep, number>> = {};
   let previous: LoginStep | null = null;
   let lastCode: string | null = null;
+  /** Any page Amazon serves that login recognises — the proxy got through. */
+  let reachedSignIn = false;
 
   const fail = async (reason: string): Promise<LoginResult> => {
     console.log(`[bot] login looks failed (${reason}) — checking whether it signed in anyway`);
@@ -326,7 +386,11 @@ export async function runLogin(page: Page, creds: Credentials): Promise<LoginRes
       await pause("login complete");
       return { ok: true };
     }
-    return { ok: false, reason };
+    // Password in, then an Amazon page that says "Hello, sign in": blocked.
+    if (handled.password && (await detectStep(page)) === "signed_out") {
+      return { ok: false, reason: BLOCKED_REASON, reachedSignIn: true, blocked: true };
+    }
+    return { ok: false, reason, reachedSignIn };
   };
 
   for (let i = 0; i < MAX_TRANSITIONS; i++) {
@@ -336,10 +400,14 @@ export async function runLogin(page: Page, creds: Credentials): Promise<LoginRes
 
     const { step, error } = await waitForActionableStep(page, previous);
     console.log(`[bot] step: ${step}  (${page.url()})${error ? ` — error: ${error}` : ""}`);
+    if (step !== "unknown") reachedSignIn = true;
 
     if (step === "logged_in") {
       await pause("login complete");
       return { ok: true };
+    }
+    if (step === "signed_out") {
+      return fail(handled.password ? BLOCKED_REASON : `signed out on ${page.url()} before the password step`);
     }
     if (step === "unknown") {
       return fail((await readError(page)) ?? `unrecognised page: ${page.url()}`);

@@ -8,12 +8,34 @@ export interface FailureRule {
   adminFixable: boolean;
 }
 
+/**
+ * Failures that end the run for good (user, 2026-10-09): the browser is
+ * closed, the run and its row are CANCELLED and the Accounts notes say why.
+ * The master keeps the same list (ingest.ts FINAL_FAILURES). Only login sets
+ * them: a proxy error after the first sign-in page stays proxy_unreachable.
+ */
+export const FINAL_FAILURES: ReadonlySet<string> = new Set(["account_blocked", "proxy_bad"]);
+
 export const FAILURE_RULES: FailureRule[] = [
+  {
+    code: "proxy_bad",
+    category: "ACCOUNT",
+    match: /^proxy .*before the sign-in page/i,
+    fix: "The run never reached Amazon's sign-in page through the account's proxy. Fix or replace it in the Accounts tab's Proxy column.",
+    adminFixable: true,
+  },
   {
     code: "proxy_unreachable",
     category: "ACCOUNT",
     match: /^proxy .*(unreachable|not https?:\/\/host:port)|ERR_PROXY|ERR_TUNNEL_CONNECTION_FAILED/i,
     fix: "The account's proxy did not answer. Fix or replace it in the Accounts tab's Proxy column; a changed proxy starts a new attempt in a new browser.",
+    adminFixable: true,
+  },
+  {
+    code: "account_blocked",
+    category: "ACCOUNT",
+    match: /^account blocked/i,
+    fix: "Amazon signed the account out right after sign-in (nav reads \"Hello, sign in\"): the account is blocked.",
     adminFixable: true,
   },
   {

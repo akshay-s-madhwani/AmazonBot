@@ -108,21 +108,30 @@ export const STEPS: StepDef[] = [
     timeoutMs: 300_000,
     inactivityMs: 120_000,
     run: async (page, ctx) => {
-      // Before the first Amazon page: a dead proxy fails here, by name.
+      // A proxy is to blame only until Amazon's first sign-in page shows
+      // (user, 2026-10-09); after that, login failures are the account's.
+      // Both final codes end the run: browser closed, row CANCELLED.
+      const badProxy = (why: string): StepResult => ({
+        status: "failed",
+        failure_code: "proxy_bad",
+        detail: `proxy ${ctx.proxy!.label} failed before the sign-in page: ${why}`,
+        retriable: false,
+      });
       if (ctx.proxy) {
         const why = await proxyUnreachable(ctx.proxy);
-        if (why) return toResult({ ok: false, reason: `proxy ${ctx.proxy.label} unreachable: ${why}` });
+        if (why) return badProxy(`unreachable (${why})`);
         console.log(`[bot] proxy ${ctx.proxy.label} answers`);
       }
       const r = await runLogin(page, ctx.creds);
-      return r.ok
-        ? { status: "succeeded" }
-        : {
-            status: "failed",
-            failure_code: classifyFailure(r.reason),
-            detail: r.reason,
-            retriable: true,
-          };
+      if (r.ok) return { status: "succeeded" };
+      if (r.blocked) return { status: "failed", failure_code: "account_blocked", detail: r.reason, retriable: false };
+      if (ctx.proxy && !r.reachedSignIn) return badProxy(r.reason);
+      return {
+        status: "failed",
+        failure_code: classifyFailure(r.reason),
+        detail: r.reason,
+        retriable: true,
+      };
     },
   },
   {

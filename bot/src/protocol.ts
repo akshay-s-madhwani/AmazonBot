@@ -13,6 +13,8 @@ export type RunnerEvent =
       control_port: number;
     }
   | { type: "step.started"; run_id: string; step_index: number; step_key: string }
+  /** A page stayed unloaded too long: the runner refreshed it and exits; restart this step (stall.ts). */
+  | { type: "step.restart"; run_id: string; step_index: number; step_key: string; reason: string }
   | {
       type: "step.finished";
       run_id: string;
