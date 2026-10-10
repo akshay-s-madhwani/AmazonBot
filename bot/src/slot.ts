@@ -12,7 +12,7 @@ import { appendEvent, makeEvent, openLog, tee } from "./logs.js";
 import { launchForRun, touchProfile, type LaunchedBrowser } from "./shardx.js";
 import { inputsChanged, resumeStep } from "./resume-inputs.js";
 import { parseAccountProxy, type Proxy } from "./proxy.js";
-import { STALL_EXIT_CODE, STALL_RESTARTS } from "./stall.js";
+import { STALL_EXIT_CODE, STALL_RESTARTS, STUCK_RERUNS } from "./stall.js";
 import { FINAL_FAILURES } from "./failures.js";
 
 
@@ -55,8 +55,10 @@ let deadline: NodeJS.Timeout | undefined;
 let continueAck: NodeJS.Timeout | undefined;
 let actualPort = PORT;
 let runnerWaitingPort: number | null = null;
-/** A runner asked for its step to be restarted (a stuck page, stall.ts). */
-let restartRequest: { index: number; reason: string } | null = null;
+/** A runner asked for its step to be restarted (a stuck page, stall.ts), or a rerun from rewindTo. */
+let restartRequest: { index: number; reason: string; rerun?: boolean; rewindTo?: number } | null = null;
+/** Times this run went back to clear_cart for a stuck step (stall.ts STUCK_RERUNS); reset on Resume. */
+let stuckReruns = 0;
 /** Stuck-page restarts per step index, reset when the step finishes or on Resume. */
 const stallRestarts = new Map<number, number>();
 /** A step failed with a code that ends the run (blocked account, bad proxy). */
@@ -291,6 +293,10 @@ function spawnRunner(startIndex: number): void {
     runnerPid = null;
     const ask = restartRequest;
     restartRequest = null;
+    if (ask?.rerun && ask.rewindTo !== undefined && code === STALL_EXIT_CODE && status === "BUSY" && !shuttingDown) {
+      rerunOrPause(ask.index, ask.rewindTo, ask.reason);
+      return;
+    }
     if (ask && code === STALL_EXIT_CODE && status === "BUSY" && !shuttingDown) {
       const done = stallRestarts.get(ask.index) ?? 0;
       if (done < STALL_RESTARTS) {
@@ -323,6 +329,46 @@ function spawnRunner(startIndex: number): void {
       }
     }
   });
+}
+
+/**
+ * A step after proceed_to_buy made no progress (runner.ts, stall.ts). The
+ * first time: back to clear_cart in the same browser, a fresh runner. Again:
+ * the step fails "Reran N time(s)" and the run PAUSES with its browser open —
+ * the master frees its batch place so the next row starts (user, 2026-10-10).
+ */
+function rerunOrPause(index: number, rewindTo: number, reason: string): void {
+  if (stuckReruns < STUCK_RERUNS) {
+    stuckReruns++;
+    log(`step ${index}: ${reason} — going back to step ${rewindTo} (rerun ${stuckReruns}/${STUCK_RERUNS})`);
+    record("step.rerun", { stepIndex: index, rewindTo, attempt: stuckReruns, reason });
+    for (const s of steps) if (s.index >= rewindTo) s.status = "PENDING";
+    spawnRunner(rewindTo);
+    return;
+  }
+  const detail = `Reran ${stuckReruns} time${stuckReruns === 1 ? "" : "s"}`;
+  const s = steps[index];
+  if (s) {
+    s.status = "FAILED";
+    s.failure_code = "stuck_rerun";
+    s.detail = detail;
+  }
+  clearDeadline();
+  clearContinueAck();
+  record("step.finished", {
+    stepIndex: index,
+    stepKey: s?.key ?? STEPS[index]?.key ?? String(index),
+    result: "failed",
+    failure_code: "stuck_rerun",
+    detail,
+    screenshot: null,
+    url: null,
+  });
+  status = "PAUSED";
+  log(`step ${index}: ${reason} again after ${detail.toLowerCase()} — PAUSED, browser kept; Resume continues`);
+  armStuckTtl(`paused: ${reason}`);
+  // The manager reports this as the run PAUSED (rerun_exhausted frees its batch place).
+  record("runner.waiting", { port: null, reason: "paused", after_step: Math.max(0, index - 1), rerun_exhausted: true });
 }
 
 async function finish(outcome: "SUCCEEDED" | "FAILED"): Promise<void> {
@@ -360,7 +406,11 @@ function handleEvent(event: RunnerEvent): void {
     }
 
     case "step.restart":
-      restartRequest = { index: event.step_index, reason: event.reason };
+      restartRequest = {
+        index: event.step_index,
+        reason: event.reason,
+        ...(event.rerun && event.rewind_to !== undefined ? { rerun: true, rewindTo: event.rewind_to } : {}),
+      };
       break;
 
     case "step.finished": {
@@ -544,8 +594,10 @@ const http = createServer(async (req, res) => {
     }
     stopAfter = until;
     unblocked = url.searchParams.get("unblocked") === "1";
-    // The operator's Resume gives every step its stuck-page restarts back.
+    // The operator's Resume gives every step its stuck-page restarts back,
+    // and the run its rerun from clear_cart.
     stallRestarts.clear();
+    stuckReruns = 0;
     if (JOB_ID) {
       const fresh = await requireJobClient().resumeInputs(runId);
       if (fresh.fresh_attempt) {

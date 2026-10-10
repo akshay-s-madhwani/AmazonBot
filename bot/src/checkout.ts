@@ -464,7 +464,7 @@ async function openAddressPicker(page: Page): Promise<CheckoutResult> {
   if (!shown) return { ok: false, reason: `no Change link for the delivery address at ${page.url()}` };
   await shortPause();
   await change.click({ timeout: NAV_TIMEOUT_MS });
-  await page.waitForURL(/\/address/, { timeout: NAV_TIMEOUT_MS }).catch(() => { });
+  await page.waitForURL(/\/address/, { timeout: NAV_TIMEOUT_MS, waitUntil: "domcontentloaded" }).catch(() => { });
   await pause("address list open");
   return /\/address/.test(page.url())
     ? { ok: true, detail: "address list open" }
@@ -517,7 +517,7 @@ async function settleRows(page: Page, budgetMs = 45_000): Promise<void> {
       if (change) {
         await shortPause();
         await change.click({ timeout: NAV_TIMEOUT_MS }).catch(() => { });
-        await page.waitForURL(/itemselect/, { timeout: NAV_TIMEOUT_MS }).catch(() => { });
+        await page.waitForURL(/itemselect/, { timeout: NAV_TIMEOUT_MS, waitUntil: "domcontentloaded" }).catch(() => { });
       }
     }
     await page.locator(ITEMSELECT_ROW).first().waitFor({ timeout: NAV_TIMEOUT_MS }).catch(() => { });
@@ -865,7 +865,9 @@ async function pickRowAddress(page: Page, row: number, want: string, label: stri
     // The list prints "name line1, line2, ..." — same shape as the dropdown.
     if (checkoutAddressKey(text) === want) {
       await entries.nth(i).click({ timeout: NAV_TIMEOUT_MS });
-      await sleep(2500);
+      // Only lets the list close: the caller then waits, up to 20 s, for the
+      // page to change and settle before reading it. Was a fixed 2.5 s.
+      await sleep(800);
       return true;
     }
   }
@@ -899,7 +901,7 @@ async function selectMultipleAddresses(
     console.log("[bot] checkout already delivers to multiple addresses — reopening that page");
     await shortPause();
     await multiAddressChange(page).then((l) => l!.click({ timeout: NAV_TIMEOUT_MS }));
-    await page.waitForURL(/itemselect/, { timeout: NAV_TIMEOUT_MS }).catch(() => { });
+    await page.waitForURL(/itemselect/, { timeout: NAV_TIMEOUT_MS, waitUntil: "domcontentloaded" }).catch(() => { });
   } else {
     const open = await openAddressPicker(page);
     if (!open.ok) return open;
@@ -909,7 +911,7 @@ async function selectMultipleAddresses(
     if (!shown) return { ok: false, reason: "Multiple address button not found" };
     await shortPause();
     await multi.click({ timeout: NAV_TIMEOUT_MS });
-    await page.waitForURL(/itemselect/, { timeout: NAV_TIMEOUT_MS }).catch(() => { });
+    await page.waitForURL(/itemselect/, { timeout: NAV_TIMEOUT_MS, waitUntil: "domcontentloaded" }).catch(() => { });
   }
   await page.locator(ITEMSELECT_ROW).first().waitFor({ timeout: NAV_TIMEOUT_MS }).catch(() => { });
   await pause("multi-address page open");
@@ -999,8 +1001,10 @@ async function selectMultipleAddresses(
     // over. A read under "Updating your order" saw no rows at all and failed
     // "item 1 is not on the multi-address page" mid-split (2026-10-09).
     let now: ItemRow[] | string = rows;
-    // Give the redraw time to start before the first read.
-    await pause("multi-address page updating");
+    // Give the redraw time to start before the first read. Fixed at the
+    // shortest the old random pause (0.8–2 s) ever was: the loop below waits
+    // for the change and the settle, the pause only covers the first instant.
+    await sleep(800);
     for (const deadline = Date.now() + 20_000; Date.now() < deadline; ) {
       await sleep(600);
       await settleRows(page);
@@ -1025,7 +1029,7 @@ async function selectMultipleAddresses(
 
   await pause("before continuing to payment");
   await page.locator("#checkout-primary-continue-button-id input").first().click({ timeout: NAV_TIMEOUT_MS });
-  await page.waitForURL(/\/pay/, { timeout: NAV_TIMEOUT_MS }).catch(() => { });
+  await reachPayment(page);
   await pause("back at payment");
   const confirmed = await page
     .evaluate(() => /delivering to multiple addresses/i.test(document.body.innerText.slice(0, 8000)))
@@ -1033,6 +1037,60 @@ async function selectMultipleAddresses(
   return confirmed
     ? { ok: true, detail: `delivering to ${targets.length} addresses` }
     : { ok: false, reason: `checkout does not show "Delivering to multiple addresses" (at ${page.url()})` };
+}
+
+/**
+ * The offers page's "No Thanks" is a link to .../prime/handler?action=decline
+ * (live, 2026-10-10) — not the a-button-popover button closePopoverByButton
+ * looks for, and the modal's × only hides the box, stranding checkout on
+ * /offers. Its address is opened directly — the same GET the click makes,
+ * whether the box shows or not. Never the Join button's form.
+ */
+export async function declinePrimeOffer(page: Page): Promise<boolean> {
+  const href = await page
+    .locator('a[href*="/prime/handler"][href*="action=decline"]')
+    .first()
+    .getAttribute("href", { timeout: 2_000 })
+    .catch(() => null);
+  if (!href) {
+    console.log("[bot] no Prime decline link on this page — closing the offer instead");
+    await dismissCheckoutModal(page);
+    return false;
+  }
+  // Opened, not clicked: a click is a Playwright action, and the before-click
+  // guard (guardCheckoutModals) would press No Thanks too, mid-click.
+  console.log('[bot] Prime offer: "No Thanks"');
+  await page.goto(new URL(href, page.url()).toString(), { waitUntil: "domcontentloaded", timeout: NAV_TIMEOUT_MS }).catch(() => { });
+  console.log(`[bot] Prime offer declined — now at ${page.url().slice(0, 110)}`);
+  return true;
+}
+
+/**
+ * After the address is set, checkout goes to payment — or, since 2026-10-10,
+ * first to an OFFERS page (.../checkout/p/.../offers?...) carrying the Prime
+ * upsell modal. Waiting for /pay alone sat silent there until the stuck rule
+ * fired, every run. On /offers the offer is declined (No Thanks moves checkout
+ * on; its × only closes the box), then /pay is waited for.
+ */
+async function reachPayment(page: Page): Promise<void> {
+  // Payment is /pay, or /spc (single-page checkout) where "No Thanks" on the offers page lands.
+  const atPay = (u: URL | string): boolean => /\/(pay|spc)(\?|\/|$)/.test(String(u));
+  const atOffers = (u: URL | string): boolean => /\/offers(\?|\/|$)/.test(String(u));
+  await page
+    .waitForURL((u) => atPay(u) || atOffers(u), { timeout: NAV_TIMEOUT_MS, waitUntil: "domcontentloaded" })
+    .catch(() => { });
+  for (let round = 1; round <= 3 && atOffers(page.url()); round++) {
+    console.log(`[bot] checkout stopped on the offers page — declining the Prime offer (${round}/3)`);
+    await declinePrimeOffer(page);
+    const moved = await page
+      .waitForURL((u) => atPay(u), { timeout: 15_000, waitUntil: "domcontentloaded" })
+      .then(() => true)
+      .catch(() => false);
+    if (moved) break;
+  }
+  if (!atPay(page.url())) console.log(`[bot] not on the payment page yet (${page.url().slice(0, 100)})`);
+  // The offer can also pop up over payment itself.
+  await dismissCheckoutModal(page);
 }
 
 /** One address: the payment page must already be delivering to it, else it is chosen from the list. */
@@ -1068,7 +1126,7 @@ async function selectSingleAddress(page: Page, target: TargetAddress): Promise<C
   await shortPause();
   const use = page.getByText("Deliver to this address", { exact: true }).filter({ visible: true }).first();
   await use.click({ timeout: NAV_TIMEOUT_MS });
-  await page.waitForURL(/\/pay/, { timeout: NAV_TIMEOUT_MS }).catch(() => { });
+  await reachPayment(page);
   await pause("address selected");
   return { ok: true, detail: `delivering to ${target.fullName}` };
 }
@@ -1081,6 +1139,8 @@ export async function runSelectAddresses(
   opts: { unblocked?: boolean } = {},
 ): Promise<CheckoutResult> {
   await pause("selecting delivery address");
+  // A rerun or resume can start on the offers page: past it first (reachPayment).
+  if (/\/offers(\?|\/|$)/.test(page.url())) await reachPayment(page);
   const at = await ensureAtCheckout(page);
   if (!at.ok) return at;
   // Remove blocks: the operator may have set the addresses by hand. Checkout
@@ -1355,6 +1415,51 @@ async function closePopoverByButton(page: Page): Promise<string | null> {
   return null;
 }
 
+/**
+ * THE PRIME OFFER, BEFORE EVERY CLICK (user, 2026-10-10): from add_vouchers
+ * on, the "Prime Shopping Edition — No Thanks / Join" modal can appear at any
+ * moment and take the next click — Pay Now's included. A Playwright locator
+ * handler runs before every click, fill and check on this page: when the
+ * offer is showing it is closed (its ×, else No Thanks) and the action goes on.
+ *
+ * Only a popover that names Prime: the multi-address dropdowns are popovers
+ * too and must stay open. Clicks made in page JS (dispatchEvent, el.click())
+ * are not blocked by an overlay and do not need it.
+ */
+const guarded = new WeakSet<Page>();
+
+export async function guardCheckoutModals(page: Page): Promise<void> {
+  if (guarded.has(page)) return;
+  guarded.add(page);
+  const offer = page
+    .locator('.a-popover:not(.a-popover-hidden), .a-popover-modal, [role="dialog"]')
+    .filter({ hasText: /prime shopping edition|join prime|amazon prime|prime membership/i })
+    .filter({ visible: true })
+    .first();
+  await page
+    .addLocatorHandler(offer, async () => {
+      if (/\/offers(\?|\/|$)/.test(page.url())) {
+        // The offers page: No Thanks (a decline link) is what moves checkout on.
+        console.log("[bot] Prime offer on the offers page — No Thanks before the click");
+        await declinePrimeOffer(page);
+        return;
+      }
+      const x = page
+        .locator('.a-popover:not(.a-popover-hidden) [data-action="a-popover-close"], .a-popover:not(.a-popover-hidden) .a-button-close, [role="dialog"] button[aria-label*="close" i]')
+        .filter({ visible: true })
+        .first();
+      if (await x.count()) {
+        console.log("[bot] Prime offer over checkout — closing it (×) before the click");
+        await x.click({ timeout: 5_000 }).catch(() => { });
+      }
+      if (await offer.isVisible().catch(() => false)) {
+        console.log("[bot] Prime offer still open — No Thanks");
+        await dismissCheckoutModal(page);
+      }
+    }, { noWaitAfter: true })
+    .catch((err: Error) => console.warn(`[bot] could not watch for the Prime offer: ${err.message.split("\n")[0]}`));
+}
+
 export async function dismissCheckoutModal(page: Page): Promise<void> {
   const quick = await closePopoverByButton(page);
   if (quick) {
@@ -1569,6 +1674,8 @@ async function stillOverlaid(page: Page): Promise<boolean> {
  */
 export async function runApplyPayment(page: Page, payment: PaymentSpec): Promise<CheckoutResult> {
   await pause("reviewing payment");
+  // A resume can land here still on the offers page (see reachPayment).
+  if (/\/offers(\?|\/|$)/.test(page.url())) await reachPayment(page);
   const at = await ensureAtCheckout(page);
   if (!at.ok) return at;
 
@@ -1998,6 +2105,38 @@ function writeLedger(artifactsDir: string, entries: LedgerEntry[]): void {
   renameSync(path + ".tmp", path);
 }
 
+/** A recorded press younger than this may still be listing on Your Orders: wait it out first. */
+const REPRESS_AFTER_MS = 120_000;
+
+/**
+ * A recorded Pay Now press, seen from a later attempt: null = it may have gone
+ * through (the page left checkout, or Pay Now is gone) — never press again;
+ * { ordered } = Your Orders now lists it; otherwise why it certainly did not.
+ */
+async function pressDidNotGoThrough(
+  page: Page,
+  prior: LedgerEntry,
+  artifactsDir: string,
+  idempotencyKey: string,
+  addresses: TargetAddress[],
+): Promise<{ ordered: boolean; detail: string } | null> {
+  if (/thankyou/i.test(page.url()) || !(await atCheckoutPipeline(page))) return null;
+  await dismissCheckoutModal(page);
+  if (!(await findPayNow(page))) return null;
+  // Your Orders, until the press is old enough that its orders would show.
+  for (;;) {
+    const found = await lookUpOrders(page, artifactsDir, idempotencyKey, addresses, 1);
+    if (found.ok) return { ordered: true, detail: `Your Orders has ${found.detail}` };
+    const age = Date.now() - Date.parse(prior.placed_at);
+    if (!Number.isFinite(age) || age >= REPRESS_AFTER_MS) break;
+    console.log(`[bot] earlier Pay Now press is ${Math.round(age / 1000)}s old, nothing on Your Orders yet — checking again before pressing`);
+    await sleep(Math.min(15_000, REPRESS_AFTER_MS - age));
+  }
+  // Re-read: the page may have moved while Your Orders was being checked.
+  if (/thankyou/i.test(page.url()) || !(await atCheckoutPipeline(page)) || !(await findPayNow(page))) return null;
+  return { ordered: false, detail: "Your Orders has no order for it and checkout still shows Pay Now" };
+}
+
 /**
  * PAY NOW. note_order_id has already looked on Your Orders by the sheet's
  * address names and found nothing, so this is the press.
@@ -2016,10 +2155,21 @@ export async function runPlaceOrder(
 ): Promise<CheckoutResult> {
   const ledger = readLedger(artifactsDir);
   const prior = ledger.find((e) => e.key === idempotencyKey);
-  // Never clicks twice. A resume after the click moves on: the order ids are
-  // read next. Remove blocks presses again: Your Orders had nothing for it.
+  // A press is recorded BEFORE it is made, so a press that never reached
+  // Amazon (the Prime offer took the click) is recorded too. Pressed again
+  // only when that is certain: Your Orders has nothing new for the sheet's
+  // names (checked by the caller, and again here until the press is old enough
+  // for a slow multi-address listing) AND this page is still checkout with
+  // Pay Now on it — after a real order Amazon leaves checkout and the cart is
+  // empty. Otherwise, as before: never clicks twice; ids are read next.
+  // (2026-10-10: a restart after a swallowed press never pressed again.)
+  let repress = false;
   if (prior && !opts.unblocked) {
-    return { ok: true, detail: `already submitted at ${prior.placed_at}; order ids are read next` };
+    const why = await pressDidNotGoThrough(page, prior, artifactsDir, idempotencyKey, addresses);
+    if (why === null) return { ok: true, detail: `already submitted at ${prior.placed_at}; order ids are read next` };
+    if (why.ordered) return { ok: true, detail: `submitted at ${prior.placed_at}: ${why.detail}; order ids are read next` };
+    console.log(`[bot] pressed at ${prior.placed_at} but ${why.detail} — that press did not go through; pressing Pay Now again`);
+    repress = true;
   }
   const basketFile = join(artifactsDir, "expected-basket.json");
   const basket = existsSync(basketFile) ? (JSON.parse(readFileSync(basketFile, "utf8")) as BasketItem[]) : [];
@@ -2077,8 +2227,10 @@ export async function runPlaceOrder(
   const shipping = review.ok ? review.shipping : addresses;
   const known = await knownOrderIds(page);
   if (prior) {
-    // Remove blocks, pressing again: the same purchase record, a fresh "before".
-    prior.known_orders = known;
+    // Pressing again on the same purchase record. Remove blocks takes a fresh
+    // "before"; a re-press after a swallowed click keeps the first one, so an
+    // order from that press that lists late is still found as new.
+    if (!repress) prior.known_orders = known;
     prior.ship_to = shipping.map((t) => t.fullName);
   } else {
     const intent = await requireJobClient().beginPurchase(runId, jobId);

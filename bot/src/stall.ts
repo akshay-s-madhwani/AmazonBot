@@ -106,3 +106,56 @@ export async function recoverFromStall(context: BrowserContext, main: Page): Pro
   await main.goto(url, { waitUntil: "domcontentloaded", timeout: 45_000 }).catch(() => {});
   await main.bringToFront().catch(() => {});
 }
+
+/**
+ * STUCK AFTER PROCEED TO BUY (user, 2026-10-10): a step from add_vouchers to
+ * select_payment that makes no progress for STUCK_RERUN_MS (30 s) goes back
+ * to clear_cart and runs again, once; stuck again, the run is paused and its
+ * batch place freed (slot.ts). note_order_id is left out on purpose: once Pay
+ * Now may have been clicked, going back to the cart could order twice.
+ *
+ * Progress is anything the step says (every log line) or any page of the
+ * browser moving to a new address. Network chatter is not: Amazon's pages
+ * poll on their own, which would make a frozen step look busy forever.
+ */
+export const STUCK_RERUN_MS = Number(process.env.STUCK_RERUN_MS ?? 30_000);
+/** How many times a run goes back to clear_cart before it is paused. */
+export const STUCK_RERUNS = 1;
+
+let lastProgressAt = Date.now();
+let hooked = false;
+
+/** Counts every log line and page navigation as progress. Once per runner. */
+export function trackProgress(context: BrowserContext): void {
+  if (hooked) return;
+  hooked = true;
+  for (const m of ["log", "warn", "error"] as const) {
+    const orig = console[m].bind(console);
+    console[m] = (...args: unknown[]) => {
+      lastProgressAt = Date.now();
+      orig(...args);
+    };
+  }
+  const watch = (p: Page) => p.on("framenavigated", () => { lastProgressAt = Date.now(); });
+  for (const p of context.pages()) watch(p);
+  context.on("page", watch);
+}
+
+/** Calls onStuck once when nothing has progressed for STUCK_RERUN_MS. Returns a stop function. */
+export function watchForNoProgress(onStuck: (quietMs: number) => void): () => void {
+  lastProgressAt = Date.now();
+  let stopped = false;
+  const timer = setInterval(() => {
+    if (stopped) return;
+    const quiet = Date.now() - lastProgressAt;
+    if (quiet < STUCK_RERUN_MS) return;
+    stopped = true;
+    clearInterval(timer);
+    onStuck(quiet);
+  }, 1_000);
+  timer.unref?.();
+  return () => {
+    stopped = true;
+    clearInterval(timer);
+  };
+}

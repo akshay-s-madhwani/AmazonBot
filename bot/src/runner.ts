@@ -6,13 +6,25 @@ import { loadAddress, loadConfig, loadDotEnv, loadProduct, parseRewardType, relo
 import { postEvent, type RunnerConfig, type StepResult } from "./protocol.js";
 import { LAST_STEP, LAST_STEP_INDEX, STEPS, UNBLOCKABLE_FROM, UNBLOCKABLE_UNTIL, stepAt, type StepContext } from "./steps.js";
 import { openRewardTab } from "./reward.js";
+import { guardCheckoutModals } from "./checkout.js";
 import { describeForOperator } from "./failures.js";
 import type { SheetJob } from "./job-client.js";
 import { parseAccountProxy } from "./proxy.js";
-import { STALL_EXIT_CODE, recoverFromStall, watchForStall } from "./stall.js";
+import { STALL_EXIT_CODE, recoverFromStall, trackProgress, watchForNoProgress, watchForStall } from "./stall.js";
 
 
 const STEP_SETTLE_MS = 350;
+
+/**
+ * The steps that go back to clear_cart when stuck (stall.ts STUCK_RERUN_MS):
+ * after proceed_to_buy, before note_order_id — never once Pay Now may be clicked.
+ */
+const REWIND_TO = STEPS.findIndex((s) => s.key === "clear_cart");
+const RERUN_FROM = STEPS.findIndex((s) => s.key === "proceed_to_buy") + 1;
+const RERUN_UNTIL = STEPS.findIndex((s) => s.key === "note_order_id");
+/** From add_vouchers on, the Prime offer is closed before every click (checkout.ts guardCheckoutModals). */
+const GUARD_FROM = STEPS.findIndex((s) => s.key === "add_vouchers");
+const rerunnable = (i: number): boolean => REWIND_TO >= 0 && RERUN_FROM > 0 && i >= RERUN_FROM && i < RERUN_UNTIL;
 const HEARTBEAT_MS = 5_000;
 
 function startHeartbeat(cfg: RunnerConfig, state: { index: number; key: string }): NodeJS.Timeout {
@@ -418,6 +430,7 @@ async function main(): Promise<number> {
     }
   }
 
+  trackProgress(context);
   const live = { index: cfg.start_index, key: "" };
   captureNow = () => capture(page, cfg.artifacts_dir, `capture-${Date.now()}`);
   const controlPortNow = await ensureControlServer(cfg, live);
@@ -473,9 +486,37 @@ async function main(): Promise<number> {
         })();
       });
 
+      // Stuck after proceed_to_buy: back to clear_cart (the slot counts, and
+      // pauses the run the second time). Exits like a stalled page does: the
+      // stuck attempt cannot be cancelled in place.
+      const stopQuietWatch = rerunnable(i)
+        ? watchForNoProgress((quietMs) => {
+            void (async () => {
+              const reason = `no progress for ${Math.round(quietMs / 1000)}s on ${step.key}`;
+              console.error(`[runner] ${reason} — going back to ${STEPS[REWIND_TO]!.key}`);
+              await capture(page, cfg.artifacts_dir, `${i}-${step.key}-stuck-${Date.now()}`, true);
+              await postEvent(cfg.slot_url, cfg.token, {
+                type: "step.restart",
+                run_id: cfg.run_id,
+                step_index: i,
+                step_key: step.key,
+                reason,
+                rerun: true,
+                rewind_to: REWIND_TO,
+              });
+              process.exit(STALL_EXIT_CODE);
+            })();
+          })
+        : () => {};
+
+      if (GUARD_FROM >= 0 && i >= GUARD_FROM) await guardCheckoutModals(page);
+
       let result: StepResult;
       try {
-        result = await withTimeout(step.run(page, ctx), step.timeoutMs, step.key).finally(stopWatch);
+        result = await withTimeout(step.run(page, ctx), step.timeoutMs, step.key).finally(() => {
+          stopWatch();
+          stopQuietWatch();
+        });
       } catch (err) {
         result = {
           status: "failed",

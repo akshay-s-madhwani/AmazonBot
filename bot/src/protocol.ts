@@ -13,8 +13,14 @@ export type RunnerEvent =
       control_port: number;
     }
   | { type: "step.started"; run_id: string; step_index: number; step_key: string }
-  /** A page stayed unloaded too long: the runner refreshed it and exits; restart this step (stall.ts). */
-  | { type: "step.restart"; run_id: string; step_index: number; step_key: string; reason: string }
+  /**
+   * A page stayed unloaded too long: the runner refreshed it and exits; restart this step (stall.ts).
+   * rerun: a step after proceed_to_buy made no progress — restart from rewind_to (clear_cart) instead.
+   */
+  | {
+      type: "step.restart"; run_id: string; step_index: number; step_key: string; reason: string;
+      rerun?: boolean; rewind_to?: number;
+    }
   | {
       type: "step.finished";
       run_id: string;

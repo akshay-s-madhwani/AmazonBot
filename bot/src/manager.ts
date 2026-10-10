@@ -1004,7 +1004,12 @@ app.post("/slots/event", (req: Request, res: Response) => {
     s.status = "PAUSED";
     const after = Number(body.after_step);
     emit(s, "run.paused", {
-      payload: { after_step: Number.isInteger(after) ? after : s.stepIndex },
+      payload: {
+        after_step: Number.isInteger(after) ? after : s.stepIndex,
+        // Stuck twice after proceed_to_buy (slot.ts rerunOrPause): the master
+        // pauses it from FAILED too, and frees its batch place.
+        ...(body.rerun_exhausted === true ? { reason: "rerun_exhausted" } : {}),
+      },
     });
   }
   if (body.type === "browser.started") {

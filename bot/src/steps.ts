@@ -116,7 +116,7 @@ export const STEPS: StepDef[] = [
     run: async (page, ctx) => {
       // A proxy is to blame only until Amazon's first sign-in page shows
       // (user, 2026-10-09); after that, login failures are the account's.
-      // Both final codes end the run: browser closed, row CANCELLED.
+      // Final codes (failures.ts FINAL_FAILURES) end the run: browser closed, row CANCELLED.
       const badProxy = (why: string): StepResult => ({
         status: "failed",
         failure_code: "proxy_bad",
@@ -131,6 +131,12 @@ export const STEPS: StepDef[] = [
       const r = await runLogin(page, ctx.creds);
       if (r.ok) return { status: "succeeded" };
       if (r.blocked) return { status: "failed", failure_code: "account_blocked", detail: r.reason, retriable: false };
+      if (r.refused) return { status: "failed", failure_code: "sign_in_refused", detail: r.reason, retriable: false };
+      if (r.business) return { status: "failed", failure_code: "business_account", detail: r.reason, retriable: false };
+      // Amazon said the password is wrong: final too, like a blocked account.
+      if (r.reachedSignIn && classifyFailure(r.reason) === "password_incorrect") {
+        return { status: "failed", failure_code: "password_incorrect", detail: r.reason, retriable: false };
+      }
       if (ctx.proxy && !r.reachedSignIn) return badProxy(r.reason);
       return {
         status: "failed",
