@@ -8,12 +8,60 @@ export interface FailureRule {
   adminFixable: boolean;
 }
 
+/**
+ * Failures that end the run for good (user, 2026-10-09): the browser is
+ * closed, the run and its row are CANCELLED and the Accounts notes say why.
+ * The master keeps the same list (ingest.ts FINAL_FAILURES). Only login sets
+ * them: a proxy error after the first sign-in page stays proxy_unreachable.
+ */
+export const FINAL_FAILURES: ReadonlySet<string> = new Set([
+  "account_blocked", "business_account", "password_incorrect", "proxy_bad", "sign_in_refused",
+  "sign_in_unconfirmed",
+]);
+
 export const FAILURE_RULES: FailureRule[] = [
+  {
+    code: "proxy_bad",
+    category: "ACCOUNT",
+    match: /^proxy .*before the sign-in page/i,
+    fix: "The run never reached Amazon's sign-in page through the account's proxy. Fix or replace it in the Accounts tab's Proxy column.",
+    adminFixable: true,
+  },
   {
     code: "proxy_unreachable",
     category: "ACCOUNT",
-    match: /^proxy .*(unreachable|not https?:\/\/host:port)|ERR_PROXY|ERR_TUNNEL_CONNECTION_FAILED/i,
+    match: /^proxy .*(unreachable|not https?:\/\/host:port)|ERR_PROXY|ERR_TUNNEL_CONNECTION_FAILED|ERR_INVALID_AUTH_CREDENTIALS/i,
     fix: "The account's proxy did not answer. Fix or replace it in the Accounts tab's Proxy column; a changed proxy starts a new attempt in a new browser.",
+    adminFixable: true,
+  },
+  {
+    code: "sign_in_refused",
+    category: "ACCOUNT",
+    match: /^signed out on .* before the password step/i,
+    fix: "Amazon sent the sign-in back to a signed-out page (its 503 link) before the password was asked for.",
+    adminFixable: true,
+  },
+  {
+    code: "account_blocked",
+    category: "ACCOUNT",
+    match: /^account blocked/i,
+    fix: "Amazon signed the account out right after sign-in (nav reads \"Hello, sign in\"): the account is blocked.",
+    adminFixable: true,
+  },
+  {
+    code: "business_account",
+    category: "ACCOUNT",
+    match: /^business account/i,
+    fix: "The account signed in to Amazon Business (\"Account for Your Business\"). Use a personal account.",
+    adminFixable: true,
+  },
+  {
+    // Final too (user, 2026-10-09): after sign-in, neither page showed
+    // "Hello, <name>" — an account that cannot be confirmed is not ordered from.
+    code: "sign_in_unconfirmed",
+    category: "ACCOUNT",
+    match: /^sign-in not confirmed/i,
+    fix: "After sign-in neither the page nor the home page read \"Hello, <name>\". Check the screenshot; the run is cancelled.",
     adminFixable: true,
   },
   {

@@ -9,6 +9,7 @@ import { openRewardTab } from "./reward.js";
 import { describeForOperator } from "./failures.js";
 import type { SheetJob } from "./job-client.js";
 import { parseAccountProxy } from "./proxy.js";
+import { STALL_EXIT_CODE, recoverFromStall, watchForStall } from "./stall.js";
 
 
 const STEP_SETTLE_MS = 350;
@@ -453,9 +454,28 @@ async function main(): Promise<number> {
         step_key: step.key,
       });
 
+      // A page stuck loading for 90 s: refresh it, and have the slot restart
+      // this step in a fresh runner (at most 3 times, the slot counts).
+      const stopWatch = watchForStall(context, (stall) => {
+        void (async () => {
+          const where = stall.url.slice(0, 100);
+          const reason = `page stuck ${stall.state} for ${Math.round(stall.forMs / 1000)}s at ${where}`;
+          console.error(`[runner] ${reason} — refreshing and restarting step ${i} ${step.key}`);
+          await recoverFromStall(context, page);
+          await postEvent(cfg.slot_url, cfg.token, {
+            type: "step.restart",
+            run_id: cfg.run_id,
+            step_index: i,
+            step_key: step.key,
+            reason,
+          });
+          process.exit(STALL_EXIT_CODE);
+        })();
+      });
+
       let result: StepResult;
       try {
-        result = await withTimeout(step.run(page, ctx), step.timeoutMs, step.key);
+        result = await withTimeout(step.run(page, ctx), step.timeoutMs, step.key).finally(stopWatch);
       } catch (err) {
         result = {
           status: "failed",

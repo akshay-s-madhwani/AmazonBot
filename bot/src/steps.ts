@@ -1,8 +1,23 @@
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { productIdentity, type BasketItem } from "./purchase-evidence.js";
-import type { Page } from "./pw.js";
+import { runAddresses } from "./address.js";
+import { allocate, placeFreeItems, type FreeItem } from "./allocation.js";
+import {
+  lookUpOrders,
+  openCart,
+  readFreebieMessages,
+  readOfferedFreebie,
+  recordOrders,
+  runAddToCart,
+  runApplyPayment,
+  runClearCart,
+  runNoteOrderId,
+  runPlaceOrder,
+  runProceedToBuy,
+  runSelectAddresses,
+  saveOrdersBefore,
+} from "./checkout.js";
 import type {
   Credentials,
   PaymentCode,
@@ -13,30 +28,15 @@ import type {
   RewardSpec,
   TargetAddress,
 } from "./config.js";
-import { runLogin } from "./login.js";
-import { proxyUnreachable, type Proxy } from "./proxy.js";
-import { runCheckReward } from "./reward.js";
-import { runAddresses } from "./address.js";
-import { runApplyCoupon, runOpenProduct, runSetQuantity } from "./product.js";
-import {
-  openCart,
-  readFreebieMessages,
-  readOfferedFreebie,
-  runAddToCart,
-  runApplyPayment,
-  saveOrdersBefore,
-  runClearCart,
-  lookUpOrders,
-  recordOrders,
-  runNoteOrderId,
-  runPlaceOrder,
-  runProceedToBuy,
-  runSelectAddresses,
-} from "./checkout.js";
-import { classifyFailure, type StepResult } from "./protocol.js";
-import { allocate, placeFreeItems, type FreeItem } from "./allocation.js";
-import { runAddVouchers } from "./vouchers.js";
 import { pause, sleep } from "./human.js";
+import { runLogin } from "./login.js";
+import { runApplyCoupon, runOpenProduct, runSetQuantity } from "./product.js";
+import { classifyFailure, type StepResult } from "./protocol.js";
+import { proxyUnreachable, type Proxy } from "./proxy.js";
+import { productIdentity, type BasketItem } from "./purchase-evidence.js";
+import type { Page } from "./pw.js";
+import { runCheckReward } from "./reward.js";
+import { runAddVouchers } from "./vouchers.js";
 
 /**
  * A hard stop for local debugging only. Keep it null in anything the panel
@@ -101,33 +101,48 @@ export interface StepDef {
   run(page: Page, ctx: StepContext): Promise<StepResult>;
 }
 
+/**
+ * Every step may take 10 minutes (user, 2026-10-09): 2 min failed set_address
+ * on its 6th address and cut short the slower, steadier checkout.
+ */
+const STEP_TIMEOUT_MS = 600_000;
+
 export const STEPS: StepDef[] = [
   {
     key: "login",
     // Covers runLogin's own budget (LOGIN_TIMEOUT_MS, 200s) plus its final signed-in check.
-    timeoutMs: 300_000,
+    timeoutMs: STEP_TIMEOUT_MS,
     inactivityMs: 120_000,
     run: async (page, ctx) => {
-      // Before the first Amazon page: a dead proxy fails here, by name.
+      // A proxy is to blame only until Amazon's first sign-in page shows
+      // (user, 2026-10-09); after that, login failures are the account's.
+      // Both final codes end the run: browser closed, row CANCELLED.
+      const badProxy = (why: string): StepResult => ({
+        status: "failed",
+        failure_code: "proxy_bad",
+        detail: `proxy ${ctx.proxy!.label} failed before the sign-in page: ${why}`,
+        retriable: false,
+      });
       if (ctx.proxy) {
         const why = await proxyUnreachable(ctx.proxy);
-        if (why) return toResult({ ok: false, reason: `proxy ${ctx.proxy.label} unreachable: ${why}` });
+        if (why) return badProxy(`unreachable (${why})`);
         console.log(`[bot] proxy ${ctx.proxy.label} answers`);
       }
       const r = await runLogin(page, ctx.creds);
-      return r.ok
-        ? { status: "succeeded" }
-        : {
-            status: "failed",
-            failure_code: classifyFailure(r.reason),
-            detail: r.reason,
-            retriable: true,
-          };
+      if (r.ok) return { status: "succeeded" };
+      if (r.blocked) return { status: "failed", failure_code: "account_blocked", detail: r.reason, retriable: false };
+      if (ctx.proxy && !r.reachedSignIn) return badProxy(r.reason);
+      return {
+        status: "failed",
+        failure_code: classifyFailure(r.reason),
+        detail: r.reason,
+        retriable: true,
+      };
     },
   },
   {
     key: "check_reward",
-    timeoutMs: 300_000,
+    timeoutMs: STEP_TIMEOUT_MS,
     inactivityMs: 90_000,
     run: async (page, ctx) => {
       const r = await runCheckReward(page, ctx.rewards, ctx.markReward);
@@ -148,23 +163,23 @@ export const STEPS: StepDef[] = [
   },
   {
     key: "set_address",
-    timeoutMs: 120_000,
+    timeoutMs: STEP_TIMEOUT_MS,
     inactivityMs: 90_000,
     run: async (page, ctx) => {
       const r = await runAddresses(page, deliveryAddresses(ctx));
       return r.ok
         ? { status: "succeeded" }
         : {
-            status: "failed",
-            failure_code: classifyFailure(r.reason),
-            detail: r.reason,
-            retriable: true,
-          };
+          status: "failed",
+          failure_code: classifyFailure(r.reason),
+          detail: r.reason,
+          retriable: true,
+        };
     },
   },
   {
     key: "clear_cart",
-    timeoutMs: 120_000,
+    timeoutMs: STEP_TIMEOUT_MS,
     inactivityMs: 60_000,
     run: async (page) => toResult(await runClearCart(page)),
   },
@@ -205,7 +220,7 @@ export const STEPS: StepDef[] = [
         const label = `item ${i + 1}/${ctx.products.length}`;
         console.log(
           `[bot] -- ${label}: ${item.url} x${item.quantity}` +
-            (plan.multi ? ` (${plan.totals[i]} over ${plan.shares[i]!.join("/")})` : "") + " --",
+          (plan.multi ? ` (${plan.totals[i]} over ${plan.shares[i]!.join("/")})` : "") + " --",
         );
 
         const opened = await runOpenProduct(page, item);
@@ -264,7 +279,7 @@ export const STEPS: StepDef[] = [
       for (const [f, item] of freeItems.entries()) {
         console.log(
           `[bot] free item: ${item.title.slice(0, 60)} (${item.sku}) x${item.quantity}` +
-            (freeShares ? ` -> ${freeShares[f]!.join("/")}` : ""),
+          (freeShares ? ` -> ${freeShares[f]!.join("/")}` : ""),
         );
         expected.push({ ...item, free: true, ...(freeShares ? { shares: freeShares[f]! } : {}) });
       }
@@ -276,7 +291,7 @@ export const STEPS: StepDef[] = [
   },
   {
     key: "proceed_to_buy",
-    timeoutMs: 120_000,
+    timeoutMs: STEP_TIMEOUT_MS,
     inactivityMs: 60_000,
     run: async (page) => toResult(await runProceedToBuy(page)),
   },
@@ -294,7 +309,7 @@ export const STEPS: StepDef[] = [
   },
   {
     key: "select_address",
-    timeoutMs: 120_000,
+    timeoutMs: STEP_TIMEOUT_MS,
     inactivityMs: 60_000,
     run: async (page, ctx) => {
       const targets = deliveryAddresses(ctx);
@@ -309,7 +324,7 @@ export const STEPS: StepDef[] = [
   },
   {
     key: "select_payment",
-    timeoutMs: 120_000,
+    timeoutMs: STEP_TIMEOUT_MS,
     inactivityMs: 90_000,
     run: async (page, ctx) => {
       const paid = await runApplyPayment(page, ctx.payment);
@@ -327,7 +342,7 @@ export const STEPS: StepDef[] = [
     // Now. Otherwise Pay Now, then the ids the same way. Was confirm_order +
     // note_order_id until 2026-10-07; orders-first since 2026-10-08.
     key: "note_order_id",
-    timeoutMs: 300_000,
+    timeoutMs: STEP_TIMEOUT_MS,
     inactivityMs: 180_000,
     run: async (page, ctx) => {
       const key = idempotencyKey(ctx);
@@ -363,7 +378,7 @@ export const LAST_STEP_INDEX: number = (() => {
   if (i < 0) {
     throw new Error(
       `LAST_STEP in steps.ts is "${LAST_STEP}", which is not a step key. ` +
-        `Use one of: ${STEPS.map((s) => s.key).join(", ")}`,
+      `Use one of: ${STEPS.map((s) => s.key).join(", ")}`,
     );
   }
   return i;

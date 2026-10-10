@@ -15,7 +15,24 @@ export interface BasketItem {
 }
 export interface CheckoutEvidence { items: BasketItem[]; address: string }
 export interface OrderEvidence { id: string; placedAt: string | null; items: BasketItem[]; cancelled: boolean }
-const normalized = (text: string) => text.toLowerCase().replace(/[^a-z0-9]/g, "");
+/**
+ * Amazon prints some titles with their HTML codes left in ("POND&#39;S" on the
+ * review page, 2026-10-10): decoded first, or "pond39s" never matches "ponds".
+ */
+export function decodeEntities(text: string): string {
+  const named: Record<string, string> = { amp: "&", quot: '"', apos: "'", lt: "<", gt: ">", nbsp: " " };
+  let out = text;
+  // Twice: "&amp;#39;" is "&#39;" once decoded.
+  for (let i = 0; i < 2; i++) {
+    out = out
+      .replace(/&#(\d+);/g, (_, n: string) => String.fromCodePoint(Number(n)))
+      .replace(/&#x([0-9a-f]+);/gi, (_, n: string) => String.fromCodePoint(parseInt(n, 16)))
+      .replace(/&([a-z]+);/gi, (m, n: string) => named[n.toLowerCase()] ?? m);
+  }
+  return out;
+}
+
+const normalized = (text: string) => decodeEntities(text).toLowerCase().replace(/[^a-z0-9]/g, "");
 
 export function basketError(expected: BasketItem[], actual: BasketItem[]): string | null {
   if (!expected.length || expected.some(i => !i.sku || !i.title || !Number.isInteger(i.quantity) || i.quantity < 1)) return "expected basket identity is incomplete";
@@ -115,7 +132,7 @@ export async function readReviewShipments(page: Page): Promise<Shipment[]> {
       }
       const qty = lines[i]!.match(/^Change quantity of (.+)$/i);
       if (qty && cur) {
-        const title = qty[1]!.replace(/&amp;(?:amp;)*/g, "&").trim();
+        const title = qty[1]!.trim();
         cur.items.push({ title, quantity: Number(lines[i + 1] ?? NaN) });
       }
     }

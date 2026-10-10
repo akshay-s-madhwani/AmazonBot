@@ -5,8 +5,16 @@ export const SEL = {
 
   password: ["#ap_password", 'input[type="password"]:not([class*="hide"])'],
 
-  otp: ["#auth-mfa-otpcode", 'input[name="otpCode"]', 'input[type="tel"]'],
-  otpSubmit: ["#auth-signin-button", 'input[type="submit"]'],
+  otp: [
+    "#auth-mfa-otpcode",
+    'input[name="otpCode"]',
+    'input[autocomplete="one-time-code"]',
+    'input[name*="otp" i]',
+    'input[id*="otp" i]',
+    'input[type="tel"]',
+  ],
+  /** Each sign-in screen's own button, old /ap and new /ax/claim pages alike. */
+  submit: ["#signInSubmit", "#continue", "#auth-signin-button", "#cvf-submit-otp-button"],
 
   cvfCode: ["#cvf-input-code"],
   cvfSubmit: ["#cvf-submit-otp-button", 'input[type="submit"]'],

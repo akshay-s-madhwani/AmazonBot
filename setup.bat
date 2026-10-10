@@ -15,7 +15,7 @@ echo   Bot machine setup
 echo  ===========================================================
 echo.
 
-rem ---- Node.js 20.6+ -- installed through nvm for Windows when missing/too old --
+rem ---- Node.js 22+ -- installed through nvm for Windows when missing/too old --
 rem An nvm install from an earlier run may not be on this window's PATH yet.
 call :find_nvm
 if defined NVM_SYMLINK if exist "!NVM_SYMLINK!\node.exe" set "PATH=!NVM_SYMLINK!;!PATH!"
@@ -31,6 +31,12 @@ if errorlevel 1 (
   )
 )
 echo  [ok] Node.js !NODE_V!
+
+rem Webhook updates require Git even when the packages folder already exists.
+where git >nul 2>nul
+if errorlevel 1 call :install_git
+where git >nul 2>nul || goto :failed
+git rev-parse --is-inside-work-tree >nul 2>nul || goto :failed
 
 rem ---- the shared packages (a git submodule) ---------------------------------
 if not exist "packages\contracts\package.json" (
@@ -98,9 +104,16 @@ move /y "bot\.env.tmp" "bot\.env" >nul
 echo  [ok] MASTER_URL written to bot\.env
 
 rem ---- this machine's node id -> bot\.node-id ----------------------------------
-rem Always asked; Enter takes the machine name. This is the bot id the machine
-rem is approved as. A copied folder's approval for another id is discarded by
-rem the bot at start, and an id already in use is rejected by the master.
+rem Kept without asking when this machine is already approved as bot\.node-id
+rem (scripts\approved-node-id.mjs). Otherwise asked; Enter takes the machine
+rem name. A copied folder's approval for another id is discarded by the bot at
+rem start, and an id already in use is rejected by the master.
+set "NODE_ID_APPROVED="
+for /f "delims=" %%i in ('node scripts\approved-node-id.mjs 2^>nul') do set "NODE_ID_APPROVED=%%i"
+if defined NODE_ID_APPROVED (
+  echo  [ok] node id: !NODE_ID_APPROVED! ^(already approved^)
+  goto :node_id_done
+)
 set "NODE_ID_CURRENT="
 if exist "bot\.node-id" set /p NODE_ID_CURRENT=<"bot\.node-id"
 if defined NODE_ID_CURRENT echo  current node id: !NODE_ID_CURRENT!
@@ -118,6 +131,7 @@ if errorlevel 1 (
 )
 > "bot\.node-id" echo !NODE_ID_IN!
 echo  [ok] node id: !NODE_ID_IN!
+:node_id_done
 
 rem ---- install + build, in dependency order -------------------------------------
 echo.
@@ -136,13 +150,11 @@ if not exist "browser-profiles" mkdir "browser-profiles"
 echo  [ok] profile store: %CD%\browser-profiles
 popd
 
+call npm install --global pm2@6.0.14 --no-audit --no-fund || goto :failed
+rem Creates/validates deploy.env, prompts for missing credentials, and registers startup.
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\install-startup.ps1 || goto :failed
 > "start.bat" echo @echo off
->> "start.bat" echo if defined NVM_SYMLINK set "PATH=%%NVM_SYMLINK%%;%%PATH%%"
->> "start.bat" echo cd /d "%%~dp0bot"
->> "start.bat" echo title Bot
->> "start.bat" echo start "" http://127.0.0.1:7800
->> "start.bat" echo node dist\manager.js
->> "start.bat" echo pause
+>> "start.bat" echo call "%%~dp0run-manager.bat"
 echo  [ok] created start.bat for future starts
 
 echo.
@@ -158,10 +170,10 @@ echo  ===========================================================
 echo.
 
 start "" http://127.0.0.1:7800
-cd /d "%~dp0bot"
-node dist\manager.js
+call pm2 start ecosystem.config.cjs || goto :failed
+call pm2 save || goto :failed
 echo.
-echo  The bot has stopped. Run start.bat to start it again.
+echo  The bot is managed by PM2. Use stop-manager.bat to stop it.
 pause
 exit /b 0
 
@@ -176,12 +188,12 @@ exit /b 0
 
 rem ---- Node.js helpers --------------------------------------------------------
 
-rem errorlevel 0 when node is on PATH and is 20.6 or newer; NODE_V = its version.
+rem errorlevel 0 when node is on PATH and is 22 or newer; NODE_V = its version.
 :check_node
 set "NODE_V="
 where node >nul 2>nul || exit /b 1
 for /f "tokens=*" %%v in ('node -v') do set "NODE_V=%%v"
-node -e "const [a,b]=process.versions.node.split('.').map(Number);process.exit(a>20||(a===20&&b>=6)?0:1)" || exit /b 1
+node -e "process.exit(Number(process.versions.node.split('.')[0])>=22?0:1)" || exit /b 1
 exit /b 0
 
 rem Sets NVM_HOME / NVM_SYMLINK (env, then registry, then nvm's defaults) and
@@ -263,7 +275,7 @@ where curl.exe >nul 2>nul && (
 powershell -NoProfile -ExecutionPolicy Bypass -Command "[Net.ServicePointManager]::SecurityProtocol='Tls12'; $ProgressPreference='SilentlyContinue'; Invoke-WebRequest -UseBasicParsing '%~1' -OutFile '%~2'" && exit /b 0
 exit /b 1
 
-rem Git, only for fetching the packages submodule. Needs winget.
+rem Git for webhook updates and the packages submodule. Needs winget.
 :install_git
 where winget >nul 2>nul || exit /b 0
 echo  ... installing Git ^(approve the Windows prompt^)

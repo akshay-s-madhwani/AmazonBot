@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { basketError, checkoutError, matchingOrder, newOrdersFor, ordersByName, reviewBasket, reviewError, type OrderEvidence } from "./purchase-evidence.js";
+import { basketError, checkoutError, matchingOrder, newOrdersFor, ordersByName, reviewBasket, reviewError, decodeEntities, type OrderEvidence } from "./purchase-evidence.js";
 import { acceptRun, wasRunAccepted } from "./start-registry.js";
 import { FleetLink, type FleetHooks } from "./fleet.js";
 import { resumeStep, inputsChanged } from "./resume-inputs.js";
@@ -15,7 +15,8 @@ import { addressKey, targetKey } from "./address.js";
 import { checkoutAddressKey, fitSharesToCart, matchBasketItem, planRowAction, sheetAddressKey } from "./checkout.js";
 import { allocate, parseItemsQuantity, placeFreeItems } from "./allocation.js";
 import { planVouchers } from "./vouchers.js";
-import { parseAccountProxy } from "./proxy.js";
+import { createServer, type AddressInfo } from "node:net";
+import { parseAccountProxy, proxyUnreachable } from "./proxy.js";
 import { fleetProcesses, orphans } from "./procs.js";
 
 const basket = [{ sku: "B012345678", quantity: 2, title: "Test product" }];
@@ -278,11 +279,25 @@ test("Multi-address rows: one row per address, at that address's share", () => {
   assert.match(planRowAction([], keys, [[8, 0]]) as string, /item 1 is not on the multi-address page/);
 });
 
-test("Multi-address rows match basket items by ASIN, else by title", () => {
+test("Multi-address rows match basket items by title, else by ASIN", () => {
   const basket = [{ sku: "B0FY6KL849", title: lamp, quantity: 3 }, { sku: "B0CKZ7MBBT", title: study, quantity: 1 }];
-  assert.equal(matchBasketItem({ item: "anything", asin: "b0ckz7mbbt" }, basket), 1);
-  assert.equal(matchBasketItem({ item: "XECH Quest PRO Table Lamp with 15W…", asin: null }, basket), 0);
-  assert.equal(matchBasketItem({ item: "FREE Delivery Tomorrow", asin: null }, basket), -1);
+  assert.equal(matchBasketItem({ item: "anything", asins: ["b0ckz7mbbt"] }, basket), 1);
+  assert.equal(matchBasketItem({ item: "XECH Quest PRO Table Lamp with 15W…", asins: [] }, basket), 0);
+  assert.equal(matchBasketItem({ item: "FREE Delivery Tomorrow", asins: [] }, basket), -1);
+  // 2026-10-09: the Santoor card carried the free shampoo's ASIN; its title still says Santoor.
+  const santoor = {
+    sku: "B08K95SV28",
+    title: "Santoor Fresh Skin Aloe Vera & Lime Bathing Soap with Nourishing & Anti-Aging Properties| 125g, Pack of 6",
+    quantity: 5,
+  };
+  const shampoo = { sku: "B0D6BNL45S", title: "WishCare Multi Peptide Anti Hairfall Shampoo - Rice Water, Rosemary", quantity: 1, free: true };
+  const row = "Santoor Fresh Skin Aloe Vera & Lime Bathing Soap with";
+  assert.equal(matchBasketItem({ item: row, asins: ["B0D6BNL45S"] }, [santoor, shampoo]), 0);
+  assert.equal(matchBasketItem({ item: row, asins: ["B0D6BNL45S", "B08K95SV28"] }, [santoor, shampoo]), 0);
+  // A title that fits two basket items: the ASIN picks between them.
+  const twin = { ...santoor, sku: "B08K95SV29" };
+  assert.equal(matchBasketItem({ item: row, asins: ["B08K95SV29"] }, [santoor, twin]), 1);
+  assert.equal(matchBasketItem({ item: row, asins: [] }, [santoor, twin]), -1);
 });
 
 const nhdi = { fullName: "nhdi naman jain", phone: "", pincode: "521333", line1: "1-66/86",
@@ -404,6 +419,25 @@ test("Proxy: http://host:port, bare host:port means http, anything else refuses"
   assert.throws(() => parseAccountProxy("ftp://10.0.0.1:21"));
 });
 
+test("Proxy check: CONNECT with the account's user:pass, a 407 is a bad proxy", async () => {
+  const server = createServer((sock) => {
+    sock.once("data", (req) => {
+      const ok = req.toString().includes(`Proxy-Authorization: Basic ${Buffer.from("u:p@ss").toString("base64")}`);
+      sock.end(ok ? "HTTP/1.1 200 Connection established\r\n\r\n" : "HTTP/1.1 407 Proxy Authentication Required\r\n\r\n");
+    });
+  });
+  await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+  const port = (server.address() as AddressInfo).port;
+  try {
+    assert.equal(await proxyUnreachable(parseAccountProxy(`http://u:p%40ss@127.0.0.1:${port}`)!), null);
+    assert.match((await proxyUnreachable(parseAccountProxy(`http://u:wrong@127.0.0.1:${port}`)!))!, /407/);
+    assert.match((await proxyUnreachable(parseAccountProxy(`127.0.0.1:${port}`)!))!, /407/);
+  } finally {
+    server.close();
+  }
+  assert.ok(await proxyUnreachable(parseAccountProxy(`127.0.0.1:${port}`)!, 2_000));
+});
+
 test("Your Orders: every new order matched to its address by Ship to name, exactly", () => {
   const addr = (fullName: string) => ({ fullName, phone: "", pincode: "521139", line1: "x", line2: "", landmark: "",
     city: "", state: "", country: "India" });
@@ -460,4 +494,12 @@ test("Cleanup: finds this folder's slots, runners and browsers; orphans are the 
     { pid: 6, ppid: 1, cmd: "/Users/a/Library/shardx/Chromium.app/Contents/MacOS/Chromium --user-data-dir=/Users/a/AmazonBot/bot/browser-profiles/run-ccc" },
   ], mac);
   assert.deepEqual(macFleet.map((p) => [p.kind, p.runId ?? p.profileId]), [["runner", "run-x"], ["browser", "run-ccc"]]);
+});
+
+test("Pre-purchase titles: HTML codes Amazon leaves in a title still match", () => {
+  const t = { fullName: "lokesh 117", phone: "", pincode: "521333", line1: "117 amazon kaikaluru", line2: "", landmark: "", city: "", state: "", country: "India" };
+  const basket = [{ sku: "B0X", title: "POND'S Dreamflower Floral Perfumed Powder With Floral Fragrance", quantity: 1 }];
+  const ship = [{ key: sheetAddressKey(t), name: "lokesh 117", items: [{ title: "POND&#39;S Dreamflower Floral Perfumed Powder With Floral Fragrance", quantity: 1 }] }];
+  assert.equal(reviewError(basket, [t], ship), null);
+  assert.equal(decodeEntities("POND&amp;#39;S &amp; Co"), "POND'S & Co");
 });

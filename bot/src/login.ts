@@ -1,5 +1,5 @@
 import type { Credentials } from "./config.js";
-import { pause, shortPause, sleep } from "./human.js";
+import { pause, rand, shortPause, sleep } from "./human.js";
 import type { Locator, Page } from "./pw.js";
 import { SEL, anyPresent, firstLocator } from "./selectors.js";
 import { generate as totp } from "./totp.js";
@@ -46,6 +46,10 @@ export type LoginStep =
   | "passkey_nudge"
   | "continue_shopping"
   | "logged_in"
+  /** An Amazon page whose nav reads "Hello, sign in". */
+  | "signed_out"
+  /** Amazon's "Account locked temporarily" page (locked for misuse): blocked. */
+  | "locked"
   | "unknown";
 
 const SIDE_EFFECT_STEPS: readonly LoginStep[] = ["passkey_nudge", "continue_shopping"];
@@ -58,7 +62,77 @@ const SIDE_EFFECT_STEPS: readonly LoginStep[] = ["passkey_nudge", "continue_shop
 const MAX_REPEATS = (step: LoginStep): number => (SIDE_EFFECT_STEPS.includes(step) ? 3 : 2);
 const CODE_STEPS: readonly LoginStep[] = ["otp", "cvf"];
 
-export type LoginResult = { ok: true } | { ok: false; reason: string };
+export type LoginResult =
+  | { ok: true }
+  | {
+      ok: false;
+      reason: string;
+      /** Amazon showed a sign-in screen (or any page it recognises): the proxy works. */
+      reachedSignIn: boolean;
+      /** Signed out right after the password went in: the account is blocked. */
+      blocked?: boolean;
+      /** Amazon sent the sign-in to a signed-out page (e.g. its 503 link) before the password. */
+      refused?: boolean;
+      /** Signed in, but to an Amazon Business account: never ordered from. */
+      business?: boolean;
+    };
+
+const HOME_URL = "https://www.amazon.in/";
+/** How long the signed-in nav ("Hello, <name>") gets to show. */
+const GREETING_WAIT_MS = envMs("LOGIN_GREETING_WAIT_MS", 30_000);
+const BLOCKED_REASON = 'account blocked: Amazon shows "Hello, sign in" after sign-in';
+const LOCKED_REASON = 'account blocked: Amazon shows "Account locked temporarily" (locked for misuse)';
+
+const BUSINESS_REASON = 'business account: Amazon shows "Account for Your Business" after sign-in';
+
+/**
+ * An Amazon Business account (user, 2026-10-09): the nav's account link reads
+ * "Account for Your Business" (not "Account & Lists") and the logo is
+ * "amazon business". The run is cancelled, never ordered from.
+ *
+ * The business nav is a different one (ABNavDesktop): no
+ * #nav-link-accountList-nav-line-1, so the "Hello, <name>" read never saw a
+ * name and login failed "no Hello, <name> in the nav" instead (2026-10-09).
+ * Hence read before the greeting, by what the page shows anywhere up top:
+ * the title "Amazon Business", "Account for Your Business", the business
+ * nav's own assets.
+ */
+async function isBusinessAccount(page: Page): Promise<boolean> {
+  return page
+    .evaluate(() => {
+      const read = (sel: string) => {
+        const el = document.querySelector(sel) as HTMLElement | null;
+        return el ? `${el.innerText ?? ""} ${el.getAttribute("aria-label") ?? ""}` : "";
+      };
+      if (/for your business/i.test(read("#nav-link-accountList")) || /amazon business/i.test(read("#nav-logo"))) return true;
+      if (/^\s*amazon business\s*$/i.test(document.title)) return true;
+      const top = (document.body?.innerText ?? "").slice(0, 3000);
+      if (/account for your business/i.test(top)) return true;
+      return [...document.querySelectorAll('link[rel="stylesheet"], script[src]')].some((e) =>
+        /AUIClients\/(ABNavDesktop|BusinessHomepageAssets)/.test(e.getAttribute("href") ?? e.getAttribute("src") ?? ""),
+      );
+    })
+    .catch(() => false);
+}
+
+/**
+ * Amazon's lock page (2026-10-09): title and alert heading "Account locked
+ * temporarily", "Your account has been locked for misuse of Amazon's
+ * services." No nav, so it is read by its text, whatever its URL.
+ */
+async function onLockedPage(page: Page): Promise<boolean> {
+  return page
+    .evaluate(() => {
+      const text = (sel: string) =>
+        [...document.querySelectorAll(sel)].map((n) => (n as HTMLElement).innerText ?? "").join(" ");
+      return (
+        /account locked/i.test(document.title) ||
+        /account locked/i.test(text(".a-alert-heading")) ||
+        /locked for misuse/i.test(text(".a-alert-content"))
+      );
+    })
+    .catch(() => false);
+}
 
 function isLoggedInUrl(rawUrl: string): boolean {
   try {
@@ -72,14 +146,20 @@ function isLoggedInUrl(rawUrl: string): boolean {
   }
 }
 
-/** The nav greeting, when the page has one: "Hello, sign in" means signed out. */
-async function greetingSaysSignedOut(page: Page): Promise<boolean> {
+/**
+ * The nav greeting: "name" for "Hello, <name>", "signed_out" for "Hello,
+ * sign in", "missing" when the page has none (yet).
+ */
+async function readGreeting(page: Page): Promise<"name" | "signed_out" | "missing"> {
   return page
     .evaluate(() => {
-      const el = document.querySelector("#nav-link-accountList-nav-line-1, #glow-ingress-line1");
-      return !!el && /sign in/i.test((el as HTMLElement).innerText ?? "");
+      const read = (sel: string) =>
+        ((document.querySelector(sel) as HTMLElement | null)?.innerText ?? "").replace(/\s+/g, " ").trim();
+      const line = read("#nav-link-accountList-nav-line-1") || read("#nav-link-accountList .nav-line-1");
+      if (/sign in/i.test(line) || /sign in/i.test(read("#glow-ingress-line1"))) return "signed_out" as const;
+      return /^hello\b/i.test(line) ? ("name" as const) : ("missing" as const);
     })
-    .catch(() => false);
+    .catch(() => "missing" as const);
 }
 
 /**
@@ -90,25 +170,85 @@ export async function detectStep(page: Page): Promise<LoginStep> {
   try {
     const url = page.url();
 
+    if (await onLockedPage(page)) return "locked";
+
     if (url.includes("/webauthn/nudge") || url.includes("passkeyNudgeArb")) return "passkey_nudge";
 
     if (url.includes("/ap/cvf") || (await anyPresent(page, SEL.cvfCode))) return "cvf";
 
     if (await hasContinueShopping(page)) return "continue_shopping";
 
-    const title = await page.title().catch(() => "");
-    if (url.includes("/ap/mfa") || title.includes("Two-Step") || (await anyPresent(page, ["#auth-mfa-otpcode"]))) {
-      return "otp";
-    }
+    if (url.includes("/ap/mfa") || (await onOtpScreen(page))) return "otp";
 
-    if (await anyPresent(page, ["#ap_password"])) return "password";
+    if (await anyVisible(page, SEL.password)) return "password";
     if (await anyPresent(page, SEL.email)) return "email";
 
-    if (isLoggedInUrl(url) && !(await greetingSaysSignedOut(page))) return "logged_in";
+    if (isLoggedInUrl(url)) return (await readGreeting(page)) === "signed_out" ? "signed_out" : "logged_in";
     return "unknown";
   } catch {
     return "unknown";
   }
+}
+
+/** A visible match for any of the selectors (a hidden password input is not a password page). */
+async function anyVisible(page: Page, selectors: readonly string[]): Promise<boolean> {
+  for (const sel of selectors) {
+    if ((await page.locator(sel).filter({ visible: true }).count().catch(() => 0)) > 0) return true;
+  }
+  return false;
+}
+
+/**
+ * The 2-Step Verification screen. The new /ax/claim/auth one has its own
+ * URL and field, so it is also known by its heading.
+ */
+async function onOtpScreen(page: Page): Promise<boolean> {
+  const title = await page.title().catch(() => "");
+  if (/two-step|2-step/i.test(title)) return true;
+  if (await anyVisible(page, ["#auth-mfa-otpcode", 'input[name="otpCode"]', 'input[autocomplete="one-time-code"]'])) {
+    return true;
+  }
+  return page
+    .evaluate(() => /(2|two)-step verification/i.test((document.querySelector("h1") as HTMLElement | null)?.innerText ?? ""))
+    .catch(() => false);
+}
+
+/** The OTP field: a known one, else the only text-like box on the 2-Step screen. */
+async function otpField(page: Page): Promise<Locator | null> {
+  for (const sel of [...SEL.otp, 'input[type="text"]', 'input[type="number"]', "input:not([type])"]) {
+    const loc = page.locator(sel).filter({ visible: true }).first();
+    if ((await loc.count()) > 0) return loc;
+  }
+  return null;
+}
+
+/** Types like a person: Amazon's sign-in pages watch the key presses. */
+async function typeInto(input: Locator, text: string): Promise<void> {
+  await input.click();
+  await input.fill("");
+  await input.pressSequentially(text, { delay: rand(60, 120) });
+}
+
+/**
+ * Submits a sign-in screen the way a person does: a real click on its own
+ * button, else Enter in the field. Never form.submit(): that skips the page's
+ * submit handler, and the new /ax/claim pages then just show the same step
+ * again with the field empty (2026-10-09).
+ */
+async function submitStep(page: Page, input: Locator): Promise<void> {
+  const form = input.locator("xpath=ancestor::form[1]");
+  const scope = (await form.count()) > 0 ? form : page.locator("body");
+  for (const sel of [...SEL.submit, 'input[type="submit"]', 'button[type="submit"]']) {
+    const btn = scope.locator(sel).filter({ visible: true }).first();
+    if ((await btn.count()) === 0) continue;
+    try {
+      await btn.click({ timeout: 10_000 });
+      return;
+    } catch {
+      break;
+    }
+  }
+  await input.press("Enter");
 }
 
 async function hasContinueShopping(page: Page): Promise<boolean> {
@@ -167,14 +307,6 @@ async function settled(page: Page): Promise<boolean> {
   return page.evaluate(() => document.readyState === "complete").catch(() => false);
 }
 
-async function submitEnclosingForm(input: Locator): Promise<void> {
-  await input.evaluate((el) => {
-    const form = (el as HTMLElement).closest("form") ?? document.querySelector("form");
-    if (!form) throw new Error("Sign-in form not found");
-    (form as HTMLFormElement).submit();
-  });
-}
-
 /**
  * A TOTP code with time left to be typed, submitted and checked on a slow
  * machine, and never `avoid` (the code already tried: Amazon refuses a reuse).
@@ -194,9 +326,9 @@ async function handleEmail(page: Page, email: string): Promise<void> {
   await pause("email step");
   const input = await firstLocator(page, SEL.email);
   if (!input) throw new Error("email field not found");
-  await input.fill(email);
+  await typeInto(input, email);
   await shortPause();
-  await submitEnclosingForm(input);
+  await submitStep(page, input);
 }
 
 /** Fixed, not scaled by BOT_PACE: a password typed the instant the page appears gets bounced. */
@@ -205,24 +337,22 @@ const PASSWORD_WAIT_MS = 3_000;
 async function handlePassword(page: Page, password: string): Promise<void> {
   console.log(`[bot] waiting ${PASSWORD_WAIT_MS / 1000}s (password step)`);
   await sleep(PASSWORD_WAIT_MS);
-  const input = await firstLocator(page, SEL.password);
-  if (!input) throw new Error("password field not found");
-  await input.fill(password);
+  const input = page.locator(SEL.password.join(", ")).filter({ visible: true }).first();
+  if ((await input.count()) === 0) throw new Error("password field not found");
+  await typeInto(input, password);
   await shortPause();
-  await submitEnclosingForm(input);
+  await submitStep(page, input);
 }
 
 async function handleOtp(page: Page, secret: string, lastCode: string | null): Promise<string> {
   if (!secret) throw new Error("TOTP secret not configured (AMAZON_TOTP_SECRET)");
   await pause("otp step");
-  const input = await firstLocator(page, SEL.otp);
+  const input = await otpField(page);
   if (!input) throw new Error("OTP field not found");
   const code = await freshCode(secret, lastCode);
-  await input.fill(code);
+  await typeInto(input, code);
   await shortPause();
-  const btn = await firstLocator(page, SEL.otpSubmit);
-  if (!btn) throw new Error("OTP submit button not found");
-  await btn.dispatchEvent("click");
+  await submitStep(page, input);
   return code;
 }
 
@@ -232,9 +362,9 @@ async function handleCvf(page: Page, secret: string, lastCode: string | null): P
   const input = await firstLocator(page, SEL.cvfCode);
   if (!input) throw new Error("CVF code field not found");
   const code = await freshCode(secret, lastCode);
-  await input.fill(code);
+  await typeInto(input, code);
   await shortPause();
-  await submitEnclosingForm(input);
+  await submitStep(page, input);
   return code;
 }
 
@@ -264,7 +394,7 @@ async function waitForActionableStep(
   while (Date.now() < deadline) {
     const step = await detectStep(page);
     last = step;
-    if (step === "logged_in") return { step, error: null };
+    if (step === "logged_in" || step === "locked") return { step, error: null };
     if (step !== previous && step !== "unknown") {
       if (candidate === step) return { step, error: null };
       candidate = step;
@@ -309,15 +439,59 @@ async function gotoSignIn(page: Page): Promise<void> {
   }
 }
 
+/**
+ * SIGNED IN = the nav reads "Hello, <name>" (user, 2026-10-09). A blocked
+ * account lands on Amazon after the OTP but reads "Hello, sign in". Read on
+ * the page login ended on, else on the home page.
+ */
+async function confirmGreeting(page: Page): Promise<LoginResult> {
+  for (const where of ["here", "home"] as const) {
+    if (where === "home") {
+      console.log("[bot] no nav greeting on this page — reading it on the home page");
+      await page.goto(HOME_URL, { waitUntil: "domcontentloaded", timeout: NAV_TIMEOUT_MS }).catch(() => { });
+    }
+    const deadline = Date.now() + GREETING_WAIT_MS;
+    let signedOutReads = 0;
+    while (Date.now() < deadline) {
+      if (await onLockedPage(page)) return { ok: false, reason: LOCKED_REASON, reachedSignIn: true, blocked: true };
+      // Before the greeting: the business nav has no "Hello, <name>" for it to find.
+      if (await isBusinessAccount(page)) {
+        return { ok: false, reason: BUSINESS_REASON, reachedSignIn: true, business: true };
+      }
+      const greeting = await readGreeting(page);
+      if (greeting === "name") {
+        console.log("[bot] nav reads \"Hello, <name>\" — signed in");
+        return { ok: true };
+      }
+      signedOutReads = greeting === "signed_out" ? signedOutReads + 1 : 0;
+      if (signedOutReads >= 2) return { ok: false, reason: BLOCKED_REASON, reachedSignIn: true, blocked: true };
+      await sleep(1_000);
+    }
+  }
+  // Final (failures.ts sign_in_unconfirmed): browser closed, row CANCELLED.
+  return { ok: false, reason: `sign-in not confirmed: no "Hello, <name>" in the nav at ${page.url()}`, reachedSignIn: true };
+}
+
 export async function runLogin(page: Page, creds: Credentials): Promise<LoginResult> {
+  const r = await signIn(page, creds);
+  return r.ok ? confirmGreeting(page) : r;
+}
+
+async function signIn(page: Page, creds: Credentials): Promise<LoginResult> {
   page.setDefaultTimeout(NAV_TIMEOUT_MS);
-  await gotoSignIn(page);
+  try {
+    await gotoSignIn(page);
+  } catch (err) {
+    return { ok: false, reason: (err as Error).message.split("\n")[0] ?? "sign-in page did not load", reachedSignIn: false };
+  }
   await pause("signin page loaded");
 
   const startedAt = Date.now();
   const handled: Partial<Record<LoginStep, number>> = {};
   let previous: LoginStep | null = null;
   let lastCode: string | null = null;
+  /** Any page Amazon serves that login recognises — the proxy got through. */
+  let reachedSignIn = false;
 
   const fail = async (reason: string): Promise<LoginResult> => {
     console.log(`[bot] login looks failed (${reason}) — checking whether it signed in anyway`);
@@ -326,7 +500,13 @@ export async function runLogin(page: Page, creds: Credentials): Promise<LoginRes
       await pause("login complete");
       return { ok: true };
     }
-    return { ok: false, reason };
+    const now = await detectStep(page);
+    if (now === "locked") return { ok: false, reason: LOCKED_REASON, reachedSignIn: true, blocked: true };
+    // Password in, then an Amazon page that says "Hello, sign in": blocked.
+    if (handled.password && now === "signed_out") {
+      return { ok: false, reason: BLOCKED_REASON, reachedSignIn: true, blocked: true };
+    }
+    return { ok: false, reason, reachedSignIn };
   };
 
   for (let i = 0; i < MAX_TRANSITIONS; i++) {
@@ -336,10 +516,19 @@ export async function runLogin(page: Page, creds: Credentials): Promise<LoginRes
 
     const { step, error } = await waitForActionableStep(page, previous);
     console.log(`[bot] step: ${step}  (${page.url()})${error ? ` — error: ${error}` : ""}`);
+    if (step !== "unknown") reachedSignIn = true;
 
     if (step === "logged_in") {
       await pause("login complete");
       return { ok: true };
+    }
+    if (step === "locked") {
+      return { ok: false, reason: LOCKED_REASON, reachedSignIn: true, blocked: true };
+    }
+    if (step === "signed_out") {
+      if (handled.password) return fail(BLOCKED_REASON);
+      const r = await fail(`signed out on ${page.url()} before the password step`);
+      return r.ok ? r : { ...r, refused: true };
     }
     if (step === "unknown") {
       return fail((await readError(page)) ?? `unrecognised page: ${page.url()}`);

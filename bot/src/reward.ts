@@ -228,6 +228,50 @@ function signedOut(tab: Page): boolean {
   return /\/ap\/signin|\/ax\/claim/.test(tab.url());
 }
 
+/** The page is drawn signed out: its header says "Sign in", or a button "Sign-in to collect". */
+async function drawnSignedOut(tab: Page): Promise<boolean> {
+  return tab
+    .evaluate(() => {
+      const squash = (s: string) => s.replace(/\s+/g, " ").trim();
+      const shown = (e: Element) => e.getBoundingClientRect().width > 0;
+      const label = (e: Element) => squash((e as HTMLElement).innerText || (e as HTMLInputElement).value || "");
+      const header = [...document.querySelectorAll("#nav-logobar-greeting, #nav-link-accountList-nav-line-1")]
+        .filter(shown)
+        .some((e) => /^(hello, )?sign[- ]?in\b/i.test(label(e)));
+      const button = [...document.querySelectorAll("button, a, .a-button, input[type=submit]")]
+        .filter(shown)
+        .some((e) => /^sign[- ]?in to\b/i.test(label(e)));
+      return header || button;
+    })
+    .catch(() => false);
+}
+
+const SIGNED_OUT_REOPENS = 3;
+
+/**
+ * Amazon now and then draws a reward page signed out ("Sign in ›", "Sign-in
+ * to collect") with the session still good — it happens after many trips to
+ * the rewards pages (2026-10-09). Home, then the page again, up to 3 times.
+ * True when the page is (now) signed in; false when it is not, or the home
+ * page is signed out too — the session really is gone.
+ */
+async function reopenSignedIn(tab: Page, url: string): Promise<boolean> {
+  for (let i = 1; signedOut(tab) || (await drawnSignedOut(tab)); i++) {
+    if (i > SIGNED_OUT_REOPENS) return false;
+    console.log(`[bot] rewards: ${where(tab)} shows signed out — home, then the page again (${i}/${SIGNED_OUT_REOPENS})`);
+    await pause("reward page drawn signed out");
+    if (!(await goto(tab, "https://www.amazon.in/"))) return false;
+    await pause("home page loaded");
+    if (signedOut(tab) || (await drawnSignedOut(tab))) {
+      console.log("[bot] rewards: the home page is signed out too");
+      return false;
+    }
+    if (!(await goto(tab, url))) return false;
+    await pause("letting the reward page load");
+  }
+  return true;
+}
+
 /** "the home page" when Amazon sent a reward link there instead of its page, else null. */
 function sentHome(tab: Page): string | null {
   try {
@@ -948,6 +992,8 @@ export async function openTaskPage(tab: Page, button: Locator, card: TaskCard, t
 async function backToTasks(tab: Page, taskUrl: string): Promise<TaskBoard> {
   await goto(tab, taskUrl);
   await pause("back on the task page");
+  // Still signed out after the reopens: playStickers' round says so.
+  await reopenSignedIn(tab, taskUrl);
   await dismissCheckInDialog(tab);
   return waitForTasks(tab);
 }
@@ -976,7 +1022,7 @@ async function runStickers(tab: Page, r: RewardSpec): Promise<RowResult> {
   console.log(`[bot] rewards: opening the sticker tasks ${STICKERS_URL}`);
   if (!(await goto(tab, STICKERS_URL))) return { ok: false, reason: "Sticker page did not load" };
   await pause("letting the task page load");
-  if (signedOut(tab)) return SIGNED_OUT;
+  if (!(await reopenSignedIn(tab, STICKERS_URL))) return SIGNED_OUT;
   return playStickers(tab, r);
 }
 
@@ -988,13 +1034,20 @@ async function playStickers(tab: Page, r: RewardSpec): Promise<RowResult> {
   /** Products this run added for a task: never picked again, on a retry or the next card. */
   const added = new Set<string>();
   let board = await waitForTasks(tab);
+  if (board.cards.length === 0 && (signedOut(tab) || (await drawnSignedOut(tab)))) {
+    if (!(await reopenSignedIn(tab, taskUrl))) return SIGNED_OUT;
+    board = await waitForTasks(tab);
+  }
   if (board.cards.length === 0) {
     console.log(`[bot] rewards: no task cards on ${tab.url()}`);
     return { ok: false, reason: "No sticker tasks on the page" };
   }
 
   for (let round = 0; round < MAX_TASK_ROUNDS; round++) {
-    if (signedOut(tab)) return SIGNED_OUT;
+    if (signedOut(tab) || (await drawnSignedOut(tab))) {
+      if (!(await reopenSignedIn(tab, taskUrl))) return SIGNED_OUT;
+      board = await waitForTasks(tab);
+    }
     // Before anything on the board is pressed: the popup covers it.
     if (await dismissCheckInDialog(tab)) board = await readTasks(tab);
     console.log(`[bot] rewards: tasks ${describeBoard(board)}`);
@@ -1068,7 +1121,7 @@ async function runSpin(tab: Page, r: RewardSpec): Promise<RowResult> {
   console.log(`[bot] rewards: opening the spin game ${SPIN_URL}`);
   if (!(await goto(tab, SPIN_URL))) return { ok: false, reason: "Spin page did not load" };
   await pause("letting the spin wheel load");
-  if (signedOut(tab)) return SIGNED_OUT;
+  if (!(await reopenSignedIn(tab, SPIN_URL))) return SIGNED_OUT;
   // Amazon sends a game it will not show this account (campaign over, not
   // eligible) to the home page; say so rather than "unrecognised page".
   const home = sentHome(tab);
@@ -1103,25 +1156,30 @@ async function runLink(tab: Page, r: RewardSpec, url: string): Promise<RowResult
   console.log(`[bot] rewards: opening ${url}`);
   if (!(await goto(tab, url))) return { ok: false, dead: true, reason: "Reward link did not load" };
   await pause("letting the reward page load");
-  if (signedOut(tab)) return SIGNED_OUT;
+  if (!(await reopenSignedIn(tab, url))) return SIGNED_OUT;
   const home = sentHome(tab);
   if (home) {
     console.log(`[bot] rewards: ${url} opened ${home} (${tab.url()})`);
     return { ok: false, retriable: false, dead: true, reason: `Reward link opened ${home} — expired or not offered` };
   }
 
-  // The board's cards and the game's wheel can render a few seconds late.
+  // The board's cards and the game's wheel can render a few seconds late —
+  // and so can the signed-out drawing, which is reopened once more.
   let screen: Screen = { kind: "unknown", controls: [] };
-  for (const deadline = Date.now() + 15_000; ; ) {
-    if (STICKERS_NODE.test(tab.url()) || (await tab.locator(TASK_CARD).count().catch(() => 0)) > 0) {
-      console.log(`[bot] rewards: link is the sticker tasks (${where(tab)})`);
-      return playStickers(tab, r);
+  for (let pass = 0; pass < 2; pass++) {
+    for (const deadline = Date.now() + 15_000; ; ) {
+      if (STICKERS_NODE.test(tab.url()) || (await tab.locator(TASK_CARD).count().catch(() => 0)) > 0) {
+        console.log(`[bot] rewards: link is the sticker tasks (${where(tab)})`);
+        return playStickers(tab, r);
+      }
+      screen = await readScreen(tab);
+      if (screen.kind !== "unknown" || Date.now() >= deadline || (await drawnSignedOut(tab))) break;
+      await sleep(1000);
     }
-    screen = await readScreen(tab);
-    if (screen.kind !== "unknown" || Date.now() >= deadline) break;
-    await sleep(1000);
+    if (screen.kind !== "unknown" || !(signedOut(tab) || (await drawnSignedOut(tab)))) break;
+    if (!(await reopenSignedIn(tab, url))) return SIGNED_OUT;
   }
-  if (signedOut(tab)) return SIGNED_OUT;
+  if (signedOut(tab) || (await drawnSignedOut(tab))) return SIGNED_OUT;
   if (screen.kind === "unknown") {
     const text = await tab.evaluate(() => document.body?.innerText ?? "").catch(() => "");
     const expired = text.match(EXPIRED_TEXT)?.[0];
