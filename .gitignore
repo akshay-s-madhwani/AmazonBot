@@ -31,6 +31,7 @@ master/artifacts/
 # Google service-account key (PRIVATE KEY — never commit)
 fyers-trading-*.json
 *-service-account*.json
+timing-profile/
 
 # Per-machine node identity. MUST NOT be committed: every node cloning the repo
 # would inherit the same id and start running each other's sheet rows.

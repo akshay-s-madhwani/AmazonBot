@@ -5,7 +5,7 @@ import { mkdir, readFile, writeFile, rename, rm, lstat, symlink } from "node:fs/
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { unzipEntry } from "./zip.js";
-import { releaseId, runDeployment, type Release } from "./protocol.js";
+import { releaseId, runDeployment, validateWorkflowRun, type Release } from "./protocol.js";
 import { restoreRuntime, switchRuntime, validateTransaction, type Transaction } from "./runtime.js";
 
 export const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
@@ -123,14 +123,21 @@ export async function deploy(release: Release): Promise<void> {
       if (await git(["status", "--porcelain", "--untracked-files=normal"])) throw new Error("Deployment checkout has local changes");
       if (existsSync(journal)) throw new Error("An interrupted deployment needs recovery");
       const run = await (await api(release.repository, `actions/runs/${release.runId}`)).json() as any;
-      if (run.conclusion !== "success" || run.status !== "completed" || run.event !== "push" ||
-          run.head_branch !== "main" || run.head_sha !== release.sha || run.run_attempt !== release.attempt ||
-          run.path !== ".github/workflows/deploy.yml" || run.repository?.full_name !== release.repository ||
-          run.head_repository?.full_name !== release.repository) throw new Error("Unapproved workflow run");
+      const pr = release.prNumber === undefined ? undefined :
+        await (await api(release.repository, `pulls/${release.prNumber}`)).json();
+      validateWorkflowRun(release, run, pr);
       await git(["fetch", "origin", "main"]);
-      if (await git(["rev-parse", "origin/main"]) !== release.sha) throw new Error("Superseded release; only current main can deploy");
+      if (release.prNumber !== undefined) {
+        const ref = `refs/remotes/origin/deploy-pr-${release.prNumber}`;
+        await git(["fetch", "origin", `+refs/pull/${release.prNumber}/head:${ref}`]);
+        if (await git(["rev-parse", ref]) !== release.sha) throw new Error("PR changed after its build; rebuild it first");
+      } else if (await git(["rev-parse", "origin/main"]) !== release.sha) throw new Error("Superseded release; only current main can deploy");
       const oldSha = await git(["rev-parse", "HEAD"]);
-      await git(["merge-base", "--is-ancestor", oldSha, release.sha]);
+      const oldVersion = await jsonFile<{ prNumber?: number }>(versionFile);
+      // Explicit PR selection may switch branches. Main may also replace a PR
+      // deployed before a squash merge, whose commit is not an ancestor of main.
+      if (release.prNumber === undefined && oldVersion?.prNumber === undefined)
+        await git(["merge-base", "--is-ancestor", oldSha, release.sha]);
       const tree = await git(["ls-tree", release.sha, "packages"]);
       const packagesSha = /^160000 commit ([a-f0-9]{40})\tpackages$/.exec(tree)?.[1];
       if (!packagesSha) throw new Error("Missing packages submodule");
@@ -191,7 +198,8 @@ export async function deploy(release: Release): Promise<void> {
       await git(["checkout", "--detach", release.sha]);
       await git(["submodule", "update", "--init", "--recursive"]);
       await switchRuntime(ROOT, tx, () => saveJson(journal, tx));
-      await saveJson(versionFile, { sha: release.sha, runId: release.runId, attempt: release.attempt });
+      await saveJson(versionFile, { sha: release.sha, runId: release.runId, attempt: release.attempt,
+        ...(release.prNumber === undefined ? {} : { prNumber: release.prNumber }) });
       await pm2("restart");
     },
     health: () => health(release.sha),

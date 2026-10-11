@@ -29,7 +29,7 @@ const results = await Promise.allSettled(targets.map(async (target, index) => {
     try { result = await request(target, '/status'); }
     catch { /* a temporary disconnection does not mean the deployment failed */ }
   }
-  if (result.status !== 'succeeded') throw new Error(`Machine ${index + 1}: deployment ${result.status}`);
+  if (result.status !== 'succeeded') throw new Error(`Machine ${index + 1}: deployment ${result.status}${result.error ? `: ${result.error}` : ''}`);
   console.log(`Machine ${index + 1}: deployed successfully`);
 }));
 for (const result of results) if (result.status === 'rejected') console.error(result.reason.message);
