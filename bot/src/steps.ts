@@ -64,6 +64,8 @@ export interface StepContext {
   artifactsDir: string;
   /** Remove blocks: the operator aligned the checkout by hand (RunnerConfig.unblocked). */
   unblocked?: boolean;
+  /** The run was sent straight to this step (runner.ts): note_order_id only reads Your Orders. */
+  visitOnly?: boolean;
 }
 
 export function idempotencyKey(ctx: StepContext): string {
@@ -353,10 +355,16 @@ export const STEPS: StepDef[] = [
     run: async (page, ctx) => {
       const key = idempotencyKey(ctx);
       const targets = deliveryAddresses(ctx);
-      const existing = await lookUpOrders(page, ctx.artifactsDir, key, targets);
+      // Sent straight here: Your Orders only, a few looks (orders can list
+      // late), never Pay Now (user, 2026-10-11).
+      const existing = await lookUpOrders(page, ctx.artifactsDir, key, targets, ctx.visitOnly ? 3 : 1);
       if (existing.ok) {
         console.log(`[bot] Your Orders already has ${existing.detail} — taking it, no Pay Now`);
         return toResult(await recordOrders(page, key, ctx.artifactsDir, targets, existing));
+      }
+      if (ctx.visitOnly) {
+        console.log(`[bot] manual visit to note_order_id: ${existing.reason} — Pay Now not pressed`);
+        return { status: "failed", failure_code: "manual_visit_to_note_order_id", detail: "no order id found", retriable: false };
       }
       console.log(`[bot] ${existing.reason} — pressing Pay Now`);
       const placed = await runPlaceOrder(page, key, ctx.artifactsDir, targets, { unblocked: ctx.unblocked === true });
