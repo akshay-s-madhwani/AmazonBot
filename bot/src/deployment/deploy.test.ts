@@ -44,6 +44,35 @@ test("explicit PR deployment requires its current successful same-repository bui
   assert.throws(() => validateWorkflowRun(selected, { ...run, conclusion: "failure" }, pr));
   assert.throws(() => validateWorkflowRun(selected, { ...run, head_repository: { full_name: "fork/bot" } }, pr));
 });
+test("same-workflow deployment requires a successful build from this exact attempt", () => {
+  const run = { status: "in_progress", conclusion: null, head_sha: release.sha, run_attempt: 1,
+    path: ".github/workflows/deploy.yml", repository: { full_name: release.repository },
+    head_repository: { full_name: release.repository }, head_branch: "main", event: "push" };
+  const job = { name: "Build and test bot", status: "completed", conclusion: "success", run_id: release.runId, run_attempt: 1 };
+  validateWorkflowRun(release, run, undefined, [job]);
+  assert.throws(() => validateWorkflowRun(release, run));
+  for (const patch of [{ name: "Deploy bot to RDP machines" }, { status: "in_progress" },
+    { conclusion: "failure" }, { run_id: 456 }, { run_attempt: 2 }])
+    assert.throws(() => validateWorkflowRun(release, run, undefined, [{ ...job, ...patch }]));
+  for (const patch of [{ status: "queued" }, { status: "completed", conclusion: "failure" }, { run_attempt: 2 }])
+    assert.throws(() => validateWorkflowRun(release, { ...run, ...patch }, undefined, [job]));
+});
+
+test("manual PR deployment builds the selected PR while its workflow runs from main", () => {
+  const selected = { ...release, prNumber: 42 };
+  const run = { status: "in_progress", conclusion: null, head_sha: "b".repeat(40), run_attempt: 1,
+    path: ".github/workflows/deploy.yml", repository: { full_name: release.repository },
+    head_repository: { full_name: release.repository }, head_branch: "main", event: "workflow_dispatch" };
+  const jobs = [{ name: "Build and test bot", status: "completed", conclusion: "success", run_id: release.runId, run_attempt: 1 }];
+  const pr = { number: 42, state: "open", base: { ref: "main", repo: { full_name: release.repository } },
+    head: { sha: release.sha, ref: "feature", repo: { full_name: release.repository } } };
+  validateWorkflowRun(selected, run, pr, jobs);
+  assert.throws(() => validateWorkflowRun(selected, { ...run, head_branch: "feature" }, pr, jobs));
+  assert.throws(() => validateWorkflowRun(selected, { ...run, event: "push" }, pr, jobs));
+  assert.throws(() => validateWorkflowRun(selected, run, { ...pr, head: { ...pr.head, sha: run.head_sha } }, jobs));
+  assert.throws(() => validateWorkflowRun(release, run, undefined, jobs));
+});
+
 test("signed requests bind timestamp, route and body, and expire", () => {
   const secret = "s".repeat(32);
   const body = Buffer.from(JSON.stringify(release));
