@@ -1,14 +1,30 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
 
-export interface Release { repository: string; sha: string; runId: number; attempt: number }
+export interface Release { repository: string; sha: string; runId: number; attempt: number; prNumber?: number }
 export const releaseId = (r: Release): string => `${r.runId}-${r.attempt}`;
 
 export function validateRelease(value: unknown, repository: string): Release {
   const r = value as Partial<Release> | null;
   if (!r || r.repository !== repository || !/^[a-f0-9]{40}$/.test(r.sha ?? "") ||
       !Number.isSafeInteger(r.runId) || (r.runId ?? 0) < 1 ||
-      !Number.isSafeInteger(r.attempt) || (r.attempt ?? 0) < 1) throw new Error("Invalid release");
+      !Number.isSafeInteger(r.attempt) || (r.attempt ?? 0) < 1 ||
+      (r.prNumber !== undefined && (!Number.isSafeInteger(r.prNumber) || r.prNumber < 1))) throw new Error("Invalid release");
   return r as Release;
+}
+
+export function validateWorkflowRun(release: Release, run: any, pr?: any): void {
+  if (run.conclusion !== "success" || run.status !== "completed" || run.head_sha !== release.sha ||
+      run.run_attempt !== release.attempt || run.path !== ".github/workflows/deploy.yml" ||
+      run.repository?.full_name !== release.repository || run.head_repository?.full_name !== release.repository)
+    throw new Error("Unapproved workflow run");
+  if (release.prNumber !== undefined) {
+    if (run.event !== "pull_request" || pr?.number !== release.prNumber || pr.state !== "open" ||
+        pr.base?.ref !== "main" || pr.base?.repo?.full_name !== release.repository ||
+        pr.head?.repo?.full_name !== release.repository || pr.head.sha !== release.sha || pr.head.ref !== run.head_branch)
+      throw new Error("PR is closed, changed, from a fork, or does not match this build");
+  } else if (!["push", "workflow_dispatch"].includes(run.event) || run.head_branch !== "main") {
+    throw new Error("Only main builds or explicitly selected PR builds can deploy");
+  }
 }
 
 export function signature(secret: string, timestamp: string, path: string, body: Buffer): string {

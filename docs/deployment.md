@@ -32,13 +32,40 @@ after moving the checkout or changing the Node installation.
 ```
 
 - Each machine's `DEPLOY_GITHUB_TOKEN`: Actions read on the bot repo. This is
-  separate from the credentials Git uses to fetch bot and packages.
+  separate from the credentials Git uses to fetch bot and packages. Also grant
+  **Pull requests: Read** when enabling PR deployments.
 - Packages repo `BOT_UPDATE_TOKEN`: Contents read on packages, Contents and Pull
   requests write on bot. Optional variable `BOT_REPOSITORY` overrides its default.
 
 Protect `main` and require build checks. Packages merges build/test packages and
 open a bot submodule-update PR. Merging the bot PR builds its pinned packages and
 bot, then notifies machines after success. Artifacts are retained for 30 days.
+
+## Deploy main or choose a PR
+
+- A successful `main` build automatically starts **Deploy bot to machines**.
+  It creates an `rdp-fleet` GitHub deployment and records success/failure after
+  waiting for the machines. Check this workflow as well as **Build bot**.
+- To deploy a PR, open **Actions → Deploy bot to machines → Run workflow**,
+  select workflow branch **main**, enter its number in **pr_number**, and run.
+  Leave the field empty to deploy the latest successful build of current main.
+- The PR must be open, originate in this repo, target main, and have a successful
+  build of its latest head commit. Fork PRs and stale/failed builds are rejected.
+  The PR is deployed to the **same machines in DEPLOY_TARGETS**, not a preview fleet.
+- PR builds now upload deployable artifacts. Rerun the PR build if its previous
+  run used the old workflow. A missing artifact or build fails with an explicit
+  explanation rather than silently finishing without deploying.
+- Merge these workflow changes to main once so GitHub registers the deployment
+  trigger and manual input. GitHub only enables `workflow_run` and the manual
+  Run workflow UI when their workflow exists on the default branch.
+- Update/rebuild the receiver on every RDP and run `pm2 restart deploy-webhook`
+  once before the first PR deployment: older receivers only accept main builds.
+  Ensure its token has Pull requests read access. Restart only when no deployment
+  is running. Future main deployments can replace a PR even after squash merging.
+
+The existing HTTPS requirement still applies. Registering a deployment in GitHub
+does not make an unreachable or HTTP-only receiver reachable over HTTPS.
+See [GitHub workflow triggers](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows).
 
 ## Daily commands
 

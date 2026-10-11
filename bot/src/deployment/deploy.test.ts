@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { signature, validateRelease, verify, runDeployment, type DeploymentSteps } from "./protocol.js";
+import { signature, validateRelease, verify, runDeployment, validateWorkflowRun, type DeploymentSteps } from "./protocol.js";
 import { validateBuild } from "./deploy.js";
 import { mkdtemp, mkdir, writeFile, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -11,6 +11,39 @@ import { once } from "node:events";
 import type { AddressInfo } from "node:net";
 
 const release = { repository: "owner/bot", sha: "a".repeat(40), runId: 123, attempt: 1 };
+test("release PR selection must be a positive integer", () => {
+  assert.equal(validateRelease({ ...release, prNumber: 42 }, release.repository).prNumber, 42);
+  for (const prNumber of [0, -1, 1.5, "42", null])
+    assert.throws(() => validateRelease({ ...release, prNumber }, release.repository));
+});
+
+test("main and manually rebuilt main releases remain supported", () => {
+  const run = { status: "completed", conclusion: "success", head_sha: release.sha, run_attempt: 1,
+    path: ".github/workflows/deploy.yml", repository: { full_name: release.repository },
+    head_repository: { full_name: release.repository }, head_branch: "main", event: "push" };
+  validateWorkflowRun(release, run);
+  validateWorkflowRun(release, { ...run, event: "workflow_dispatch" });
+  for (const patch of [{ event: "pull_request" }, { head_branch: "feature" }, { conclusion: "failure" },
+    { status: "in_progress" }, { head_sha: "b".repeat(40) }, { run_attempt: 2 }, { path: "other.yml" }])
+    assert.throws(() => validateWorkflowRun(release, { ...run, ...patch }));
+});
+
+test("explicit PR deployment requires its current successful same-repository build", () => {
+  const selected = { ...release, prNumber: 42 };
+  const run = { status: "completed", conclusion: "success", head_sha: release.sha, run_attempt: 1,
+    path: ".github/workflows/deploy.yml", repository: { full_name: release.repository },
+    head_repository: { full_name: release.repository }, head_branch: "feature", event: "pull_request" };
+  const pr = { number: 42, state: "open", base: { ref: "main", repo: { full_name: release.repository } },
+    head: { sha: release.sha, ref: "feature", repo: { full_name: release.repository } } };
+  validateWorkflowRun(selected, run, pr);
+  assert.throws(() => validateWorkflowRun(release, run, pr)); // Not opted in.
+  assert.throws(() => validateWorkflowRun(selected, run));
+  for (const patch of [{ state: "closed" }, { number: 43 }, { base: { ...pr.base, ref: "other" } },
+    { head: { ...pr.head, sha: "b".repeat(40) } }, { head: { ...pr.head, repo: { full_name: "fork/bot" } } }])
+    assert.throws(() => validateWorkflowRun(selected, run, { ...pr, ...patch }));
+  assert.throws(() => validateWorkflowRun(selected, { ...run, conclusion: "failure" }, pr));
+  assert.throws(() => validateWorkflowRun(selected, { ...run, head_repository: { full_name: "fork/bot" } }, pr));
+});
 test("signed requests bind timestamp, route and body, and expire", () => {
   const secret = "s".repeat(32);
   const body = Buffer.from(JSON.stringify(release));
