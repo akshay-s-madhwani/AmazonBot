@@ -1004,7 +1004,12 @@ app.post("/slots/event", (req: Request, res: Response) => {
     s.status = "PAUSED";
     const after = Number(body.after_step);
     emit(s, "run.paused", {
-      payload: { after_step: Number.isInteger(after) ? after : s.stepIndex },
+      payload: {
+        after_step: Number.isInteger(after) ? after : s.stepIndex,
+        // Stuck twice after proceed_to_buy (slot.ts rerunOrPause): the master
+        // pauses it from FAILED too, and frees its batch place.
+        ...(body.rerun_exhausted === true ? { reason: "rerun_exhausted" } : {}),
+      },
     });
   }
   if (body.type === "browser.started") {
@@ -1371,7 +1376,7 @@ const hooks: FleetHooks = {
     return started.map((s) => s.runId);
   },
 
-  resumeRun: async (run_id, from, stopAfter, unblocked) => {
+  resumeRun: async (run_id, from, stopAfter, unblocked, manual) => {
     if (deploymentClosing || deploymentMaintenance()) throw new Error("Deployment in progress; resume is disabled");
     const s = liveSlotFor(run_id, "resume");
     s.status = "BUSY"; // Account for the in-flight resume while deployment checks drain state.
@@ -1379,6 +1384,7 @@ const hooks: FleetHooks = {
       ...(from === undefined ? [] : [`from=${from}`]),
       ...(stopAfter === undefined ? [] : [`stop_after=${stopAfter}`]),
       ...(unblocked ? ["unblocked=1"] : []),
+      ...(manual ? ["manual=1"] : []),
     ].join("&");
     await slotCall(s, "/resume", query);
     s.status = "BUSY";

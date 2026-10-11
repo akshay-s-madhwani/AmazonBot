@@ -13,8 +13,14 @@ export type RunnerEvent =
       control_port: number;
     }
   | { type: "step.started"; run_id: string; step_index: number; step_key: string }
-  /** A page stayed unloaded too long: the runner refreshed it and exits; restart this step (stall.ts). */
-  | { type: "step.restart"; run_id: string; step_index: number; step_key: string; reason: string }
+  /**
+   * A page stayed unloaded too long: the runner refreshed it and exits; restart this step (stall.ts).
+   * rerun: a step after proceed_to_buy made no progress — restart from rewind_to (clear_cart) instead.
+   */
+  | {
+      type: "step.restart"; run_id: string; step_index: number; step_key: string; reason: string;
+      rerun?: boolean; rewind_to?: number;
+    }
   | {
       type: "step.finished";
       run_id: string;
@@ -53,6 +59,12 @@ export interface RunnerConfig {
    * passed over — see UNBLOCKABLE_FROM in steps.ts.
    */
   unblocked?: boolean;
+  /**
+   * The operator picked this start step by hand (dashboard "Run from", the run
+   * page's restart from a step): the only start allowed to go back before
+   * note_order_id once Pay Now was pressed (runner.ts guardPaid).
+   */
+  manual?: boolean;
 }
 
 export async function postEvent(
