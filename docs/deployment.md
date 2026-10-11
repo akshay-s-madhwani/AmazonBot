@@ -13,8 +13,11 @@ No JavaScript process-management wrapper or separate ops package is needed.
 2. Use a clean production clone with its packages submodule initialized. Stop any
    old foreground manager, then run `setup.bat`. Node 22+, Git and Windows `tar`
    are required. Setup installs Node when needed.
-3. Expose each receiver through HTTPS, forwarding only `/deploy` and `/status`
-   to `127.0.0.1:7901`. Do not expose the manager or browser control ports.
+3. For direct HTTP access, set `DEPLOY_HOST=0.0.0.0` in each RDP's `deploy.env`,
+   allow inbound TCP port 7901 in Windows and provider firewalls, and run
+   `pm2 restart deploy-webhook`. Use `http://SERVER_IP:7901` in `DEPLOY_TARGETS`.
+   Do not expose the manager or browser control ports. With an HTTPS reverse
+   proxy, keep the receiver on `127.0.0.1` and use the proxy's HTTPS URL instead.
 4. Configure the GitHub secrets below. Merge to `main` to build and deploy.
 
 The scheduled task runs under the setup account at sign-in. Use that same account
@@ -24,7 +27,7 @@ after moving the checkout or changing the Node installation.
 ## GitHub secrets
 
 - Bot repo `PACKAGES_READ_TOKEN`: Contents read on bot and private packages repo.
-- Bot repo `DEPLOY_TARGETS`: JSON array of each machine's HTTPS URL and signing
+- Bot repo `DEPLOY_TARGETS`: JSON array of each machine's HTTP or HTTPS URL and signing
   secret, matching `DEPLOY_SECRET` in that machine's `deploy.env`:
 
 ```json
@@ -68,8 +71,10 @@ Missing `DEPLOY_TARGETS` fails deployment with an explicit configuration error.
 
 The receiver checks the completed build job for the exact run attempt while the
 workflow is still running. See the [GitHub jobs API](https://docs.github.com/en/rest/actions/workflow-jobs#list-jobs-for-a-workflow-run-attempt).
-The existing HTTPS requirement still applies; each configured URL must reach the
-receiver over HTTPS.
+HTTP and HTTPS targets are supported. Requests remain signed with each machine's
+secret. HTTP does not encrypt traffic or authenticate the server's responses;
+use HTTPS when that protection is needed. URLs must contain only the host and
+optional port, without a `/deploy` path; the notifier adds the endpoint itself.
 
 ## Daily commands
 
