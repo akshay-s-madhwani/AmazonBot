@@ -538,7 +538,7 @@ type RawRow = { item: string; lines: string[]; asins: string[]; qty: number; key
  * failed "item 1 is not on the multi-address page" on a settled page that a
  * fresh read matched fine (2026-10-08/09).
  */
-async function readItemRows(page: Page): Promise<RawRow[]> {
+export async function readItemRows(page: Page): Promise<RawRow[]> {
   return page.evaluate(([rowSel, del]) => {
     const shown = (e: Element) => e.getBoundingClientRect().width > 0;
     const squash = (s: string) => s.replace(/\s+/g, " ").trim();
