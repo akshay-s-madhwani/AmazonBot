@@ -427,7 +427,13 @@ function tileKey(t: Tile): string {
 }
 
 async function openAddressBook(page: Page): Promise<Map<string, Tile>> {
-  await page.goto(ADDRESSES_URL, { waitUntil: "domcontentloaded", timeout: NAV_TIMEOUT_MS });
+  // A delete's answer IS the address book, drawn after the delete: read it
+  // there instead of loading it again.
+  if (/\/a\/addresses\?alertId=yaab-deleteAddressSuccess/.test(page.url())) {
+    await page.waitForLoadState("domcontentloaded", { timeout: NAV_TIMEOUT_MS }).catch(() => { });
+  } else {
+    await page.goto(ADDRESSES_URL, { waitUntil: "domcontentloaded", timeout: NAV_TIMEOUT_MS });
+  }
   await pause("addresses page loaded");
   const book = new Map<string, Tile>();
   for (const t of await readTiles(page)) book.set(tileKey(t), t);
@@ -449,7 +455,8 @@ async function removeTile(page: Page, tile: Tile): Promise<"removed" | "resident
   const deadline = Date.now() + 8_000;
   while (Date.now() < deadline) {
     if (await yes.count()) {
-      await shortPause();
+      // The confirm box takes Yes only once it has finished opening.
+      await sleep(1_000);
       // Yes POSTs the delete and Amazon answers on ...?alertId=yaab-deleteAddressSuccess.
       // Wait for that: the next address-book load used to start while the
       // POST was in flight and cancelled it — the card stayed, was "removed"
@@ -458,7 +465,31 @@ async function removeTile(page: Page, tile: Tile): Promise<"removed" | "resident
         .waitForURL((u) => /alertId=yaab-deleteAddress/i.test(u.href), { timeout: NAV_TIMEOUT_MS })
         .then(() => true)
         .catch(() => false);
-      await yes.locator("input, button").first().click({ timeout: NAV_TIMEOUT_MS });
+      // A Yes pressed under a second after the book loaded sent nothing: no
+      // POST, the card stayed, and the 20 s wait ran out (2026-10-11, ~21 s a
+      // card, every run of an account with old cards). Pressed again while
+      // no delete has gone out, at most 3 times; a delete sent is never repeated.
+      let sent = false;
+      const onRequest = (q: { method(): string; url(): string }) => {
+        if (q.method() === "POST" && /\/a\/addresses\/delete/.test(q.url())) sent = true;
+      };
+      page.on("request", onRequest);
+      try {
+        for (let press = 1; press <= 3 && !sent; press++) {
+          if (press > 1) {
+            if (!(await yes.count())) break;
+            console.log(`[bot] remove: Yes sent no delete — pressing it again (${press}/3)`);
+          }
+          await yes.locator("input, button").first().click({ timeout: NAV_TIMEOUT_MS }).catch(() => { });
+          for (const until = Date.now() + 4_000; !sent && Date.now() < until;) await sleep(250);
+        }
+      } finally {
+        page.off("request", onRequest);
+      }
+      if (!sent) {
+        console.log("[bot] remove: Yes sent no delete after 3 presses");
+        return "failed";
+      }
       if (!(await done)) {
         console.log(`[bot] remove: Amazon did not answer the delete (still at ${page.url().slice(0, 100)})`);
         return "failed";

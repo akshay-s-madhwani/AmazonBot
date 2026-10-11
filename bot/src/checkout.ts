@@ -1137,8 +1137,17 @@ async function selectSingleAddress(page: Page, target: TargetAddress): Promise<C
   }, want);
   if (!picked) return { ok: false, reason: `delivery address "${target.fullName}" (${target.pincode}) is not in the checkout address list` };
   await shortPause();
-  const use = page.getByText("Deliver to this address", { exact: true }).filter({ visible: true }).first();
-  await use.click({ timeout: NAV_TIMEOUT_MS });
+  // The button's own input, laid over its "Deliver to this address" text: a
+  // click on the text was taken by that input, and Playwright retried it
+  // until the stuck rule sent the run back, every single-address run (2026-10-11).
+  const use = page
+    .locator("span.a-button")
+    .filter({ hasText: /^\s*Deliver to this address\s*$/ })
+    .filter({ visible: true })
+    .locator("input.a-button-input, button")
+    .first();
+  if (await use.count()) await use.click({ timeout: NAV_TIMEOUT_MS });
+  else await page.getByText("Deliver to this address", { exact: true }).filter({ visible: true }).first().click({ timeout: NAV_TIMEOUT_MS, force: true });
   await reachPayment(page);
   await pause("address selected");
   return { ok: true, detail: `delivering to ${target.fullName}` };

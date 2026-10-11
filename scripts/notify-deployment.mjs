@@ -4,6 +4,20 @@ if (!Array.isArray(targets) || !targets.length) throw new Error('Configure the D
 const body = process.env.DEPLOY_RELEASE;
 if (!body) throw new Error('Missing DEPLOY_RELEASE');
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+function connectionError(error) {
+  // Log transport codes, not request headers, secrets or server response bodies.
+  const codes = new Set();
+  function collect(value) {
+    if (!value || typeof value !== 'object') return;
+    if (typeof value.code === 'string' && /^[A-Z0-9_]+$/.test(value.code)) codes.add(value.code);
+    if (value.cause) collect(value.cause);
+    if (Array.isArray(value.errors)) value.errors.forEach(collect);
+  }
+  collect(error);
+  const message = /^HTTP \d{3}$/.test(error?.message ?? '') ? error.message :
+    error?.name === 'TimeoutError' ? 'request timed out' : 'connection or response failed';
+  return `${message}${codes.size ? ` (${[...codes].join(', ')})` : ''}`;
+}
 async function request(target, route) {
   const timestamp = String(Date.now());
   const signature = 'sha256=' + createHmac('sha256', target.secret).update(`${timestamp}.${route}.`).update(body).digest('hex');
@@ -16,12 +30,17 @@ async function request(target, route) {
 }
 const results = await Promise.allSettled(targets.map(async (target, index) => {
   const url = new URL(target.url);
-  if (url.protocol !== 'https:' || url.username || url.password || url.pathname !== '/' || url.search || url.hash ||
+  if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.pathname !== '/' || url.search || url.hash ||
       typeof target.secret !== 'string' || target.secret.length < 32) throw new Error(`Invalid target ${index + 1}`);
   let result;
   for (let attempt = 0; attempt < 5; attempt++) {
     try { result = await request(target, '/deploy'); break; }
-    catch { if (attempt === 4) throw new Error(`Machine ${index + 1}: notification failed`); await sleep(10_000); }
+    catch (error) {
+      const detail = connectionError(error);
+      if (attempt === 4) throw new Error(`Machine ${index + 1}: notification failed: ${detail}`);
+      console.warn(`Machine ${index + 1}: attempt ${attempt + 1} failed: ${detail}; retrying`);
+      await sleep(10_000);
+    }
   }
   const deadline = Date.now() + 25 * 60_000;
   while (result.status === 'deploying' && Date.now() < deadline) {
