@@ -1376,7 +1376,7 @@ const hooks: FleetHooks = {
     return started.map((s) => s.runId);
   },
 
-  resumeRun: async (run_id, from, stopAfter, unblocked) => {
+  resumeRun: async (run_id, from, stopAfter, unblocked, manual) => {
     if (deploymentClosing || deploymentMaintenance()) throw new Error("Deployment in progress; resume is disabled");
     const s = liveSlotFor(run_id, "resume");
     s.status = "BUSY"; // Account for the in-flight resume while deployment checks drain state.
@@ -1384,6 +1384,7 @@ const hooks: FleetHooks = {
       ...(from === undefined ? [] : [`from=${from}`]),
       ...(stopAfter === undefined ? [] : [`stop_after=${stopAfter}`]),
       ...(unblocked ? ["unblocked=1"] : []),
+      ...(manual ? ["manual=1"] : []),
     ].join("&");
     await slotCall(s, "/resume", query);
     s.status = "BUSY";

@@ -18,6 +18,7 @@ import { planVouchers } from "./vouchers.js";
 import { createServer, type AddressInfo } from "node:net";
 import { parseAccountProxy, proxyUnreachable } from "./proxy.js";
 import { fleetProcesses, orphans } from "./procs.js";
+import { STEPS, guardPaid, payNowPressed } from "./steps.js";
 
 const basket = [{ sku: "B012345678", quantity: 2, title: "Test product" }];
 test("Resume starts at the asked step; only a changed basket goes back to clear_cart", () => {
@@ -298,6 +299,14 @@ test("Multi-address rows match basket items by title, else by ASIN", () => {
   const twin = { ...santoor, sku: "B08K95SV29" };
   assert.equal(matchBasketItem({ item: row, asins: ["B08K95SV29"] }, [santoor, twin]), 1);
   assert.equal(matchBasketItem({ item: row, asins: [] }, [santoor, twin]), -1);
+  // 2026-10-11: one item, its card read as the whole page — order summary first.
+  const sandal = { sku: "B0AAAAAAAA", title: "Santoor Sandal & Turmeric Soap for Total Skin Care, 125g (Pack of 4)", quantity: 4 };
+  const page = ["BUY MORE SAVE MORE", "Make updates to your items", "Santoor Sandal & Turmeric Soap for Total…",
+    "Deliver this item to additional addresses", "Santoor Sandal & Turmeric Soap for Total Skin Care, 125g (Pack of 4)"];
+  assert.equal(matchBasketItem({ item: "Marketplace Fee:", lines: page, asins: [] }, [sandal]), 0);
+  assert.equal(matchBasketItem({ item: "Marketplace Fee:", lines: page, asins: [] }, [sandal, shampoo]), 0);
+  assert.equal(matchBasketItem({ item: "Marketplace Fee:", lines: ["BUY MORE SAVE MORE"], asins: [] }, [sandal]), -1);
+  assert.equal(matchBasketItem({ item: row, lines: [row, sandal.title], asins: [] }, [santoor, twin, sandal]), -1);
 });
 
 const nhdi = { fullName: "nhdi naman jain", phone: "", pincode: "521333", line1: "1-66/86",
@@ -502,4 +511,32 @@ test("Pre-purchase titles: HTML codes Amazon leaves in a title still match", () 
   const ship = [{ key: sheetAddressKey(t), name: "lokesh 117", items: [{ title: "POND&#39;S Dreamflower Floral Perfumed Powder With Floral Fragrance", quantity: 1 }] }];
   assert.equal(reviewError(basket, [t], ship), null);
   assert.equal(decodeEntities("POND&amp;#39;S &amp; Co"), "POND'S & Co");
+});
+
+test("Pay Now guard: once pressed, no start goes back before note_order_id unless picked by hand", () => {
+  const dir = mkdtempSync(join(tmpdir(), "paid-"));
+  try {
+    const at = (k: string) => STEPS.findIndex((s) => s.key === k);
+    const note = at("note_order_id");
+    // Not pressed: every start stands.
+    assert.equal(payNowPressed(dir), false);
+    assert.equal(guardPaid(at("clear_cart"), { artifacts_dir: dir }), at("clear_cart"));
+    // Pressed (the ledger is written just before the press).
+    writeFileSync(join(dir, "orders-placed.json"), JSON.stringify([{ key: "k", order_id: null, placed_at: "2026-10-10T00:00:00Z" }]));
+    assert.equal(payNowPressed(dir), true);
+    for (const k of ["login", "clear_cart", "proceed_to_buy", "add_vouchers", "select_address", "select_payment"]) {
+      assert.equal(guardPaid(at(k), { artifacts_dir: dir }), note, `${k} must not run again after Pay Now`);
+    }
+    assert.equal(guardPaid(note, { artifacts_dir: dir }), note);
+    // Picked by hand (Run from): allowed.
+    assert.equal(guardPaid(at("clear_cart"), { artifacts_dir: dir, manual: true }), at("clear_cart"));
+    // An unreadable ledger counts as pressed.
+    writeFileSync(join(dir, "orders-placed.json"), "{not json");
+    assert.equal(guardPaid(at("select_payment"), { artifacts_dir: dir }), note);
+    // An empty ledger is no press.
+    writeFileSync(join(dir, "orders-placed.json"), "[]");
+    assert.equal(guardPaid(at("select_payment"), { artifacts_dir: dir }), at("select_payment"));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

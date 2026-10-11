@@ -389,3 +389,39 @@ export const LAST_STEP_INDEX: number = (() => {
   }
   return i;
 })();
+
+/**
+ * THE PAY NOW GUARD (user, 2026-10-10): once this run has pressed Pay Now (its
+ * ledger, orders-placed.json, holds the press — written just before it), no
+ * start goes back before note_order_id: a rerun, Run all, Next, Resume or
+ * Remove blocks reads the order ids instead of buying again (it went back,
+ * re-placed, and failed on the spent balance). Only a start step the operator
+ * picked by hand (cfg.manual) may.
+ */
+
+
+export function payNowPressed(artifactsDir: string): boolean {
+  const file = join(artifactsDir, "orders-placed.json");
+  if (!existsSync(file)) return false;
+  try {
+    const entries: unknown = JSON.parse(readFileSync(file, "utf8"));
+    return Array.isArray(entries) && entries.length > 0;
+  } catch {
+    return true; // unreadable: assume pressed — the safe side
+  }
+}
+
+export function guardPaid(from: number, cfg: { artifacts_dir: string; manual?: boolean }): number {
+  const NOTE_INDEX = STEPS.findIndex((s) => s.key === "note_order_id");
+  if (NOTE_INDEX < 0 || from >= NOTE_INDEX || !payNowPressed(cfg.artifacts_dir)) return from;
+  const key = STEPS[from]?.key ?? String(from);
+  if (cfg.manual) {
+    console.warn(`[runner] Pay Now was already pressed in this run — starting at step ${from} ${key} anyway`);
+    return from;
+  }
+  console.warn(
+    `[runner] Pay Now was already pressed in this run — not going back to step ${from} ${key}; ` +
+      `reading the order ids (step ${NOTE_INDEX} note_order_id) instead`,
+  );
+  return NOTE_INDEX;
+}

@@ -525,7 +525,7 @@ async function settleRows(page: Page, budgetMs = 45_000): Promise<void> {
   }
 }
 
-type RawRow = { item: string; asins: string[]; qty: number; key: string | null };
+type RawRow = { item: string; lines: string[]; asins: string[]; qty: number; key: string | null };
 
 /**
  * Rows on the multi-address page, in page order, with the product each belongs to.
@@ -593,15 +593,20 @@ async function readItemRows(page: Page): Promise<RawRow[]> {
         if (a) asins.add(a.toUpperCase());
       }
       const titled = links.map((l) => squash((l as HTMLElement).innerText ?? "")).find((t) => t.length > 15);
+      // Long lines of the card, summary labels ("Marketplace Fee:") left out: with one
+      // item its card is the whole page, order summary first (2026-10-11).
+      const lines = ((product as HTMLElement | null)?.innerText ?? "").split("\n").map((l) => l.trim())
+        .filter((l) => l.length > 15 && !/:$/.test(l)).slice(0, 40);
       return {
-        item: titled ?? ((product as HTMLElement | null)?.innerText ?? "").split("\n").map((l) => l.trim()).find((l) => l.length > 15) ?? "",
+        item: titled ?? lines[0] ?? "",
+        lines,
         asins: [...asins],
         qty: Number(stepper?.querySelector('[data-a-selector="value"]')?.textContent?.trim() ?? "1"),
         chosen,
       };
     });
   }, [ITEMSELECT_ROW, LINE_GROUP_DELETE] as [string, string]).then((rows) =>
-    rows.map((r) => ({ item: r.item, asins: r.asins, qty: r.qty, key: checkoutAddressKey(r.chosen) })),
+    rows.map((r) => ({ item: r.item, lines: r.lines, asins: r.asins, qty: r.qty, key: checkoutAddressKey(r.chosen) })),
   );
 }
 
@@ -609,21 +614,29 @@ async function readItemRows(page: Page): Promise<RawRow[]> {
  * Which basket item a multi-address row is: by the title its card shows,
  * then — when no title or several match — by an ASIN in its card. Title
  * first: a card can carry another product's ASIN (a free item drawn inside
- * it), never another product's title. -1 = none, or more than one.
+ * it), never another product's title. Last, any other line of its card
+ * that is one basket item's title (a card read too wide, "Marketplace Fee:"
+ * first, 2026-10-11). -1 = none, or more than one.
  */
-export function matchBasketItem(row: { item: string; asins: string[] }, basket: BasketItem[]): number {
+export function matchBasketItem(row: { item: string; lines?: string[]; asins: string[] }, basket: BasketItem[]): number {
   const norm = (v: string) => v.toLowerCase().replace(/\.{3}|…/g, "").replace(/[^a-z0-9]/g, "");
-  const t = norm(row.item);
-  const byTitle = basket.flatMap((b, i) => {
-    const bt = norm(b.title);
-    const n = Math.min(t.length, bt.length, 40);
-    return n >= 10 && t.slice(0, n) === bt.slice(0, n) ? [i] : [];
-  });
+  const titledAs = (line: string) => {
+    const t = norm(line);
+    return basket.flatMap((b, i) => {
+      const bt = norm(b.title);
+      const n = Math.min(t.length, bt.length, 40);
+      return n >= 10 && t.slice(0, n) === bt.slice(0, n) ? [i] : [];
+    });
+  };
+  const byTitle = titledAs(row.item);
   if (byTitle.length === 1) return byTitle[0]!;
   const pool = byTitle.length > 1 ? byTitle : basket.map((_, i) => i);
   const want = new Set(row.asins.map((a) => a.toUpperCase()));
   const byAsin = pool.filter((i) => want.has(basket[i]!.sku.toUpperCase()));
-  return byAsin.length === 1 ? byAsin[0]! : -1;
+  if (byAsin.length === 1) return byAsin[0]!;
+  if (byTitle.length > 0) return -1;
+  const byLine = new Set((row.lines ?? []).flatMap(titledAs));
+  return byLine.size === 1 ? [...byLine][0]! : -1;
 }
 
 type ItemRow = { item: number; qty: number; key: string | null };

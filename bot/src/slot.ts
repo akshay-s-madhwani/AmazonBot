@@ -73,6 +73,8 @@ let runnerControlPort: number | null = null;
 let stopAfter: number | undefined = parseStopAfter(process.env.SLOT_STOP_AFTER ?? null);
 /** Remove blocks (RunnerConfig.unblocked). Restated by every resume, like stopAfter. */
 let unblocked = process.env.SLOT_UNBLOCKED === "true";
+/** The resume's start step was picked by hand (RunnerConfig.manual). Restated by every resume. */
+let manualStart = false;
 
 function parseStopAfter(raw: string | null): number | undefined {
   if (raw === null || raw.trim() === "") return undefined;
@@ -265,6 +267,7 @@ function spawnRunner(startIndex: number): void {
     artifacts_dir: artifactsDir,
     ...(stopAfter !== undefined ? { stop_after: stopAfter } : {}),
     ...(unblocked ? { unblocked: true } : {}),
+    ...(manualStart ? { manual: true } : {}),
   };
 
   status = "BUSY";
@@ -338,7 +341,8 @@ function spawnRunner(startIndex: number): void {
  * the master frees its batch place so the next row starts (user, 2026-10-10).
  */
 function rerunOrPause(index: number, rewindTo: number, reason: string): void {
-  if (stuckReruns < STUCK_RERUNS) {
+  // Never back to the cart once Pay Now was pressed (runner.ts guardPaid).
+  if (stuckReruns < STUCK_RERUNS && !existsSync(join(artifactsDir, "orders-placed.json"))) {
     stuckReruns++;
     log(`step ${index}: ${reason} — going back to step ${rewindTo} (rerun ${stuckReruns}/${STUCK_RERUNS})`);
     record("step.rerun", { stepIndex: index, rewindTo, attempt: stuckReruns, reason });
@@ -594,6 +598,7 @@ const http = createServer(async (req, res) => {
     }
     stopAfter = until;
     unblocked = url.searchParams.get("unblocked") === "1";
+    manualStart = url.searchParams.get("manual") === "1";
     // The operator's Resume gives every step its stuck-page restarts back,
     // and the run its rerun from clear_cart.
     stallRestarts.clear();
@@ -647,7 +652,7 @@ const http = createServer(async (req, res) => {
     if (runnerWaitingPort) {
       const ok = await fetch(
         `http://127.0.0.1:${runnerWaitingPort}/continue?token=${token}&from=${from}` +
-          `&stop_after=${stopAfter ?? ""}&unblocked=${unblocked ? 1 : ""}`,
+          `&stop_after=${stopAfter ?? ""}&unblocked=${unblocked ? 1 : ""}&manual=${manualStart ? 1 : ""}`,
         { method: "POST" },
       )
         .then((r) => r.ok)

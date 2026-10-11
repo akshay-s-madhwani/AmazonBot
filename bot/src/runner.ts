@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { chromium, type BrowserContext, type Page } from "./pw.js";
 import { loadAddress, loadConfig, loadDotEnv, loadProduct, parseRewardType, reloadDotEnv } from "./config.js";
 import { postEvent, type RunnerConfig, type StepResult } from "./protocol.js";
-import { LAST_STEP, LAST_STEP_INDEX, STEPS, UNBLOCKABLE_FROM, UNBLOCKABLE_UNTIL, stepAt, type StepContext } from "./steps.js";
+import { LAST_STEP, LAST_STEP_INDEX, STEPS, UNBLOCKABLE_FROM, UNBLOCKABLE_UNTIL, guardPaid, payNowPressed, stepAt, type StepContext } from "./steps.js";
 import { openRewardTab } from "./reward.js";
 import { guardCheckoutModals } from "./checkout.js";
 import { describeForOperator } from "./failures.js";
@@ -186,6 +186,8 @@ function ensureControlServer(cfg: RunnerConfig, live: { index: number }): Promis
       else cfg.stop_after = until;
       // Restated on every continue, like the checkpoint: only Remove blocks sets it.
       cfg.unblocked = url.searchParams.get("unblocked") === "1";
+      // So is a start step picked by hand (the Pay Now guard's one exception).
+      cfg.manual = url.searchParams.get("manual") === "1";
       reply(202, { ok: true });
       resume(Number.isInteger(from) && from >= 0 ? from : 0);
     });
@@ -453,6 +455,7 @@ async function main(): Promise<number> {
   }
 
   async function runFrom(from: number): Promise<"SUCCEEDED" | "FAILED"> {
+    from = guardPaid(from, cfg);
     for (let i = from; i < STEPS.length; i++) {
       const step = stepAt(i);
       if (!step) break;
@@ -489,7 +492,7 @@ async function main(): Promise<number> {
       // Stuck after proceed_to_buy: back to clear_cart (the slot counts, and
       // pauses the run the second time). Exits like a stalled page does: the
       // stuck attempt cannot be cancelled in place.
-      const stopQuietWatch = rerunnable(i)
+      const stopQuietWatch = rerunnable(i) && !payNowPressed(cfg.artifacts_dir)
         ? watchForNoProgress((quietMs) => {
             void (async () => {
               const reason = `no progress for ${Math.round(quietMs / 1000)}s on ${step.key}`;

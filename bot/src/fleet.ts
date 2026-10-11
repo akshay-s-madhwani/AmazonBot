@@ -53,7 +53,8 @@ export interface FleetHooks {
   startPushedJob(run_id: string, job: SheetJob, stopAfter?: number): Promise<string>;
   startJobs(instances: number): Promise<string[]>;
   /** unblocked: Remove blocks (RunnerConfig.unblocked) for this resume. */
-  resumeRun(run_id: string, from?: number, stopAfter?: number, unblocked?: boolean): Promise<void>;
+  /** manual: the operator picked `from` by hand — the only start that may go back before Pay Now once it was pressed. */
+  resumeRun(run_id: string, from?: number, stopAfter?: number, unblocked?: boolean, manual?: boolean): Promise<void>;
   reloadRow?(run_id: string): Promise<void>;
   cancelRun(run_id: string): Promise<void>;
   closeSession(run_id: string): Promise<void>;
@@ -491,7 +492,8 @@ export class FleetLink {
         }
         const until = stopAfter();
         const unblocked = cmd.payload.unblocked === true;
-        await this.hooks.resumeRun(runId(), raw, until, unblocked);
+        const manual = cmd.payload.manual === true;
+        await this.hooks.resumeRun(runId(), raw, until, unblocked, manual);
         return done(`from step ${raw}${until === undefined ? "" : ` to ${until}`}${unblocked ? ", blocks removed" : ""}`);
       }
       case "stop_run":
