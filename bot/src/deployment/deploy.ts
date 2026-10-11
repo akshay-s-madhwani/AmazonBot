@@ -125,7 +125,9 @@ export async function deploy(release: Release): Promise<void> {
       const run = await (await api(release.repository, `actions/runs/${release.runId}`)).json() as any;
       const pr = release.prNumber === undefined ? undefined :
         await (await api(release.repository, `pulls/${release.prNumber}`)).json();
-      validateWorkflowRun(release, run, pr);
+      const jobs = await (await api(release.repository,
+        `actions/runs/${release.runId}/attempts/${release.attempt}/jobs?per_page=100`)).json() as any;
+      validateWorkflowRun(release, run, pr, jobs.jobs);
       await git(["fetch", "origin", "main"]);
       if (release.prNumber !== undefined) {
         const ref = `refs/remotes/origin/deploy-pr-${release.prNumber}`;

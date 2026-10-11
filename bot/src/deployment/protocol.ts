@@ -12,17 +12,23 @@ export function validateRelease(value: unknown, repository: string): Release {
   return r as Release;
 }
 
-export function validateWorkflowRun(release: Release, run: any, pr?: any): void {
-  if (run.conclusion !== "success" || run.status !== "completed" || run.head_sha !== release.sha ||
+export function validateWorkflowRun(release: Release, run: any, pr?: any, jobs: any[] = []): void {
+  const finished = run.status === "completed" && run.conclusion === "success";
+  const buildingDeployment = run.status === "in_progress" && run.conclusion == null &&
+    jobs.some(job => job.name === "Build and test bot" && job.status === "completed" &&
+      job.conclusion === "success" && job.run_id === release.runId && job.run_attempt === release.attempt);
+  if ((!finished && !buildingDeployment) ||
       run.run_attempt !== release.attempt || run.path !== ".github/workflows/deploy.yml" ||
       run.repository?.full_name !== release.repository || run.head_repository?.full_name !== release.repository)
     throw new Error("Unapproved workflow run");
   if (release.prNumber !== undefined) {
-    if (run.event !== "pull_request" || pr?.number !== release.prNumber || pr.state !== "open" ||
+    const matchingSource = (run.event === "pull_request" && run.head_sha === release.sha && pr?.head?.ref === run.head_branch) ||
+      (run.event === "workflow_dispatch" && run.head_branch === "main");
+    if (!matchingSource || pr?.number !== release.prNumber || pr.state !== "open" ||
         pr.base?.ref !== "main" || pr.base?.repo?.full_name !== release.repository ||
-        pr.head?.repo?.full_name !== release.repository || pr.head.sha !== release.sha || pr.head.ref !== run.head_branch)
+        pr.head?.repo?.full_name !== release.repository || pr.head.sha !== release.sha)
       throw new Error("PR is closed, changed, from a fork, or does not match this build");
-  } else if (!["push", "workflow_dispatch"].includes(run.event) || run.head_branch !== "main") {
+  } else if (!["push", "workflow_dispatch"].includes(run.event) || run.head_branch !== "main" || run.head_sha !== release.sha) {
     throw new Error("Only main builds or explicitly selected PR builds can deploy");
   }
 }

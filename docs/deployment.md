@@ -43,29 +43,33 @@ bot, then notifies machines after success. Artifacts are retained for 30 days.
 
 ## Deploy main or choose a PR
 
-- A successful `main` build automatically starts **Deploy bot to machines**.
-  It creates an `rdp-fleet` GitHub deployment and records success/failure after
-  waiting for the machines. Check this workflow as well as **Build bot**.
-- To deploy a PR, open **Actions → Deploy bot to machines → Run workflow**,
-  select workflow branch **main**, enter its number in **pr_number**, and run.
-  Leave the field empty to deploy the latest successful build of current main.
-- The PR must be open, originate in this repo, target main, and have a successful
-  build of its latest head commit. Fork PRs and stale/failed builds are rejected.
-  The PR is deployed to the **same machines in DEPLOY_TARGETS**, not a preview fleet.
-- PR builds now upload deployable artifacts. Rerun the PR build if its previous
-  run used the old workflow. A missing artifact or build fails with an explicit
-  explanation rather than silently finishing without deploying.
-- Merge these workflow changes to main once so GitHub registers the deployment
-  trigger and manual input. GitHub only enables `workflow_run` and the manual
-  Run workflow UI when their workflow exists on the default branch.
-- Update/rebuild the receiver on every RDP and run `pm2 restart deploy-webhook`
-  once before the first PR deployment: older receivers only accept main builds.
-  Ensure its token has Pull requests read access. Restart only when no deployment
-  is running. Future main deployments can replace a PR even after squash merging.
+The **Build and deploy AmazonBot** workflow contains two visible jobs:
+**Build and test bot**, then **Deploy bot to RDP machines**. The second job sends
+signed webhooks to every configured machine, waits for deployment and PM2 restart
+results, and records success/failure in GitHub's `rdp-fleet` deployment.
+Missing `DEPLOY_TARGETS` fails deployment with an explicit configuration error.
 
-The existing HTTPS requirement still applies. Registering a deployment in GitHub
-does not make an unreachable or HTTP-only receiver reachable over HTTPS.
-See [GitHub workflow triggers](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows).
+- Pushes/merges to `main` automatically build and deploy.
+- PRs build by default. To also deploy on PR updates, set repository variable
+  **DEPLOY_ON_PR** to **true** under Settings -> Secrets and variables -> Actions
+  -> Variables. Only same-repository PRs targeting main are eligible.
+- For a manual deployment, open Actions -> **Build and deploy AmazonBot** ->
+  **Run workflow**, select branch **main**, and keep **deploy** checked. Enter
+  **pr_number** to build/deploy an open PR, or leave it empty for main.
+  Uncheck **deploy** for a build-only manual run.
+- PR deployments use the **same machines in DEPLOY_TARGETS**. Closed, forked,
+  changed or failed PR builds cannot deploy.
+- Merge this workflow to main once to expose the manual inputs. The former
+  separate notification workflow has been removed; deployment is in `deploy.yml`.
+- Before using this workflow, update/rebuild the receiver on every RDP and run
+  `pm2 restart deploy-webhook` once while no deployment is running. Old receivers
+  require the entire workflow to finish and would reject this deployment job.
+  Its token needs Actions read, plus Pull requests read for PR deployments.
+
+The receiver checks the completed build job for the exact run attempt while the
+workflow is still running. See the [GitHub jobs API](https://docs.github.com/en/rest/actions/workflow-jobs#list-jobs-for-a-workflow-run-attempt).
+The existing HTTPS requirement still applies; each configured URL must reach the
+receiver over HTTPS.
 
 ## Daily commands
 
@@ -96,8 +100,9 @@ deployments during maintenance, `pm2 stop deploy-webhook` and `pm2 save` too.
   15-minute drain timeout expires.
 - Failed activation or health checks restore the previous runtime. A journal
   handles interrupted file swaps. `.deploy/history` records results.
-- Notifications retry every 30 minutes for offline machines. Failed deployments
-  require fixing the cause and rerunning **Build bot** for a new attempt.
+- Failed or unreachable machines fail the deployment job. Fix the cause, then
+  start a new manual run or rerun **all jobs** to build an artifact for the new
+  attempt. There is no scheduled offline retry.
 - Restart the webhook separately after its own code changes, once deployment is
   finished: `pm2 restart deploy-webhook`. Do not interrupt an active deployment.
 - Old `.deploy/staging` folders can be pruned during maintenance when no

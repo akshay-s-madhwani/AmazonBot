@@ -1,23 +1,61 @@
-name: Build bot
+name: Build and deploy AmazonBot
 on:
   push:
     branches: [main]
   pull_request:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      deploy:
+        description: 'Deploy to the RDP machines after the build succeeds'
+        type: boolean
+        default: true
+      pr_number:
+        description: 'Optional PR number to build and deploy instead of main'
+        type: string
+        required: false
 permissions:
   contents: read
+  pull-requests: read
 concurrency:
   group: bot-build-${{ github.ref }}
   cancel-in-progress: false
 jobs:
   build:
+    name: Build and test bot
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    outputs:
+      sha: ${{ steps.source.outputs.sha }}
+      pr_number: ${{ steps.source.outputs.pr_number }}
     steps:
+      - name: Select source commit
+        id: source
+        uses: actions/github-script@v7
+        env:
+          REQUESTED_PR: ${{ inputs.pr_number }}
+        with:
+          script: |
+            let sha = context.sha;
+            let pr = context.payload.pull_request;
+            if (context.eventName === 'workflow_dispatch') {
+              if (context.ref !== 'refs/heads/main') throw new Error('Run this workflow from main; use pr_number to select a PR.');
+              const input = (process.env.REQUESTED_PR || '').trim();
+              if (input) {
+                if (!/^[1-9][0-9]*$/.test(input)) throw new Error('pr_number must be a positive integer.');
+                ({ data: pr } = await github.rest.pulls.get({ ...context.repo, pull_number: Number(input) }));
+              }
+            }
+            if (pr) {
+              if (pr.state !== 'open' || pr.base.ref !== 'main' || pr.head.repo?.full_name !== `${context.repo.owner}/${context.repo.repo}`)
+                throw new Error('Only open PRs from this repository targeting main are supported.');
+              sha = pr.head.sha;
+              core.setOutput('pr_number', String(pr.number));
+            }
+            core.setOutput('sha', sha);
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          ref: ${{ steps.source.outputs.sha }}
           submodules: recursive
           token: ${{ secrets.PACKAGES_READ_TOKEN || github.token }}
           persist-credentials: false
@@ -49,12 +87,78 @@ jobs:
           node bot/dist/fleet.test.js
           node --test bot/dist/safety.test.js bot/dist/deployment/deploy.test.js
       - name: Package compiled files
-        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
         run: node scripts/package-build.mjs
       - uses: actions/upload-artifact@v4
-        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
         with:
-          name: bot-${{ github.event.pull_request.head.sha || github.sha }}-${{ github.run_attempt }}
+          name: bot-${{ steps.source.outputs.sha }}-${{ github.run_attempt }}
           path: deployment.json
           if-no-files-found: error
           retention-days: 30
+
+  deploy:
+    name: Deploy bot to RDP machines
+    needs: build
+    if: >-
+      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+      (github.event_name == 'workflow_dispatch' && inputs.deploy) ||
+      (github.event_name == 'pull_request' && vars.DEPLOY_ON_PR == 'true' &&
+       github.event.pull_request.head.repo.full_name == github.repository)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    concurrency:
+      group: bot-rdp-deployment
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      deployments: write
+    steps:
+      - name: Check deployment configuration
+        env:
+          DEPLOY_TARGETS: ${{ secrets.DEPLOY_TARGETS }}
+        run: |
+          node -e "const targets=JSON.parse(process.env.DEPLOY_TARGETS || '[]'); if (!Array.isArray(targets) || !targets.length) throw new Error('Set the DEPLOY_TARGETS repository secret to your RDP URLs and signing secrets.');"
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Register deployment
+        id: release
+        uses: actions/github-script@v7
+        env:
+          BUILD_SHA: ${{ needs.build.outputs.sha }}
+          BUILD_ATTEMPT: ${{ github.run_attempt }}
+          PR_NUMBER: ${{ needs.build.outputs.pr_number }}
+        with:
+          script: |
+            const sha = process.env.BUILD_SHA;
+            const prNumber = process.env.PR_NUMBER ? Number(process.env.PR_NUMBER) : undefined;
+            core.setOutput('payload', JSON.stringify({ repository: `${context.repo.owner}/${context.repo.repo}`,
+              sha, runId: context.runId, attempt: Number(process.env.BUILD_ATTEMPT), ...(prNumber ? { prNumber } : {}) }));
+            const { data } = await github.rest.repos.createDeployment({ ...context.repo, ref: sha,
+              environment: 'rdp-fleet', auto_merge: false, required_contexts: [],
+              description: prNumber ? `Deploy bot PR #${prNumber}` : 'Deploy bot main' });
+            if (!data.id) throw new Error('GitHub did not create a deployment.');
+            core.setOutput('deployment_id', String(data.id));
+            await github.rest.repos.createDeploymentStatus({ ...context.repo, deployment_id: data.id, state: 'in_progress' });
+      - name: Send deployment webhooks and wait for PM2 restart results
+        id: notify
+        env:
+          DEPLOY_RELEASE: ${{ steps.release.outputs.payload }}
+          DEPLOY_TARGETS: ${{ secrets.DEPLOY_TARGETS }}
+        run: node scripts/notify-deployment.mjs
+      - name: Record deployment result
+        if: always() && steps.release.outputs.deployment_id != ''
+        uses: actions/github-script@v7
+        env:
+          DEPLOYMENT_ID: ${{ steps.release.outputs.deployment_id }}
+          DEPLOY_OUTCOME: ${{ steps.notify.outcome }}
+        with:
+          script: |
+            const state = process.env.DEPLOY_OUTCOME === 'success' ? 'success' : 'failure';
+            await github.rest.repos.createDeploymentStatus({ ...context.repo,
+              deployment_id: Number(process.env.DEPLOYMENT_ID), state,
+              log_url: `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}` });
+            await core.summary.addHeading(`RDP deployment: ${state}`).write();
