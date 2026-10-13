@@ -8,6 +8,7 @@ import {
   type RewardSpec,
   type TargetAddress,
 } from "./config.js";
+import type { CancelProgress, CancelResult } from "@app/contracts";
 import { loadCredentials, refreshApiToken } from "./enroll.js";
 import { sheetDirectClient, sheetDirectMode } from "./sheet-direct.js";
 
@@ -263,6 +264,37 @@ export class JobClient {
 
   completePurchase(run_id: string, job_id: string, token: string, order_id: string, evidence: unknown): Promise<{ ok: boolean }> {
     return this.call("/node/purchases/complete", { method: "POST", body: JSON.stringify({ run_id, job_id, token, order_id, evidence }) });
+  }
+
+  /** Cancel flow: a step started or finished. false = the master says the run is over (stopped). */
+  async cancelProgress(run_id: string, body: CancelProgress): Promise<boolean> {
+    try {
+      await this.call(`/node/cancels/${encodeURIComponent(run_id)}/progress`, { method: "POST", body: JSON.stringify(body) });
+      return true;
+    } catch (err) {
+      const message = (err as Error).message;
+      if (/master 409/.test(message)) return false;
+      this.log(`[cancel] progress not reported: ${message}`);
+      return true;
+    }
+  }
+
+  /** Cancel flow: the run's outcome, retried — it is what frees the row. */
+  async cancelResult(run_id: string, body: CancelResult): Promise<boolean> {
+    for (let attempt = 1; attempt <= 5; attempt += 1) {
+      try {
+        await this.call(`/node/cancels/${encodeURIComponent(run_id)}/result`, { method: "POST", body: JSON.stringify(body) });
+        return true;
+      } catch (err) {
+        const message = (err as Error).message;
+        if (/master 4\d\d/.test(message) || attempt === 5) {
+          this.log(`[cancel] could not report ${body.outcome} for ${run_id}: ${message}`);
+          return false;
+        }
+        await new Promise((r) => setTimeout(r, 1000 * 2 ** attempt));
+      }
+    }
+    return false;
   }
 
   async config(): Promise<{ instances: number; raw: Record<string, string> }> {

@@ -12,6 +12,8 @@ import {
   telemetrySubject,
   CommandEnvelopeSchema,
   StartJobPayloadSchema,
+  StartCancelPayloadSchema,
+  type CancelJob,
   type CommandAck,
   type CommandEnvelope,
   type EventType,
@@ -52,6 +54,8 @@ export interface FleetHooks {
   /** stopAfter: park after this step index (a checkpoint); absent = run to the end. */
   startPushedJob(run_id: string, job: SheetJob, stopAfter?: number): Promise<string>;
   startJobs(instances: number): Promise<string[]>;
+  /** The cancel flow: one cancel run in its own process (cancel-run.ts), counted as a slot. */
+  startCancel(run_id: string, job: CancelJob): Promise<void>;
   /** unblocked: Remove blocks (RunnerConfig.unblocked) for this resume. */
   /** manual: the operator picked `from` by hand — the only start that may go back before Pay Now once it was pressed. */
   resumeRun(run_id: string, from?: number, stopAfter?: number, unblocked?: boolean, manual?: boolean): Promise<void>;
@@ -480,6 +484,14 @@ export class FleetLink {
           throw new Error("the master has no runnable rows for this node");
         }
         return done(`started ${started.length}: ${started.join(", ")}`);
+      }
+      case "start_cancel": {
+        const parsed = StartCancelPayloadSchema.safeParse(cmd.payload);
+        if (!parsed.success) {
+          throw new Error(`bad start_cancel payload: ${parsed.error.issues[0]?.message}`);
+        }
+        await this.hooks.startCancel(parsed.data.run_id, parsed.data.job);
+        return done(`cancel run ${parsed.data.run_id} for row ${parsed.data.job.row_number}`);
       }
       case "resume":
       case "resume_from_last_success":

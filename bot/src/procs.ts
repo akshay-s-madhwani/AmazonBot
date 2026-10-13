@@ -23,7 +23,7 @@ export interface Proc {
   cmd: string;
 }
 
-export type FleetKind = "slot" | "runner" | "browser";
+export type FleetKind = "slot" | "runner" | "browser" | "cancel";
 
 export interface FleetProc extends Proc {
   kind: FleetKind;
@@ -98,6 +98,7 @@ export function fleetRoots(): FleetRoots {
 export function fleetProcesses(all: Proc[], roots: FleetRoots): FleetProc[] {
   const slot = norm(join(roots.dist, "slot.js"));
   const runner = norm(join(roots.dist, "runner.js"));
+  const cancel = norm(join(roots.dist, "cancel-run.js"));
   const profiles = norm(roots.profiles).replace(/\/+$/, "") + "/";
   const out: FleetProc[] = [];
   for (const p of all) {
@@ -107,6 +108,9 @@ export function fleetProcesses(all: Proc[], roots: FleetRoots): FleetProc[] {
       // The config is JSON on the command line, quotes escaped or not.
       const id = p.cmd.match(/run_id\\?"\s*:\s*\\?"([^"\\]+)/)?.[1] ?? null;
       out.push({ ...p, kind: "runner", runId: id, profileId: null });
+    } else if (cmd.includes(cancel)) {
+      // A cancel-flow run (cancel-run.ts): owns its browser like a slot does.
+      out.push({ ...p, kind: "cancel", runId: null, profileId: null });
     } else if (cmd.includes(slot)) {
       out.push({ ...p, kind: "slot", runId: null, profileId: null });
     } else if (cmd.includes(profiles) && /--user-data-dir/.test(cmd) && !/--type=/.test(cmd)) {
@@ -131,7 +135,7 @@ export interface LiveSet {
  */
 export function orphans(fleet: FleetProc[], live: LiveSet): FleetProc[] {
   return fleet.filter((p) => {
-    if (p.kind === "slot") return !live.slotPids.has(p.pid);
+    if (p.kind === "slot" || p.kind === "cancel") return !live.slotPids.has(p.pid);
     if (live.slotPids.has(p.ppid)) return false;
     if (p.kind === "runner") return !p.runId || !live.runIds.has(p.runId);
     return !p.profileId || !live.profileIds.has(p.profileId);
@@ -191,7 +195,7 @@ export async function killTree(pid: number, all: Proc[]): Promise<void> {
 
 /** One line for logs: what a fleet process is. */
 export function describe(p: FleetProc): string {
-  const what = p.kind === "runner" ? `runner ${p.runId ?? "?"}` : p.kind === "browser" ? `browser ${p.profileId ?? "?"}` : "slot";
+  const what = p.kind === "runner" ? `runner ${p.runId ?? "?"}` : p.kind === "browser" ? `browser ${p.profileId ?? "?"}` : p.kind;
   return `${what} (pid ${p.pid})`;
 }
 
@@ -200,7 +204,7 @@ export function describe(p: FleetProc): string {
  * skipping anything already taken down with an earlier tree.
  */
 export async function killAll(doomed: FleetProc[], all: Proc[]): Promise<FleetProc[]> {
-  const order: Record<FleetKind, number> = { slot: 0, runner: 1, browser: 2 };
+  const order: Record<FleetKind, number> = { slot: 0, cancel: 0, runner: 1, browser: 2 };
   const killed: FleetProc[] = [];
   for (const p of [...doomed].sort((a, b) => order[a.kind] - order[b.kind])) {
     if (!alive(p.pid)) continue;
