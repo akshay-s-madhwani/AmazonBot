@@ -28,6 +28,7 @@ bot/artifacts/
 master/artifacts/
 *artifacts/run-*/
 .env
+timing-profiles/*
 # Google service-account key (PRIVATE KEY — never commit)
 fyers-trading-*.json
 *-service-account*.json
