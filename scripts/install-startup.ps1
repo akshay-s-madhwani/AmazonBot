@@ -28,7 +28,10 @@ if ((Read-Setting 'DEPLOY_SECRET').Length -lt 32) {
     try { $rng.GetBytes($bytes) } finally { $rng.Dispose() }
     Set-Setting 'DEPLOY_SECRET' ([BitConverter]::ToString($bytes).Replace('-', '').ToLowerInvariant())
 }
-if (-not (Read-Setting 'DEPLOY_GITHUB_TOKEN')) {
+# A token handed in by install.bat / setup.bat wins; otherwise keep the saved one or ask.
+if ($env:DEPLOY_GITHUB_TOKEN) {
+    Set-Setting 'DEPLOY_GITHUB_TOKEN' $env:DEPLOY_GITHUB_TOKEN.Trim()
+} elseif (-not (Read-Setting 'DEPLOY_GITHUB_TOKEN')) {
     $secureToken = Read-Host 'GitHub token with Actions read access to this repo' -AsSecureString
     $token = [System.Net.NetworkCredential]::new('', $secureToken).Password
     if (-not $token) { throw 'A GitHub token is required to configure the webhook.' }
