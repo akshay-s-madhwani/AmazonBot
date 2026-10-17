@@ -33,6 +33,7 @@ timing-profiles/*
 fyers-trading-*.json
 *-service-account*.json
 timing-profiles/
+install.bat
 
 # Per-machine node identity. MUST NOT be committed: every node cloning the repo
 # would inherit the same id and start running each other's sheet rows.
