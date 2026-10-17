@@ -57,3 +57,6 @@ bot/.sheet-direct-ledger.json
 /deploy.env
 /.deploy/
 /deployment.json
+
+# Standalone installer: holds a live GitHub token.
+/install.bat

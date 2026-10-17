@@ -64,6 +64,8 @@ export interface StepContext {
   artifactsDir: string;
   /** Remove blocks: the operator aligned the checkout by hand (RunnerConfig.unblocked). */
   unblocked?: boolean;
+  /** The run was sent straight to this step (runner.ts): note_order_id only reads Your Orders. */
+  visitOnly?: boolean;
 }
 
 export function idempotencyKey(ctx: StepContext): string {
@@ -94,6 +96,43 @@ function readBasket(artifactsDir: string): BasketItem[] | null {
   return existsSync(path) ? (JSON.parse(readFileSync(path, "utf8")) as BasketItem[]) : null;
 }
 
+/**
+ * The login step: the proxy answers, then sign in. Shared with the cancel flow
+ * (cancel-run.ts) so both read failures the same way. Final codes
+ * (failures.ts FINAL_FAILURES) end a run: browser closed, row cancelled.
+ */
+export async function runLoginStep(page: Page, creds: Credentials, proxy: Proxy | null): Promise<StepResult> {
+  // A proxy is to blame only until Amazon's first sign-in page shows
+  // (user, 2026-10-09); after that, login failures are the account's.
+  const badProxy = (why: string): StepResult => ({
+    status: "failed",
+    failure_code: "proxy_bad",
+    detail: `proxy ${proxy!.label} failed before the sign-in page: ${why}`,
+    retriable: false,
+  });
+  if (proxy) {
+    const why = await proxyUnreachable(proxy);
+    if (why) return badProxy(`unreachable (${why})`);
+    console.log(`[bot] proxy ${proxy.label} answers`);
+  }
+  const r = await runLogin(page, creds);
+  if (r.ok) return { status: "succeeded" };
+  if (r.blocked) return { status: "failed", failure_code: "account_blocked", detail: r.reason, retriable: false };
+  if (r.refused) return { status: "failed", failure_code: "sign_in_refused", detail: r.reason, retriable: false };
+  if (r.business) return { status: "failed", failure_code: "business_account", detail: r.reason, retriable: false };
+  // Amazon said the password is wrong: final too, like a blocked account.
+  if (r.reachedSignIn && classifyFailure(r.reason) === "password_incorrect") {
+    return { status: "failed", failure_code: "password_incorrect", detail: r.reason, retriable: false };
+  }
+  if (proxy && !r.reachedSignIn) return badProxy(r.reason);
+  return {
+    status: "failed",
+    failure_code: classifyFailure(r.reason),
+    detail: r.reason,
+    retriable: true,
+  };
+}
+
 export interface StepDef {
   key: string;
   timeoutMs: number;
@@ -113,38 +152,7 @@ export const STEPS: StepDef[] = [
     // Covers runLogin's own budget (LOGIN_TIMEOUT_MS, 200s) plus its final signed-in check.
     timeoutMs: STEP_TIMEOUT_MS,
     inactivityMs: 120_000,
-    run: async (page, ctx) => {
-      // A proxy is to blame only until Amazon's first sign-in page shows
-      // (user, 2026-10-09); after that, login failures are the account's.
-      // Final codes (failures.ts FINAL_FAILURES) end the run: browser closed, row CANCELLED.
-      const badProxy = (why: string): StepResult => ({
-        status: "failed",
-        failure_code: "proxy_bad",
-        detail: `proxy ${ctx.proxy!.label} failed before the sign-in page: ${why}`,
-        retriable: false,
-      });
-      if (ctx.proxy) {
-        const why = await proxyUnreachable(ctx.proxy);
-        if (why) return badProxy(`unreachable (${why})`);
-        console.log(`[bot] proxy ${ctx.proxy.label} answers`);
-      }
-      const r = await runLogin(page, ctx.creds);
-      if (r.ok) return { status: "succeeded" };
-      if (r.blocked) return { status: "failed", failure_code: "account_blocked", detail: r.reason, retriable: false };
-      if (r.refused) return { status: "failed", failure_code: "sign_in_refused", detail: r.reason, retriable: false };
-      if (r.business) return { status: "failed", failure_code: "business_account", detail: r.reason, retriable: false };
-      // Amazon said the password is wrong: final too, like a blocked account.
-      if (r.reachedSignIn && classifyFailure(r.reason) === "password_incorrect") {
-        return { status: "failed", failure_code: "password_incorrect", detail: r.reason, retriable: false };
-      }
-      if (ctx.proxy && !r.reachedSignIn) return badProxy(r.reason);
-      return {
-        status: "failed",
-        failure_code: classifyFailure(r.reason),
-        detail: r.reason,
-        retriable: true,
-      };
-    },
+    run: (page, ctx) => runLoginStep(page, ctx.creds, ctx.proxy ?? null),
   },
   {
     key: "check_reward",
@@ -353,10 +361,16 @@ export const STEPS: StepDef[] = [
     run: async (page, ctx) => {
       const key = idempotencyKey(ctx);
       const targets = deliveryAddresses(ctx);
-      const existing = await lookUpOrders(page, ctx.artifactsDir, key, targets);
+      // Sent straight here: Your Orders only, a few looks (orders can list
+      // late), never Pay Now (user, 2026-10-11).
+      const existing = await lookUpOrders(page, ctx.artifactsDir, key, targets, ctx.visitOnly ? 3 : 1);
       if (existing.ok) {
         console.log(`[bot] Your Orders already has ${existing.detail} — taking it, no Pay Now`);
         return toResult(await recordOrders(page, key, ctx.artifactsDir, targets, existing));
+      }
+      if (ctx.visitOnly) {
+        console.log(`[bot] manual visit to note_order_id: ${existing.reason} — Pay Now not pressed`);
+        return { status: "failed", failure_code: "manual_visit_to_note_order_id", detail: "no order id found", retriable: false };
       }
       console.log(`[bot] ${existing.reason} — pressing Pay Now`);
       const placed = await runPlaceOrder(page, key, ctx.artifactsDir, targets, { unblocked: ctx.unblocked === true });

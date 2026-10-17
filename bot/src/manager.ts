@@ -37,14 +37,16 @@ import { describeNodeId, resolveNodeId } from "./node-id.js";
 import { JobClient, requireJobClient, type SheetJob } from "./job-client.js";
 import { sheetDirectMode } from "./sheet-direct.js";
 import { STEPS } from "./steps.js";
-import { describe as describeProc, fleetProcesses, fleetRoots, killAll, listProcesses, orphans, type FleetProc } from "./procs.js";
+import { describe as describeProc, fleetProcesses, fleetRoots, killAll, killTree, listProcesses, orphans, type FleetProc } from "./procs.js";
 import { profileIdForRun } from "./shardx.js";
+import type { CancelJob } from "@app/contracts";
 
 
 loadDotEnv();
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const SLOT_PATH = join(HERE, "slot.js");
+const CANCEL_PATH = join(HERE, "cancel-run.js");
 const UI_DIR = join(HERE, "..", "ui");
 const ARTIFACTS = join(HERE, "..", "artifacts");
 const DEPLOY_STATE = join(HERE, "..", "..", ".deploy");
@@ -94,6 +96,31 @@ interface SlotState {
 }
 
 const slots = new Map<number, SlotState>();
+
+/**
+ * THE CANCEL FLOW's runs (cancel-run.ts): one process each, owning its own
+ * browser. Not slots — no runner, resume or telemetry — but each one takes a
+ * slot index and counts against WORKER_COUNT and the RAM check like a slot.
+ */
+interface CancelState {
+  runId: string;
+  slotIndex: number;
+  token: string;
+  pid: number | null;
+  proc: ChildProcess | null;
+  startedAt: number;
+  stepKey: string | null;
+  done: boolean;
+}
+const cancels = new Map<string, CancelState>();
+
+function cancelAlive(c: CancelState): boolean {
+  if (c.done) return false;
+  if (c.proc) return c.proc.exitCode === null && c.proc.signalCode === null;
+  return pidAlive(c.pid);
+}
+
+const liveCancels = (): CancelState[] => [...cancels.values()].filter(cancelAlive);
 
 let fleet: FleetLink | null = null;
 let draining = false;
@@ -439,7 +466,10 @@ async function probeSlot(
 }
 
 function freeSlotIndex(): number {
-  const held = new Set([...slots.values()].filter(slotAlive).map((s) => s.slotIndex));
+  const held = new Set([
+    ...[...slots.values()].filter(slotAlive).map((s) => s.slotIndex),
+    ...liveCancels().map((c) => c.slotIndex),
+  ]);
   let i = 0;
   while (held.has(i)) i += 1;
   return i;
@@ -455,7 +485,7 @@ const MIN_FREE_MB_PER_SLOT = Number(process.env.MIN_FREE_MB_PER_SLOT ?? 600);
 const START_JITTER_MS = Number(process.env.START_JITTER_MS ?? 20_000);
 
 function liveSlotCount(): number {
-  return [...slots.values()].filter((s) => slotAlive(s) && s.status !== "DONE").length;
+  return [...slots.values()].filter((s) => slotAlive(s) && s.status !== "DONE").length + liveCancels().length;
 }
 
 function admit(requested: number): { granted: number; reason: string | null } {
@@ -740,10 +770,12 @@ let sweeping = false;
 
 function liveSet(): { slotPids: Set<number>; runIds: Set<string>; profileIds: Set<string> } {
   const live = [...slots.values()].filter(slotAlive);
+  // A cancel run's browser is its child, kept by its pid like a slot's.
+  const cx = liveCancels();
   return {
-    slotPids: new Set(live.flatMap((s) => (s.pid ? [s.pid] : []))),
-    runIds: new Set(live.map((s) => s.runId)),
-    profileIds: new Set(live.map((s) => profileIdForRun(s.runId))),
+    slotPids: new Set([...live.flatMap((s) => (s.pid ? [s.pid] : [])), ...cx.flatMap((c) => (c.pid ? [c.pid] : []))]),
+    runIds: new Set([...live.map((s) => s.runId), ...cx.map((c) => c.runId)]),
+    profileIds: new Set([...live.map((s) => profileIdForRun(s.runId)), ...cx.map((c) => profileIdForRun(c.runId))]),
   };
 }
 
@@ -1006,9 +1038,6 @@ app.post("/slots/event", (req: Request, res: Response) => {
     emit(s, "run.paused", {
       payload: {
         after_step: Number.isInteger(after) ? after : s.stepIndex,
-        // Stuck twice after proceed_to_buy (slot.ts rerunOrPause): the master
-        // pauses it from FAILED too, and frees its batch place.
-        ...(body.rerun_exhausted === true ? { reason: "rerun_exhausted" } : {}),
       },
     });
   }
@@ -1368,8 +1397,111 @@ async function waitForExit(s: SlotState, ms: number): Promise<boolean> {
   return gone();
 }
 
+/** Starts one cancel run in its own process. Refused like a slot when the machine has no room. */
+function startCancel(runId: string, job: CancelJob): void {
+  const existing = cancels.get(runId);
+  if (existing && cancelAlive(existing)) return;
+  if (existing) throw new Error(`cancel run ${runId} already ran here`);
+  admitOneOrThrow(`start of ${runId}`);
+  const slotIndex = freeSlotIndex();
+  const token = randomUUID();
+  const dir = join(ARTIFACTS, runId);
+  mkdirSync(logsDir(dir), { recursive: true });
+  writeFileSync(join(dir, "cancel-job.json"), JSON.stringify(job), { mode: 0o600 });
+  const proc = spawn(process.execPath, [CANCEL_PATH], {
+    detached: true,
+    stdio: ["ignore", "pipe", "pipe"],
+    windowsHide: true,
+    env: {
+      ...process.env,
+      CANCEL_RUN_ID: runId,
+      CANCEL_TOKEN: token,
+      SLOT_INDEX: String(slotIndex),
+      MANAGER_URL,
+      SLOT_HEADLESS: /^(0|false|no|off)$/i.test((process.env.FLEET_HEADLESS ?? "").trim()) ? "false" : "true",
+    },
+  });
+  const out = openLog(dir, "cancel");
+  tee(proc.stdout, out, `[cancel${slotIndex}]`);
+  tee(proc.stderr, out, `[cancel${slotIndex}!]`);
+  const state: CancelState = {
+    runId, slotIndex, token, pid: proc.pid ?? null, proc, startedAt: Date.now(), stepKey: "login", done: false,
+  };
+  proc.on("exit", (code, signal) => {
+    state.done = true;
+    log(`cancel run ${runId} (slot ${slotIndex}) exited (code=${code} signal=${signal})`);
+    setTimeout(() => {
+      if (cancels.get(runId) === state) cancels.delete(runId);
+    }, 60_000).unref();
+  });
+  proc.unref();
+  cancels.set(runId, state);
+  log(`started cancel run ${runId} in slot ${slotIndex} for row ${job.row_number}: ${job.order_ids.join(", ")} pid=${proc.pid}`);
+}
+
+/** Stops a cancel run: it closes its browser on the stop flag, else it is killed with its browser. */
+async function stopCancel(c: CancelState): Promise<void> {
+  if (!cancelAlive(c)) return;
+  try {
+    writeFileSync(join(ARTIFACTS, c.runId, "stop"), new Date().toISOString());
+  } catch {
+    // Killed below instead.
+  }
+  const until = Date.now() + RESET_GRACE_MS;
+  while (Date.now() < until && cancelAlive(c)) await new Promise((r) => setTimeout(r, 250));
+  if (cancelAlive(c) && c.pid) {
+    log(`cancel run ${c.runId} did not stop in time — killing it and its browser`);
+    await killTree(c.pid, await listProcesses().catch(() => []));
+  }
+  c.done = true;
+}
+
+/** Cancel runs left by an earlier manager: still running this folder's cancel-run.js? Keep counting them. */
+async function reattachCancels(): Promise<void> {
+  let dirs: string[] = [];
+  try {
+    dirs = readdirSync(ARTIFACTS).filter((d) => d.startsWith("cancel-"));
+  } catch {
+    return;
+  }
+  const ours = new Set(
+    fleetProcesses(await listProcesses().catch(() => []), fleetRoots())
+      .filter((p) => p.kind === "cancel")
+      .map((p) => p.pid),
+  );
+  for (const d of dirs) {
+    const file = join(ARTIFACTS, d, "cancel.json");
+    if (!existsSync(file) || cancels.has(d)) continue;
+    try {
+      const e = JSON.parse(readFileSync(file, "utf8")) as { runId: string; slotIndex: number; pid: number; token: string; startedAt: number };
+      if (!ours.has(e.pid)) {
+        rmSync(file, { force: true });
+        continue;
+      }
+      cancels.set(e.runId, {
+        runId: e.runId, slotIndex: e.slotIndex, token: e.token, pid: e.pid, proc: null,
+        startedAt: e.startedAt, stepKey: null, done: false,
+      });
+      log(`reattached cancel run ${e.runId} (slot ${e.slotIndex}, pid ${e.pid})`);
+    } catch {
+      // Unreadable: the run reports for itself; the sweep handles its browser.
+    }
+  }
+}
+
+/** Step reports from cancel runs, for the heartbeat's slot list. */
+app.post("/cancels/event", (req: Request, res: Response) => {
+  const body = (req.body ?? {}) as { token?: string; runId?: string; stepKey?: string; status?: string };
+  const c = body.runId ? cancels.get(body.runId) : undefined;
+  if (!c || body.token !== c.token) return res.status(401).json({ error: "bad token" });
+  if (typeof body.stepKey === "string") c.stepKey = body.stepKey;
+  return res.json({ ok: true });
+});
+
 const hooks: FleetHooks = {
   startPushedJob: async (run_id, job, stopAfter) => startPushedJob(run_id, job, stopAfter).runId,
+
+  startCancel: async (run_id, job) => startCancel(run_id, job),
 
   startJobs: async (instances) => {
     const started = await startInstances(instances);
@@ -1399,6 +1531,8 @@ const hooks: FleetHooks = {
   },
 
   probeRun: async (run_id) => {
+    const c = cancels.get(run_id);
+    if (c) return { has_slot: cancelAlive(c), accepted: true, slot_status: cancelAlive(c) ? "BUSY" : "DONE", browser_alive: null, step_index: null };
     const s = slotByRun(run_id);
     const accepted = (() => {
       try {
@@ -1424,10 +1558,14 @@ const hooks: FleetHooks = {
   },
 
   cancelRun: async (run_id) => {
+    const c = cancels.get(run_id);
+    if (c) return stopCancel(c);
     await slotCall(liveSlotFor(run_id, "cancel"), "/cancel");
   },
 
   closeSession: async (run_id) => {
+    const c = cancels.get(run_id);
+    if (c) return stopCancel(c);
     await slotCall(liveSlotFor(run_id, "close_session"), "/cancel");
   },
 
@@ -1478,6 +1616,8 @@ const hooks: FleetHooks = {
     // that off, which loses the profile's cookie jar and never tells the
     // master the browser closed.
     await Promise.all(live.map((s) => slotCall(s, "/cancel", "", RESET_GRACE_MS).catch(() => undefined)));
+    // Cancel runs are closed too: a reset leaves no browser open.
+    await Promise.all(liveCancels().map((c) => stopCancel(c).catch(() => undefined)));
     await Promise.all(
       live.map(async (s) => {
         if (!(await waitForExit(s, RESET_GRACE_MS))) {
@@ -1561,7 +1701,17 @@ const hooks: FleetHooks = {
       browser_idle_ms: s.browserIdleMs,
       tab_count: s.tabCount,
       stuck_for_ms: s.stuckSince === null ? null : Date.now() - s.stuckSince,
-    })),
+    })).concat(liveCancels().map((c) => ({
+      slot_index: c.slotIndex,
+      status: "busy" as const,
+      current_run_id: c.runId,
+      step_index: null,
+      step_key: c.stepKey,
+      browser_alive: null,
+      browser_idle_ms: null,
+      tab_count: null,
+      stuck_for_ms: null,
+    }))),
 
   workerCount: () => Math.max(0, advertisedWorkerCount),
 };
@@ -1657,6 +1807,7 @@ app.listen(PORT, "127.0.0.1", () => {
   log(`  start:   curl -X POST ${MANAGER_URL}/fleet/start`);
   log(`  status:  curl ${MANAGER_URL}/fleet/status`);
   void reattachSlots()
+    .then(() => reattachCancels())
     .then(() => { managerReady = true; })
     .catch((err: unknown) => log(`reattach failed: ${(err as Error).message}`))
     .finally(() => {

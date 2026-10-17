@@ -3,8 +3,9 @@ setlocal enabledelayedexpansion
 
 rem Bot machine setup. Lives at the AmazonBot root, next to bot\ and packages\,
 rem and works from a fresh copy: no node_modules, no dist anywhere.
-rem   setup.bat                        asks for the control panel URL
-rem   setup.bat http://1.2.3.4         or pass it in
+rem   setup.bat                        asks for the control panel URL and GitHub token
+rem   setup.bat http://1.2.3.4 [token] or pass them in (install.bat does); the
+rem                                    token may also come in DEPLOY_GITHUB_TOKEN
 
 cd /d "%~dp0"
 title Bot setup
@@ -14,6 +15,37 @@ echo  ===========================================================
 echo   Bot machine setup
 echo  ===========================================================
 echo.
+
+rem ---- this machine's node id -> bot\.node-id ----------------------------------
+rem Asked first, before the long installs, and only when bot\.node-id holds no
+rem valid id. Enter takes the machine name. An id already in use is rejected by
+rem the master; a copied folder's approval for another machine is discarded by
+rem the bot at start.
+set "NODE_ID="
+if exist "bot\.node-id" set /p NODE_ID=<"bot\.node-id"
+if defined NODE_ID call :valid_node_id "!NODE_ID!" || set "NODE_ID="
+if defined NODE_ID (
+  echo  [ok] node id: !NODE_ID!
+  goto :node_id_done
+)
+for /f "delims=" %%i in ('powershell -NoProfile -Command "$env:COMPUTERNAME.ToLower()"') do set "NODE_ID_DEFAULT=%%i"
+
+:ask_node_id
+set "NODE_ID="
+set /p "NODE_ID=  Node id [!NODE_ID_DEFAULT!]: "
+if "!NODE_ID!"=="" set "NODE_ID=!NODE_ID_DEFAULT!"
+call :valid_node_id "!NODE_ID!"
+if errorlevel 1 (
+  echo  [X] Use letters, digits, - or _ only.
+  goto :ask_node_id
+)
+> "bot\.node-id" echo !NODE_ID!
+echo  [ok] node id: !NODE_ID!
+:node_id_done
+
+rem ---- GitHub token for deployments -- from install.bat, else asked later -------
+if not "%~2"=="" set "DEPLOY_GITHUB_TOKEN=%~2"
+if defined DEPLOY_GITHUB_TOKEN echo  [ok] GitHub token provided
 
 rem ---- Node.js 22+ -- installed through nvm for Windows when missing/too old --
 rem An nvm install from an earlier run may not be on this window's PATH yet.
@@ -103,36 +135,6 @@ findstr /v /b /i /c:"MASTER_URL=" "bot\.env" > "bot\.env.tmp"
 move /y "bot\.env.tmp" "bot\.env" >nul
 echo  [ok] MASTER_URL written to bot\.env
 
-rem ---- this machine's node id -> bot\.node-id ----------------------------------
-rem Kept without asking when this machine is already approved as bot\.node-id
-rem (scripts\approved-node-id.mjs). Otherwise asked; Enter takes the machine
-rem name. A copied folder's approval for another id is discarded by the bot at
-rem start, and an id already in use is rejected by the master.
-set "NODE_ID_APPROVED="
-for /f "delims=" %%i in ('node scripts\approved-node-id.mjs 2^>nul') do set "NODE_ID_APPROVED=%%i"
-if defined NODE_ID_APPROVED (
-  echo  [ok] node id: !NODE_ID_APPROVED! ^(already approved^)
-  goto :node_id_done
-)
-set "NODE_ID_CURRENT="
-if exist "bot\.node-id" set /p NODE_ID_CURRENT=<"bot\.node-id"
-if defined NODE_ID_CURRENT echo  current node id: !NODE_ID_CURRENT!
-for /f "delims=" %%i in ('node -p "process.env.COMPUTERNAME.toLowerCase()"') do set "NODE_ID_DEFAULT=%%i"
-
-:ask_node_id
-set "NODE_ID_IN="
-echo.
-set /p "NODE_ID_IN=  Node id [!NODE_ID_DEFAULT!]: "
-if "!NODE_ID_IN!"=="" set "NODE_ID_IN=!NODE_ID_DEFAULT!"
-node -e "process.exit(/^[A-Za-z0-9_-]{1,64}$/.test(process.env.NODE_ID_IN)?0:1)"
-if errorlevel 1 (
-  echo  [X] Use letters, digits, - or _ only.
-  goto :ask_node_id
-)
-> "bot\.node-id" echo !NODE_ID_IN!
-echo  [ok] node id: !NODE_ID_IN!
-:node_id_done
-
 rem ---- install + build, in dependency order -------------------------------------
 echo.
 echo  Installing dependencies ^(this takes a few minutes the first time^)...
@@ -151,7 +153,7 @@ echo  [ok] profile store: %CD%\browser-profiles
 popd
 
 call npm install --global pm2@6.0.14 --no-audit --no-fund || goto :failed
-rem Creates/validates deploy.env, prompts for missing credentials, and registers startup.
+rem Creates/validates deploy.env, takes DEPLOY_GITHUB_TOKEN or prompts for it, and registers startup.
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\install-startup.ps1 || goto :failed
 > "start.bat" echo @echo off
 >> "start.bat" echo call "%%~dp0run-manager.bat"
@@ -176,6 +178,12 @@ echo.
 echo  The bot is managed by PM2. Use stop-manager.bat to stop it.
 pause
 exit /b 0
+
+rem errorlevel 0 when %1 is a usable node id: letters, digits, - or _ (1-64).
+:valid_node_id
+set "NODE_ID_CHECK=%~1"
+powershell -NoProfile -Command "exit [int]($env:NODE_ID_CHECK -cnotmatch '^[A-Za-z0-9_-]{1,64}$')"
+exit /b %errorlevel%
 
 :build_pkg
 echo  --- %~2 ---

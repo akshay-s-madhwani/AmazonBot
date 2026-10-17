@@ -135,11 +135,9 @@ export async function deploy(release: Release): Promise<void> {
         if (await git(["rev-parse", ref]) !== release.sha) throw new Error("PR changed after its build; rebuild it first");
       } else if (await git(["rev-parse", "origin/main"]) !== release.sha) throw new Error("Superseded release; only current main can deploy");
       const oldSha = await git(["rev-parse", "HEAD"]);
-      const oldVersion = await jsonFile<{ prNumber?: number }>(versionFile);
-      // Explicit PR selection may switch branches. Main may also replace a PR
-      // deployed before a squash merge, whose commit is not an ancestor of main.
-      if (release.prNumber === undefined && oldVersion?.prNumber === undefined)
-        await git(["merge-base", "--is-ancestor", oldSha, release.sha]);
+      // A clean checkout may come from a manually installed branch or squash-
+      // merged PR. The verified current-main/PR check above approves the target;
+      // ancestry is not required. Keep oldSha for transactional rollback.
       const tree = await git(["ls-tree", release.sha, "packages"]);
       const packagesSha = /^160000 commit ([a-f0-9]{40})\tpackages$/.exec(tree)?.[1];
       if (!packagesSha) throw new Error("Missing packages submodule");

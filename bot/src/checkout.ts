@@ -2127,38 +2127,6 @@ function writeLedger(artifactsDir: string, entries: LedgerEntry[]): void {
   renameSync(path + ".tmp", path);
 }
 
-/** A recorded press younger than this may still be listing on Your Orders: wait it out first. */
-const REPRESS_AFTER_MS = 120_000;
-
-/**
- * A recorded Pay Now press, seen from a later attempt: null = it may have gone
- * through (the page left checkout, or Pay Now is gone) — never press again;
- * { ordered } = Your Orders now lists it; otherwise why it certainly did not.
- */
-async function pressDidNotGoThrough(
-  page: Page,
-  prior: LedgerEntry,
-  artifactsDir: string,
-  idempotencyKey: string,
-  addresses: TargetAddress[],
-): Promise<{ ordered: boolean; detail: string } | null> {
-  if (/thankyou/i.test(page.url()) || !(await atCheckoutPipeline(page))) return null;
-  await dismissCheckoutModal(page);
-  if (!(await findPayNow(page))) return null;
-  // Your Orders, until the press is old enough that its orders would show.
-  for (;;) {
-    const found = await lookUpOrders(page, artifactsDir, idempotencyKey, addresses, 1);
-    if (found.ok) return { ordered: true, detail: `Your Orders has ${found.detail}` };
-    const age = Date.now() - Date.parse(prior.placed_at);
-    if (!Number.isFinite(age) || age >= REPRESS_AFTER_MS) break;
-    console.log(`[bot] earlier Pay Now press is ${Math.round(age / 1000)}s old, nothing on Your Orders yet — checking again before pressing`);
-    await sleep(Math.min(15_000, REPRESS_AFTER_MS - age));
-  }
-  // Re-read: the page may have moved while Your Orders was being checked.
-  if (/thankyou/i.test(page.url()) || !(await atCheckoutPipeline(page)) || !(await findPayNow(page))) return null;
-  return { ordered: false, detail: "Your Orders has no order for it and checkout still shows Pay Now" };
-}
-
 /**
  * PAY NOW. note_order_id has already looked on Your Orders by the sheet's
  * address names and found nothing, so this is the press.
@@ -2177,21 +2145,12 @@ export async function runPlaceOrder(
 ): Promise<CheckoutResult> {
   const ledger = readLedger(artifactsDir);
   const prior = ledger.find((e) => e.key === idempotencyKey);
-  // A press is recorded BEFORE it is made, so a press that never reached
-  // Amazon (the Prime offer took the click) is recorded too. Pressed again
-  // only when that is certain: Your Orders has nothing new for the sheet's
-  // names (checked by the caller, and again here until the press is old enough
-  // for a slow multi-address listing) AND this page is still checkout with
-  // Pay Now on it — after a real order Amazon leaves checkout and the cart is
-  // empty. Otherwise, as before: never clicks twice; ids are read next.
-  // (2026-10-10: a restart after a swallowed press never pressed again.)
-  let repress = false;
+  // ONE press per purchase: a press is recorded before it is made, and once
+  // recorded Pay Now is never pressed again by the bot — the order ids are
+  // read next. The "press again when Your Orders shows nothing yet" rule
+  // placed the same order several times (user, 2026-10-11).
   if (prior && !opts.unblocked) {
-    const why = await pressDidNotGoThrough(page, prior, artifactsDir, idempotencyKey, addresses);
-    if (why === null) return { ok: true, detail: `already submitted at ${prior.placed_at}; order ids are read next` };
-    if (why.ordered) return { ok: true, detail: `submitted at ${prior.placed_at}: ${why.detail}; order ids are read next` };
-    console.log(`[bot] pressed at ${prior.placed_at} but ${why.detail} — that press did not go through; pressing Pay Now again`);
-    repress = true;
+    return { ok: true, detail: `already submitted at ${prior.placed_at}; order ids are read next` };
   }
   const basketFile = join(artifactsDir, "expected-basket.json");
   const basket = existsSync(basketFile) ? (JSON.parse(readFileSync(basketFile, "utf8")) as BasketItem[]) : [];
@@ -2249,10 +2208,8 @@ export async function runPlaceOrder(
   const shipping = review.ok ? review.shipping : addresses;
   const known = await knownOrderIds(page);
   if (prior) {
-    // Pressing again on the same purchase record. Remove blocks takes a fresh
-    // "before"; a re-press after a swallowed click keeps the first one, so an
-    // order from that press that lists late is still found as new.
-    if (!repress) prior.known_orders = known;
+    // Remove blocks pressing again on the same purchase record: a fresh "before".
+    prior.known_orders = known;
     prior.ship_to = shipping.map((t) => t.fullName);
   } else {
     const intent = await requireJobClient().beginPurchase(runId, jobId);
