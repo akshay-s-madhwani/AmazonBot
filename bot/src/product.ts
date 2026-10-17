@@ -185,16 +185,36 @@ function chooseRow(box: BuyBox, pref: PurchaseOption): { id: string; why: string
   return null;
 }
 
+/**
+ * Opens one buy-box row (One-time purchase, Subscribe & Save…) and waits for
+ * it to be the active one. Checked by the row's NAME, polled: signed in,
+ * Amazon redraws the buy box after the click, and a single read 0.4s later
+ * (BOT_PACE 0.3) found it not yet active — "could not select purchase
+ * option" on every one_time row (2026-10-10). A click that never took is
+ * pressed once more as a real click.
+ */
 async function selectRow(page: Page, rowId: string): Promise<boolean> {
-  const header = page.locator(`#${rowId} .a-accordion-row`).first();
-  if ((await header.count()) === 0) return false;
-  await header.scrollIntoViewIfNeeded({ timeout: 5_000 }).catch(() => { });
-  await shortPause();
-  await header.dispatchEvent("click");
-  await page.waitForLoadState("domcontentloaded", { timeout: NAV_TIMEOUT_MS }).catch(() => { });
-  await pause("purchase option selected");
-  const after = await readBuyBox(page);
-  return after.rows.some((r) => r.id === rowId && r.active);
+  const name = (await readBuyBox(page)).rows.find((r) => r.id === rowId)?.name ?? "";
+  const isActive = async (): Promise<boolean> =>
+    (await readBuyBox(page)).rows.some((r) => (name ? r.name === name : r.id === rowId) && r.active);
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    // By name again: a redraw can renumber the row (newAccordionRow_0).
+    const target = name ? `[data-a-accordion-row-name="${name}"]` : `#${rowId}`;
+    const header = page.locator(`${target} .a-accordion-row`).filter({ visible: true }).first();
+    if ((await header.count()) === 0) return false;
+    await header.scrollIntoViewIfNeeded({ timeout: 5_000 }).catch(() => { });
+    await shortPause();
+    if (attempt === 1) await header.dispatchEvent("click");
+    else await header.click({ timeout: 10_000 }).catch(() => header.dispatchEvent("click"));
+    await page.waitForLoadState("domcontentloaded", { timeout: NAV_TIMEOUT_MS }).catch(() => { });
+    await pause("purchase option selected");
+    for (const deadline = Date.now() + 12_000; Date.now() < deadline; ) {
+      if (await isActive()) return true;
+      await sleep(1000);
+    }
+    console.log(`[bot] purchase option "${name || rowId}" not active yet — pressing it again`);
+  }
+  return isActive();
 }
 
 export async function runOpenProduct(page: Page, spec: ProductSpec): Promise<ProductResult> {

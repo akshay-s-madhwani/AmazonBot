@@ -82,6 +82,9 @@ async function liveTest(url: string): Promise<void> {
       calls.push(`startPushed:${run_id}:row${job.rowNumber}`);
       return run_id;
     },
+    startCancel: async (id) => {
+      calls.push(`startCancel:${id}`);
+    },
     startJobs: async (n) => {
       calls.push(`startJobs:${n}`);
       return [RUN, "run-2"].slice(0, n);

@@ -1,8 +1,23 @@
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { productIdentity, type BasketItem } from "./purchase-evidence.js";
-import type { Page } from "./pw.js";
+import { runAddresses } from "./address.js";
+import { allocate, placeFreeItems, type FreeItem } from "./allocation.js";
+import {
+  lookUpOrders,
+  openCart,
+  readFreebieMessages,
+  readOfferedFreebie,
+  recordOrders,
+  runAddToCart,
+  runApplyPayment,
+  runClearCart,
+  runNoteOrderId,
+  runPlaceOrder,
+  runProceedToBuy,
+  runSelectAddresses,
+  saveOrdersBefore,
+} from "./checkout.js";
 import type {
   Credentials,
   PaymentCode,
@@ -13,30 +28,15 @@ import type {
   RewardSpec,
   TargetAddress,
 } from "./config.js";
-import { runLogin } from "./login.js";
-import { proxyUnreachable, type Proxy } from "./proxy.js";
-import { runCheckReward } from "./reward.js";
-import { runAddresses } from "./address.js";
-import { runApplyCoupon, runOpenProduct, runSetQuantity } from "./product.js";
-import {
-  openCart,
-  readFreebieMessages,
-  readOfferedFreebie,
-  runAddToCart,
-  runApplyPayment,
-  saveOrdersBefore,
-  runClearCart,
-  lookUpOrders,
-  recordOrders,
-  runNoteOrderId,
-  runPlaceOrder,
-  runProceedToBuy,
-  runSelectAddresses,
-} from "./checkout.js";
-import { classifyFailure, type StepResult } from "./protocol.js";
-import { allocate, placeFreeItems, type FreeItem } from "./allocation.js";
-import { runAddVouchers } from "./vouchers.js";
 import { pause, sleep } from "./human.js";
+import { runLogin } from "./login.js";
+import { runApplyCoupon, runOpenProduct, runSetQuantity } from "./product.js";
+import { classifyFailure, type StepResult } from "./protocol.js";
+import { proxyUnreachable, type Proxy } from "./proxy.js";
+import { productIdentity, type BasketItem } from "./purchase-evidence.js";
+import type { Page } from "./pw.js";
+import { runCheckReward } from "./reward.js";
+import { runAddVouchers } from "./vouchers.js";
 
 /**
  * A hard stop for local debugging only. Keep it null in anything the panel
@@ -64,6 +64,8 @@ export interface StepContext {
   artifactsDir: string;
   /** Remove blocks: the operator aligned the checkout by hand (RunnerConfig.unblocked). */
   unblocked?: boolean;
+  /** The run was sent straight to this step (runner.ts): note_order_id only reads Your Orders. */
+  visitOnly?: boolean;
 }
 
 export function idempotencyKey(ctx: StepContext): string {
@@ -94,6 +96,43 @@ function readBasket(artifactsDir: string): BasketItem[] | null {
   return existsSync(path) ? (JSON.parse(readFileSync(path, "utf8")) as BasketItem[]) : null;
 }
 
+/**
+ * The login step: the proxy answers, then sign in. Shared with the cancel flow
+ * (cancel-run.ts) so both read failures the same way. Final codes
+ * (failures.ts FINAL_FAILURES) end a run: browser closed, row cancelled.
+ */
+export async function runLoginStep(page: Page, creds: Credentials, proxy: Proxy | null): Promise<StepResult> {
+  // A proxy is to blame only until Amazon's first sign-in page shows
+  // (user, 2026-10-09); after that, login failures are the account's.
+  const badProxy = (why: string): StepResult => ({
+    status: "failed",
+    failure_code: "proxy_bad",
+    detail: `proxy ${proxy!.label} failed before the sign-in page: ${why}`,
+    retriable: false,
+  });
+  if (proxy) {
+    const why = await proxyUnreachable(proxy);
+    if (why) return badProxy(`unreachable (${why})`);
+    console.log(`[bot] proxy ${proxy.label} answers`);
+  }
+  const r = await runLogin(page, creds);
+  if (r.ok) return { status: "succeeded" };
+  if (r.blocked) return { status: "failed", failure_code: "account_blocked", detail: r.reason, retriable: false };
+  if (r.refused) return { status: "failed", failure_code: "sign_in_refused", detail: r.reason, retriable: false };
+  if (r.business) return { status: "failed", failure_code: "business_account", detail: r.reason, retriable: false };
+  // Amazon said the password is wrong: final too, like a blocked account.
+  if (r.reachedSignIn && classifyFailure(r.reason) === "password_incorrect") {
+    return { status: "failed", failure_code: "password_incorrect", detail: r.reason, retriable: false };
+  }
+  if (proxy && !r.reachedSignIn) return badProxy(r.reason);
+  return {
+    status: "failed",
+    failure_code: classifyFailure(r.reason),
+    detail: r.reason,
+    retriable: true,
+  };
+}
+
 export interface StepDef {
   key: string;
   timeoutMs: number;
@@ -101,42 +140,23 @@ export interface StepDef {
   run(page: Page, ctx: StepContext): Promise<StepResult>;
 }
 
+/**
+ * Every step may take 10 minutes (user, 2026-10-09): 2 min failed set_address
+ * on its 6th address and cut short the slower, steadier checkout.
+ */
+const STEP_TIMEOUT_MS = 600_000;
+
 export const STEPS: StepDef[] = [
   {
     key: "login",
     // Covers runLogin's own budget (LOGIN_TIMEOUT_MS, 200s) plus its final signed-in check.
-    timeoutMs: 300_000,
+    timeoutMs: STEP_TIMEOUT_MS,
     inactivityMs: 120_000,
-    run: async (page, ctx) => {
-      // A proxy is to blame only until Amazon's first sign-in page shows
-      // (user, 2026-10-09); after that, login failures are the account's.
-      // Both final codes end the run: browser closed, row CANCELLED.
-      const badProxy = (why: string): StepResult => ({
-        status: "failed",
-        failure_code: "proxy_bad",
-        detail: `proxy ${ctx.proxy!.label} failed before the sign-in page: ${why}`,
-        retriable: false,
-      });
-      if (ctx.proxy) {
-        const why = await proxyUnreachable(ctx.proxy);
-        if (why) return badProxy(`unreachable (${why})`);
-        console.log(`[bot] proxy ${ctx.proxy.label} answers`);
-      }
-      const r = await runLogin(page, ctx.creds);
-      if (r.ok) return { status: "succeeded" };
-      if (r.blocked) return { status: "failed", failure_code: "account_blocked", detail: r.reason, retriable: false };
-      if (ctx.proxy && !r.reachedSignIn) return badProxy(r.reason);
-      return {
-        status: "failed",
-        failure_code: classifyFailure(r.reason),
-        detail: r.reason,
-        retriable: true,
-      };
-    },
+    run: (page, ctx) => runLoginStep(page, ctx.creds, ctx.proxy ?? null),
   },
   {
     key: "check_reward",
-    timeoutMs: 300_000,
+    timeoutMs: STEP_TIMEOUT_MS,
     inactivityMs: 90_000,
     run: async (page, ctx) => {
       const r = await runCheckReward(page, ctx.rewards, ctx.markReward);
@@ -157,23 +177,23 @@ export const STEPS: StepDef[] = [
   },
   {
     key: "set_address",
-    timeoutMs: 120_000,
+    timeoutMs: STEP_TIMEOUT_MS,
     inactivityMs: 90_000,
     run: async (page, ctx) => {
       const r = await runAddresses(page, deliveryAddresses(ctx));
       return r.ok
         ? { status: "succeeded" }
         : {
-            status: "failed",
-            failure_code: classifyFailure(r.reason),
-            detail: r.reason,
-            retriable: true,
-          };
+          status: "failed",
+          failure_code: classifyFailure(r.reason),
+          detail: r.reason,
+          retriable: true,
+        };
     },
   },
   {
     key: "clear_cart",
-    timeoutMs: 120_000,
+    timeoutMs: STEP_TIMEOUT_MS,
     inactivityMs: 60_000,
     run: async (page) => toResult(await runClearCart(page)),
   },
@@ -214,7 +234,7 @@ export const STEPS: StepDef[] = [
         const label = `item ${i + 1}/${ctx.products.length}`;
         console.log(
           `[bot] -- ${label}: ${item.url} x${item.quantity}` +
-            (plan.multi ? ` (${plan.totals[i]} over ${plan.shares[i]!.join("/")})` : "") + " --",
+          (plan.multi ? ` (${plan.totals[i]} over ${plan.shares[i]!.join("/")})` : "") + " --",
         );
 
         const opened = await runOpenProduct(page, item);
@@ -273,7 +293,7 @@ export const STEPS: StepDef[] = [
       for (const [f, item] of freeItems.entries()) {
         console.log(
           `[bot] free item: ${item.title.slice(0, 60)} (${item.sku}) x${item.quantity}` +
-            (freeShares ? ` -> ${freeShares[f]!.join("/")}` : ""),
+          (freeShares ? ` -> ${freeShares[f]!.join("/")}` : ""),
         );
         expected.push({ ...item, free: true, ...(freeShares ? { shares: freeShares[f]! } : {}) });
       }
@@ -285,7 +305,7 @@ export const STEPS: StepDef[] = [
   },
   {
     key: "proceed_to_buy",
-    timeoutMs: 120_000,
+    timeoutMs: STEP_TIMEOUT_MS,
     inactivityMs: 60_000,
     run: async (page) => toResult(await runProceedToBuy(page)),
   },
@@ -303,7 +323,7 @@ export const STEPS: StepDef[] = [
   },
   {
     key: "select_address",
-    timeoutMs: 120_000,
+    timeoutMs: STEP_TIMEOUT_MS,
     inactivityMs: 60_000,
     run: async (page, ctx) => {
       const targets = deliveryAddresses(ctx);
@@ -318,7 +338,7 @@ export const STEPS: StepDef[] = [
   },
   {
     key: "select_payment",
-    timeoutMs: 120_000,
+    timeoutMs: STEP_TIMEOUT_MS,
     inactivityMs: 90_000,
     run: async (page, ctx) => {
       const paid = await runApplyPayment(page, ctx.payment);
@@ -336,15 +356,21 @@ export const STEPS: StepDef[] = [
     // Now. Otherwise Pay Now, then the ids the same way. Was confirm_order +
     // note_order_id until 2026-10-07; orders-first since 2026-10-08.
     key: "note_order_id",
-    timeoutMs: 300_000,
+    timeoutMs: STEP_TIMEOUT_MS,
     inactivityMs: 180_000,
     run: async (page, ctx) => {
       const key = idempotencyKey(ctx);
       const targets = deliveryAddresses(ctx);
-      const existing = await lookUpOrders(page, ctx.artifactsDir, key, targets);
+      // Sent straight here: Your Orders only, a few looks (orders can list
+      // late), never Pay Now (user, 2026-10-11).
+      const existing = await lookUpOrders(page, ctx.artifactsDir, key, targets, ctx.visitOnly ? 3 : 1);
       if (existing.ok) {
         console.log(`[bot] Your Orders already has ${existing.detail} — taking it, no Pay Now`);
         return toResult(await recordOrders(page, key, ctx.artifactsDir, targets, existing));
+      }
+      if (ctx.visitOnly) {
+        console.log(`[bot] manual visit to note_order_id: ${existing.reason} — Pay Now not pressed`);
+        return { status: "failed", failure_code: "manual_visit_to_note_order_id", detail: "no order id found", retriable: false };
       }
       console.log(`[bot] ${existing.reason} — pressing Pay Now`);
       const placed = await runPlaceOrder(page, key, ctx.artifactsDir, targets, { unblocked: ctx.unblocked === true });
@@ -372,8 +398,44 @@ export const LAST_STEP_INDEX: number = (() => {
   if (i < 0) {
     throw new Error(
       `LAST_STEP in steps.ts is "${LAST_STEP}", which is not a step key. ` +
-        `Use one of: ${STEPS.map((s) => s.key).join(", ")}`,
+      `Use one of: ${STEPS.map((s) => s.key).join(", ")}`,
     );
   }
   return i;
 })();
+
+/**
+ * THE PAY NOW GUARD (user, 2026-10-10): once this run has pressed Pay Now (its
+ * ledger, orders-placed.json, holds the press — written just before it), no
+ * start goes back before note_order_id: a rerun, Run all, Next, Resume or
+ * Remove blocks reads the order ids instead of buying again (it went back,
+ * re-placed, and failed on the spent balance). Only a start step the operator
+ * picked by hand (cfg.manual) may.
+ */
+
+
+export function payNowPressed(artifactsDir: string): boolean {
+  const file = join(artifactsDir, "orders-placed.json");
+  if (!existsSync(file)) return false;
+  try {
+    const entries: unknown = JSON.parse(readFileSync(file, "utf8"));
+    return Array.isArray(entries) && entries.length > 0;
+  } catch {
+    return true; // unreadable: assume pressed — the safe side
+  }
+}
+
+export function guardPaid(from: number, cfg: { artifacts_dir: string; manual?: boolean }): number {
+  const NOTE_INDEX = STEPS.findIndex((s) => s.key === "note_order_id");
+  if (NOTE_INDEX < 0 || from >= NOTE_INDEX || !payNowPressed(cfg.artifacts_dir)) return from;
+  const key = STEPS[from]?.key ?? String(from);
+  if (cfg.manual) {
+    console.warn(`[runner] Pay Now was already pressed in this run — starting at step ${from} ${key} anyway`);
+    return from;
+  }
+  console.warn(
+    `[runner] Pay Now was already pressed in this run — not going back to step ${from} ${key}; ` +
+      `reading the order ids (step ${NOTE_INDEX} note_order_id) instead`,
+  );
+  return NOTE_INDEX;
+}

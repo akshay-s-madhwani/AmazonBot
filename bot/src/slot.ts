@@ -71,6 +71,8 @@ let runnerControlPort: number | null = null;
 let stopAfter: number | undefined = parseStopAfter(process.env.SLOT_STOP_AFTER ?? null);
 /** Remove blocks (RunnerConfig.unblocked). Restated by every resume, like stopAfter. */
 let unblocked = process.env.SLOT_UNBLOCKED === "true";
+/** The resume's start step was picked by hand (RunnerConfig.manual). Restated by every resume. */
+let manualStart = false;
 
 function parseStopAfter(raw: string | null): number | undefined {
   if (raw === null || raw.trim() === "") return undefined;
@@ -263,6 +265,7 @@ function spawnRunner(startIndex: number): void {
     artifacts_dir: artifactsDir,
     ...(stopAfter !== undefined ? { stop_after: stopAfter } : {}),
     ...(unblocked ? { unblocked: true } : {}),
+    ...(manualStart ? { manual: true } : {}),
   };
 
   status = "BUSY";
@@ -360,7 +363,10 @@ function handleEvent(event: RunnerEvent): void {
     }
 
     case "step.restart":
-      restartRequest = { index: event.step_index, reason: event.reason };
+      restartRequest = {
+        index: event.step_index,
+        reason: event.reason,
+      };
       break;
 
     case "step.finished": {
@@ -544,6 +550,7 @@ const http = createServer(async (req, res) => {
     }
     stopAfter = until;
     unblocked = url.searchParams.get("unblocked") === "1";
+    manualStart = url.searchParams.get("manual") === "1";
     // The operator's Resume gives every step its stuck-page restarts back.
     stallRestarts.clear();
     if (JOB_ID) {
@@ -595,7 +602,7 @@ const http = createServer(async (req, res) => {
     if (runnerWaitingPort) {
       const ok = await fetch(
         `http://127.0.0.1:${runnerWaitingPort}/continue?token=${token}&from=${from}` +
-          `&stop_after=${stopAfter ?? ""}&unblocked=${unblocked ? 1 : ""}`,
+          `&stop_after=${stopAfter ?? ""}&unblocked=${unblocked ? 1 : ""}&manual=${manualStart ? 1 : ""}`,
         { method: "POST" },
       )
         .then((r) => r.ok)

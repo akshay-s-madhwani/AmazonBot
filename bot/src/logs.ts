@@ -2,7 +2,7 @@ import { appendFileSync, createWriteStream, mkdirSync, type WriteStream } from "
 import { join } from "node:path";
 import type { Readable } from "node:stream";
 
-export type LogName = "manager" | "slot" | "runner" | "browser";
+export type LogName = "manager" | "slot" | "runner" | "browser" | "cancel";
 
 export interface LogEvent {
   ts: string;

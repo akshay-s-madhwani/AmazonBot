@@ -6,7 +6,9 @@ import type { Page } from "./pw.js";
 const ADDRESSES_URL = "https://www.amazon.in/a/addresses";
 const ADD_URL = "https://www.amazon.in/a/addresses/add?ref=ya_address_book_add_button";
 const NAV_TIMEOUT_MS = 20_000;
-const AVS_AUTOFILL_MS = 1500;
+/** PIN autofill: at least this, then until city and state are filled, at most the max. */
+const AVS_AUTOFILL_MIN_MS = 500;
+const AVS_AUTOFILL_MAX_MS = 4_000;
 
 export type AddressAction = "verified_default" | "set_default" | "added";
 export type AddressResult = { ok: true; action: AddressAction } | { ok: false; reason: string };
@@ -54,6 +56,14 @@ async function readTiles(page: Page): Promise<Tile[]> {
 }
 
 async function setAsDefault(page: Page, index: number): Promise<boolean> {
+  // The form POSTs and Amazon answers with a new page: wait for it, or the
+  // next navigation (clear_cart's cart) cancels the change in flight — the
+  // same race that left deleted addresses in place (2026-10-10).
+  const from = page.url();
+  const answered = page
+    .waitForURL((u) => u.href !== from, { timeout: NAV_TIMEOUT_MS })
+    .then(() => true)
+    .catch(() => false);
   const done = await page.evaluate((i) => {
     const row = document.getElementById(`ya-myab-edit-address-desktop-row-${i}`);
     const container = row?.closest(".address-column") ?? row?.parentElement ?? null;
@@ -71,12 +81,21 @@ async function setAsDefault(page: Page, index: number): Promise<boolean> {
     }
     return false;
   }, index);
-  if (done) await page.waitForLoadState("domcontentloaded", { timeout: NAV_TIMEOUT_MS }).catch(() => { });
-  return done;
+  if (!done) return false;
+  if (!(await answered)) console.log(`[bot] set default: no new page after the submit (still on ${page.url()})`);
+  await page.waitForLoadState("domcontentloaded", { timeout: NAV_TIMEOUT_MS }).catch(() => { });
+  console.log(`[bot] set default answered at ${page.url()}`);
+  return true;
 }
 
-async function selectByText(page: Page, selector: string, value: string): Promise<boolean> {
-  const optionValue = await page.evaluate(
+/**
+ * Picks an option by its text. An option already selected is left alone:
+ * selecting it again still fires "change", and Amazon redraws the address
+ * form on a country change — wiping a field typed straight after it (the PIN
+ * read back empty, 2026-10-10). Returns "changed" when it did select.
+ */
+async function selectByText(page: Page, selector: string, value: string): Promise<false | "kept" | "changed"> {
+  const found = await page.evaluate(
     ({ selector, value }) => {
       const sel = document.querySelector(selector) as HTMLSelectElement | null;
       if (!sel) return null;
@@ -84,13 +103,14 @@ async function selectByText(page: Page, selector: string, value: string): Promis
       const opt = [...sel.options].find(
         (o) => o.text.toLowerCase().trim() === want || o.value.toLowerCase().trim() === want,
       );
-      return opt ? opt.value : null;
+      return opt ? { value: opt.value, current: sel.value === opt.value } : null;
     },
     { selector, value },
   );
-  if (optionValue === null) return false;
-  await page.selectOption(selector, optionValue);
-  return true;
+  if (found === null) return false;
+  if (found.current) return "kept";
+  await page.selectOption(selector, found.value);
+  return "changed";
 }
 
 async function readFormError(page: Page): Promise<string | null> {
@@ -121,11 +141,15 @@ async function addNewAddress(page: Page, target: TargetAddress): Promise<Address
     .catch(() => { });
   await pause("add-address form loaded");
 
-  await selectByText(page, "#address-ui-widgets-countryCode-dropdown-nativeId", target.country);
+  if ((await selectByText(page, "#address-ui-widgets-countryCode-dropdown-nativeId", target.country)) === "changed") {
+    // A new country redraws the form: let it, before typing into it.
+    await page.waitForLoadState("domcontentloaded").catch(() => { });
+    await sleep(1_500);
+  }
 
   await setField(page, "#address-ui-widgets-enterAddressPostalCode", target.pincode, "pincode");
-  await sleep(AVS_AUTOFILL_MS);
-  await pause("pincode autofill settled");
+  await waitForPinAutofill(page);
+  await shortPause();
 
   const filled: Array<[string, string, string]> = [
     ["#address-ui-widgets-enterAddressFullName", target.fullName, "full name"],
@@ -220,6 +244,27 @@ async function addNewAddress(page: Page, target: TargetAddress): Promise<Address
 }
 
 /**
+ * Amazon fills city and state from the PIN. Waits until both are filled —
+ * what the code below keeps — never longer than AVS_AUTOFILL_MAX_MS, after
+ * which the form is used as it is (the old fixed 1.5 s wait plus a pause).
+ */
+async function waitForPinAutofill(page: Page): Promise<void> {
+  const deadline = Date.now() + AVS_AUTOFILL_MAX_MS;
+  await sleep(AVS_AUTOFILL_MIN_MS);
+  while (Date.now() < deadline) {
+    const filled = await page
+      .evaluate(() => {
+        const v = (id: string) => ((document.getElementById(id) as HTMLInputElement | HTMLSelectElement | null)?.value ?? "").trim();
+        return !!v("address-ui-widgets-enterAddressCity") && !!v("address-ui-widgets-enterAddressStateOrRegion-dropdown-nativeId");
+      })
+      .catch(() => false);
+    if (filled) return;
+    await sleep(250);
+  }
+  console.log("[bot] PIN autofill not complete — using the form as it is");
+}
+
+/**
  * After submit: null once Amazon leaves the add form (saved), else the error
  * it shows. Polled, because the save redirects — reading the form while it
  * navigates threw "execution context was destroyed" on a successful save.
@@ -263,19 +308,23 @@ async function setField(
   }
   value = want;
 
+  // Typed key by key, then read back below and retyped when Amazon dropped it:
+  // the read-back, not the typing speed, is what makes a field reliable. At
+  // 70–130 ms a key plus ~2 s of fixed sleeps a field, six addresses took
+  // close to two minutes (2026-10-10).
   for (let attempt = 1; attempt <= 3; attempt++) {
     try {
       await el.scrollIntoViewIfNeeded({ timeout: 5_000 }).catch(() => { });
       await el.focus();
-      await shortPause();
+      await sleep(rand(150, 300));
       await el.fill("");
-      await sleep(rand(200, 400));
-      await el.pressSequentially(value, { delay: rand(70, 130) });
-      await sleep(rand(400, 800));
+      await sleep(rand(80, 160));
+      await el.pressSequentially(value, { delay: 25 + Math.floor(Math.random() * 25) });
+      await sleep(rand(150, 300));
       await page.evaluate((s) => {
         (document.querySelector(s) as HTMLElement | null)?.blur();
       }, selector);
-      await shortPause();
+      await sleep(rand(150, 300));
 
       const got = (await el.inputValue().catch(() => "")).trim();
       if (got.toLowerCase() === value.trim().toLowerCase()) return true;
@@ -378,7 +427,13 @@ function tileKey(t: Tile): string {
 }
 
 async function openAddressBook(page: Page): Promise<Map<string, Tile>> {
-  await page.goto(ADDRESSES_URL, { waitUntil: "domcontentloaded", timeout: NAV_TIMEOUT_MS });
+  // A delete's answer IS the address book, drawn after the delete: read it
+  // there instead of loading it again.
+  if (/\/a\/addresses\?alertId=yaab-deleteAddressSuccess/.test(page.url())) {
+    await page.waitForLoadState("domcontentloaded", { timeout: NAV_TIMEOUT_MS }).catch(() => { });
+  } else {
+    await page.goto(ADDRESSES_URL, { waitUntil: "domcontentloaded", timeout: NAV_TIMEOUT_MS });
+  }
   await pause("addresses page loaded");
   const book = new Map<string, Tile>();
   for (const t of await readTiles(page)) book.set(tileKey(t), t);
@@ -400,11 +455,50 @@ async function removeTile(page: Page, tile: Tile): Promise<"removed" | "resident
   const deadline = Date.now() + 8_000;
   while (Date.now() < deadline) {
     if (await yes.count()) {
-      await shortPause();
-      await yes.locator("input, button").first().click({ timeout: NAV_TIMEOUT_MS });
+      // The confirm box takes Yes only once it has finished opening.
+      await sleep(1_000);
+      // Yes POSTs the delete and Amazon answers on ...?alertId=yaab-deleteAddressSuccess.
+      // Wait for that: the next address-book load used to start while the
+      // POST was in flight and cancelled it — the card stayed, was "removed"
+      // again 30 times, ~70 s a run (2026-10-10, at BOT_PACE 0.3).
+      const done = page
+        .waitForURL((u) => /alertId=yaab-deleteAddress/i.test(u.href), { timeout: NAV_TIMEOUT_MS })
+        .then(() => true)
+        .catch(() => false);
+      // A Yes pressed under a second after the book loaded sent nothing: no
+      // POST, the card stayed, and the 20 s wait ran out (2026-10-11, ~21 s a
+      // card, every run of an account with old cards). Pressed again while
+      // no delete has gone out, at most 3 times; a delete sent is never repeated.
+      let sent = false;
+      const onRequest = (q: { method(): string; url(): string }) => {
+        if (q.method() === "POST" && /\/a\/addresses\/delete/.test(q.url())) sent = true;
+      };
+      page.on("request", onRequest);
+      try {
+        for (let press = 1; press <= 3 && !sent; press++) {
+          if (press > 1) {
+            if (!(await yes.count())) break;
+            console.log(`[bot] remove: Yes sent no delete — pressing it again (${press}/3)`);
+          }
+          await yes.locator("input, button").first().click({ timeout: NAV_TIMEOUT_MS }).catch(() => { });
+          for (const until = Date.now() + 4_000; !sent && Date.now() < until;) await sleep(250);
+        }
+      } finally {
+        page.off("request", onRequest);
+      }
+      if (!sent) {
+        console.log("[bot] remove: Yes sent no delete after 3 presses");
+        return "failed";
+      }
+      if (!(await done)) {
+        console.log(`[bot] remove: Amazon did not answer the delete (still at ${page.url().slice(0, 100)})`);
+        return "failed";
+      }
       await page.waitForLoadState("domcontentloaded", { timeout: NAV_TIMEOUT_MS }).catch(() => { });
-      await pause("address removed");
-      return "removed";
+      await shortPause();
+      if (/deleteAddressSuccess/i.test(page.url())) return "removed";
+      console.log(`[bot] remove: Amazon answered ${page.url().slice(0, 120)}`);
+      return "failed";
     }
     if (await refused.count()) {
       await page.locator(`#deleteAddressModal-${tile.index}-cancel-btn`).click().catch(() => { });
@@ -445,9 +539,12 @@ export async function runAddresses(page: Page, targets: TargetAddress[]): Promis
   }
 
   let added = 0;
+  // Read once: adding one address never makes another appear, and the check
+  // after the loop re-reads the book and finds any that did not save. A
+  // reload before every address cost a page load and a pause each.
+  const before = await openAddressBook(page);
   for (const [i, t] of wanted.entries()) {
-    const book = await openAddressBook(page);
-    if (book.has(targetKey(t))) {
+    if (before.has(targetKey(t))) {
       console.log(`[bot] address ${i + 1}/${wanted.length} already saved (${t.fullName})`);
       continue;
     }

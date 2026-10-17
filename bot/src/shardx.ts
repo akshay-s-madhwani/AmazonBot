@@ -1,4 +1,4 @@
-import { ShardX } from "@proxyshard/shardx";
+import { ShardX, type Profile } from "@proxyshard/shardx";
 import { createHash } from "node:crypto";
 import { existsSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -8,11 +8,98 @@ const MEMORY_ARGS = [
   "--fleet-bot-browser",
   // "--in-process-gpu",
   // "--renderer-process-limit=1",
-  "--disable-features=TranslateUI,BackForwardCache,IsolateOrigins,site-per-process",
   "--disable-site-isolation-trials",
   "--disable-dev-shm-usage",
   "--disable-background-networking",
 ];
+const DISABLED_FEATURES = ["TranslateUI", "BackForwardCache", "IsolateOrigins", "site-per-process"];
+
+/**
+ * STEALTH (2026-10-09, after Amazon flagged the browser). Checked on
+ * browserleaks.com against the real Chrome on the same machine. The ShardX
+ * Windows templates as shipped gave every bot ONE odd identity:
+ *   - timezone Europe/Warsaw, language pl-PL (186 of 236 templates) — on an
+ *     Indian IP buying on amazon.in;
+ *   - Russian Windows voices (Microsoft Irina/Pavel, all 131 Windows templates);
+ *   - no canvas/WebGL/audio noise, so every account on a machine had the
+ *     host's exact canvas hash, whatever GPU the profile claimed.
+ * harden() fixes all three on each run profile: timezone and geolocation
+ * follow the proxy's IP ("auto", resolved by ShardX at each launch), an
+ * Indian-English language set and matching Windows voices are picked per
+ * profile, and per-profile seeded noise is on. TLS (JA4) already matched real
+ * Chrome; webdriver, CDP and WebRTC did not leak.
+ */
+const LOCALES: { weight: number; languages: string[]; accept: string; voices: [string, string][] }[] = [
+  {
+    weight: 5,
+    languages: ["en-US", "en"],
+    accept: "en-US,en;q=0.9",
+    voices: [["David", "United States"], ["Mark", "United States"], ["Zira", "United States"]],
+  },
+  {
+    weight: 2,
+    languages: ["en-IN", "en-GB", "en-US", "en"],
+    accept: "en-IN,en-GB;q=0.9,en-US;q=0.8,en;q=0.7",
+    voices: [["Heera", "India"], ["Ravi", "India"], ["David", "United States"], ["Zira", "United States"]],
+  },
+  {
+    weight: 2,
+    languages: ["en-GB", "en-US", "en"],
+    accept: "en-GB,en-US;q=0.9,en;q=0.8",
+    voices: [["Hazel", "United Kingdom"], ["George", "United Kingdom"], ["Susan", "United Kingdom"]],
+  },
+  {
+    weight: 1,
+    languages: ["en-US", "en", "hi"],
+    accept: "en-US,en;q=0.9,hi;q=0.8",
+    voices: [["David", "United States"], ["Zira", "United States"]],
+  },
+];
+const VOICE_LANG: Record<string, string> = { "United States": "en-US", India: "en-IN", "United Kingdom": "en-GB" };
+/** Noise vectors on by default; SHARDX_NOISE="" turns noise off, or names the vectors. */
+const NOISE = (process.env.SHARDX_NOISE ?? "canvas,webgl,audio,client_rects").split(",").map((v) => v.trim()).filter(Boolean);
+
+/** A stable pick in [0, 1) for this profile and purpose. */
+function seeded(id: string, what: string): number {
+  return createHash("sha256").update(`${id}:${what}`).digest().readUInt32BE(0) / 2 ** 32;
+}
+
+/** Applies the stealth settings above; true when the profile changed (save it). */
+export function harden(profile: Profile): boolean {
+  const cfg = profile.config as Record<string, any>;
+  const before = JSON.stringify(cfg);
+
+  cfg.timezone = "auto";
+  cfg.geolocation = { mode: "auto" };
+
+  let roll = seeded(profile.id, "locale") * LOCALES.reduce((n, l) => n + l.weight, 0);
+  const locale = LOCALES.find((l) => (roll -= l.weight) < 0) ?? LOCALES[0]!;
+  const nav = (cfg.navigator ??= {});
+  nav.language = locale.languages[0];
+  nav.languages = locale.languages;
+  nav.accept_language = locale.accept;
+  cfg.icu_locale = locale.languages[0];
+
+  const speech = (cfg.speech ??= {});
+  const remote = ((speech.voices ?? []) as { local_service?: boolean }[]).filter((v) => !v.local_service);
+  speech.voices = [
+    ...locale.voices.map(([name, country], i) => ({
+      name: `Microsoft ${name} - English (${country})`,
+      lang: VOICE_LANG[country],
+      local_service: true,
+      is_default: i === 0,
+    })),
+    ...remote,
+  ];
+
+  profile.setNoise(...(NOISE as Parameters<Profile["setNoise"]>));
+  // setNoise only fills a knob that is missing, and the templates ship them
+  // at 0 — which left WebGL and DOMRect noise on but doing nothing.
+  const noise = cfg.noise as Record<string, Record<string, unknown>>;
+  if (noise.webgl?.enabled) noise.webgl.intensity = 0.0005;
+  if (noise.client_rects?.enabled) noise.client_rects.max_offset = 1;
+  return JSON.stringify(cfg) !== before;
+}
 
 export interface LaunchedBrowser {
   session: {
@@ -137,13 +224,18 @@ export async function launchForRun(opts: {
   const pruned = pruneRunProfiles(wanted);
   if (pruned) console.log(`[shardx] removed ${pruned} unused run profile(s)`);
   const { profile, id, created } = await resolveProfile(wanted);
+  if (harden(profile as Profile)) getSdk().saveProfile(profile as Profile);
   touchProfile(id);
 
+  // ONE --disable-features: Chromium keeps only the last copy of a switch, so
+  // a second one here would drop ShardX's WebGPU switch for a profile that
+  // claims no WebGPU.
+  const disabled = [...DISABLED_FEATURES, ...((profile as Profile).hasWebGPU ? [] : ["WebGPU"])];
   const session = await getSdk().launch(profile as never, {
     cdp: true,
     headless: opts.headless,
     ...(opts.proxy ? { proxy: opts.proxy } : {}),
-    extraArgs: [...MEMORY_ARGS, ...(opts.extraArgs ?? [])],
+    extraArgs: [...MEMORY_ARGS, `--disable-features=${disabled.join(",")}`, ...(opts.extraArgs ?? [])],
     randomize: false,
   });
 

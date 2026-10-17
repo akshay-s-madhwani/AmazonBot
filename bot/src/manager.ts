@@ -37,16 +37,27 @@ import { describeNodeId, resolveNodeId } from "./node-id.js";
 import { JobClient, requireJobClient, type SheetJob } from "./job-client.js";
 import { sheetDirectMode } from "./sheet-direct.js";
 import { STEPS } from "./steps.js";
-import { describe as describeProc, fleetProcesses, fleetRoots, killAll, listProcesses, orphans, type FleetProc } from "./procs.js";
+import { describe as describeProc, fleetProcesses, fleetRoots, killAll, killTree, listProcesses, orphans, type FleetProc } from "./procs.js";
 import { profileIdForRun } from "./shardx.js";
+import type { CancelJob } from "@app/contracts";
 
 
 loadDotEnv();
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const SLOT_PATH = join(HERE, "slot.js");
+const CANCEL_PATH = join(HERE, "cancel-run.js");
 const UI_DIR = join(HERE, "..", "ui");
 const ARTIFACTS = join(HERE, "..", "artifacts");
+const DEPLOY_STATE = join(HERE, "..", "..", ".deploy");
+const deploymentMaintenance = (): boolean => existsSync(join(DEPLOY_STATE, "maintenance"));
+const DEPLOY_VERSION = (() => {
+  try { return JSON.parse(readFileSync(join(DEPLOY_STATE, "version.json"), "utf8")).sha as string; }
+  catch { return "development"; }
+})();
+let managerReady = false;
+let pendingStarts = 0;
+let deploymentClosing = false;
 const PORT = Number(process.env.MANAGER_PORT ?? 7800);
 const MANAGER_URL = process.env.MANAGER_URL ?? `http://127.0.0.1:${PORT}`;
 const WATCHDOG_TICK_MS = 5_000;
@@ -85,6 +96,31 @@ interface SlotState {
 }
 
 const slots = new Map<number, SlotState>();
+
+/**
+ * THE CANCEL FLOW's runs (cancel-run.ts): one process each, owning its own
+ * browser. Not slots — no runner, resume or telemetry — but each one takes a
+ * slot index and counts against WORKER_COUNT and the RAM check like a slot.
+ */
+interface CancelState {
+  runId: string;
+  slotIndex: number;
+  token: string;
+  pid: number | null;
+  proc: ChildProcess | null;
+  startedAt: number;
+  stepKey: string | null;
+  done: boolean;
+}
+const cancels = new Map<string, CancelState>();
+
+function cancelAlive(c: CancelState): boolean {
+  if (c.done) return false;
+  if (c.proc) return c.proc.exitCode === null && c.proc.signalCode === null;
+  return pidAlive(c.pid);
+}
+
+const liveCancels = (): CancelState[] => [...cancels.values()].filter(cancelAlive);
 
 let fleet: FleetLink | null = null;
 let draining = false;
@@ -430,24 +466,32 @@ async function probeSlot(
 }
 
 function freeSlotIndex(): number {
-  const held = new Set([...slots.values()].filter(slotAlive).map((s) => s.slotIndex));
+  const held = new Set([
+    ...[...slots.values()].filter(slotAlive).map((s) => s.slotIndex),
+    ...liveCancels().map((c) => c.slotIndex),
+  ]);
   let i = 0;
   while (held.has(i)) i += 1;
   return i;
 }
 
-const MIN_FREE_MB_FLOOR = Number(process.env.MIN_FREE_MB_FLOOR ?? 1500);
+/**
+ * A new slot needs MIN_FREE_MB_PER_SLOT of free RAM, nothing held back on
+ * top: 1614MB free starts 2 slots, under 600MB starts none (user,
+ * 2026-10-09). The 1500MB floor refused starts with 1.6GB still free.
+ */
+const MIN_FREE_MB_FLOOR = Number(process.env.MIN_FREE_MB_FLOOR ?? 0);
 const MIN_FREE_MB_PER_SLOT = Number(process.env.MIN_FREE_MB_PER_SLOT ?? 600);
 const START_JITTER_MS = Number(process.env.START_JITTER_MS ?? 20_000);
 
 function liveSlotCount(): number {
-  return [...slots.values()].filter((s) => slotAlive(s) && s.status !== "DONE").length;
+  return [...slots.values()].filter((s) => slotAlive(s) && s.status !== "DONE").length + liveCancels().length;
 }
 
 function admit(requested: number): { granted: number; reason: string | null } {
   if ((process.env.MASTER_URL || process.env.MASTER_NATS_URL) && !fleet)
     return { granted: 0, reason: "fleet enrollment and durable telemetry must be ready before starting jobs" };
-  if (draining) return { granted: 0, reason: "node is draining — not accepting new jobs" };
+  if (draining || deploymentClosing || deploymentMaintenance()) return { granted: 0, reason: "node is draining — not accepting new jobs" };
   if (requested <= 0) return { granted: 0, reason: "no instances requested" };
 
   let reason: string | null = null;
@@ -461,9 +505,10 @@ function admit(requested: number): { granted: number; reason: string | null } {
   const freeMb = Math.round(freemem() / 1024 / 1024);
   const headroom = Math.max(0, Math.floor((freeMb - MIN_FREE_MB_FLOOR) / MIN_FREE_MB_PER_SLOT));
   if (headroom < granted) {
-    reason =
-      `only ${freeMb}MB RAM free — reserving ${MIN_FREE_MB_FLOOR}MB and budgeting ` +
-      `${MIN_FREE_MB_PER_SLOT}MB per slot leaves room for ${headroom}`;
+    reason = MIN_FREE_MB_FLOOR > 0
+      ? `only ${freeMb}MB RAM free — reserving ${MIN_FREE_MB_FLOOR}MB and budgeting ` +
+        `${MIN_FREE_MB_PER_SLOT}MB per slot leaves room for ${headroom}`
+      : `only ${freeMb}MB RAM free — a slot needs ${MIN_FREE_MB_PER_SLOT}MB`;
     granted = headroom;
   }
   return { granted, reason };
@@ -597,6 +642,12 @@ interface StartedSlot {
 }
 
 async function startInstances(instances: number): Promise<StartedSlot[]> {
+  pendingStarts++;
+  try { return await startInstancesImpl(instances); }
+  finally { pendingStarts--; }
+}
+
+async function startInstancesImpl(instances: number): Promise<StartedSlot[]> {
   const { granted, reason } = admit(instances);
   if (granted < 1) throw new Error(reason ?? "no capacity for a new slot");
   if (granted < instances) log(`admitting ${granted} of ${instances} instance(s): ${reason}`);
@@ -647,11 +698,12 @@ function startPushedJob(runId: string, job: SheetJob, stopAfter?: number): Start
   };
 }
 
-async function slotCall(s: SlotState, path: string, query = ""): Promise<void> {
+async function slotCall(s: SlotState, path: string, query = "", timeoutMs?: number): Promise<void> {
   if (!s.port) throw new Error(`slot ${s.slotIndex} has no control port yet`);
   const sep = query ? "&" : "";
   const res = await fetch(`http://127.0.0.1:${s.port}${path}?token=${s.token}${sep}${query}`, {
     method: "POST",
+    ...(timeoutMs ? { signal: AbortSignal.timeout(timeoutMs) } : {}),
   });
   if (!res.ok) {
     const body = await res.text().catch(() => "");
@@ -718,10 +770,12 @@ let sweeping = false;
 
 function liveSet(): { slotPids: Set<number>; runIds: Set<string>; profileIds: Set<string> } {
   const live = [...slots.values()].filter(slotAlive);
+  // A cancel run's browser is its child, kept by its pid like a slot's.
+  const cx = liveCancels();
   return {
-    slotPids: new Set(live.flatMap((s) => (s.pid ? [s.pid] : []))),
-    runIds: new Set(live.map((s) => s.runId)),
-    profileIds: new Set(live.map((s) => profileIdForRun(s.runId))),
+    slotPids: new Set([...live.flatMap((s) => (s.pid ? [s.pid] : [])), ...cx.flatMap((c) => (c.pid ? [c.pid] : []))]),
+    runIds: new Set([...live.map((s) => s.runId), ...cx.map((c) => c.runId)]),
+    profileIds: new Set([...live.map((s) => profileIdForRun(s.runId)), ...cx.map((c) => profileIdForRun(c.runId))]),
   };
 }
 
@@ -982,7 +1036,9 @@ app.post("/slots/event", (req: Request, res: Response) => {
     s.status = "PAUSED";
     const after = Number(body.after_step);
     emit(s, "run.paused", {
-      payload: { after_step: Number.isInteger(after) ? after : s.stepIndex },
+      payload: {
+        after_step: Number.isInteger(after) ? after : s.stepIndex,
+      },
     });
   }
   if (body.type === "browser.started") {
@@ -1274,6 +1330,10 @@ app.get("/logs/:runId", (req: Request, res: Response) => {
 app.get("/health", (_req: Request, res: Response) =>
   res.json({
     ok: true,
+    ready: managerReady,
+    version: DEPLOY_VERSION,
+    deploymentMaintenance: deploymentMaintenance(),
+    activeSlots: liveSlotCount() + pendingStarts,
     slots: slots.size,
     port: PORT,
     nodeId: NODE.id,
@@ -1281,6 +1341,33 @@ app.get("/health", (_req: Request, res: Response) =>
     master: fleet ? "linked" : "standalone",
   }),
 );
+
+// This server binds only to loopback. These routes also require the receiver's
+// on-disk maintenance marker; the public proxy must expose only the webhook.
+app.post("/deployment/drain", (_req: Request, res: Response) => {
+  if (!deploymentMaintenance()) return res.status(409).json({ error: "No deployment maintenance marker" });
+  return res.json({ ok: true });
+});
+app.post("/deployment/resume", (_req: Request, res: Response) => {
+  if (deploymentMaintenance() || deploymentClosing) return res.status(409).json({ error: "Deployment still in progress" });
+  return res.json({ ok: true });
+});
+app.post("/deployment/close-idle", async (_req: Request, res: Response) => {
+  if (!deploymentMaintenance() || deploymentClosing || !managerReady || liveSlotCount() !== 0 || pendingStarts !== 0)
+    return res.status(409).json({ error: "Manager is not drained" });
+  deploymentClosing = true;
+  try {
+    const previous = [...slots.values()];
+    const wasDraining = draining;
+    await hooks.reset();
+    draining = wasDraining;
+    await sweepOrphans({ now: true });
+    if ((await Promise.all(previous.map((slot) => waitForExit(slot, 2000)))).some((gone) => !gone))
+      throw new Error("Old slot processes are still running");
+    return res.json({ ok: true });
+  } catch (error) { return res.status(409).json({ error: (error as Error).message }); }
+  finally { deploymentClosing = false; }
+});
 
 
 /** The live slot holding a run, or NoSlotError — the answer that lets the master release it. */
@@ -1310,20 +1397,126 @@ async function waitForExit(s: SlotState, ms: number): Promise<boolean> {
   return gone();
 }
 
+/** Starts one cancel run in its own process. Refused like a slot when the machine has no room. */
+function startCancel(runId: string, job: CancelJob): void {
+  const existing = cancels.get(runId);
+  if (existing && cancelAlive(existing)) return;
+  if (existing) throw new Error(`cancel run ${runId} already ran here`);
+  admitOneOrThrow(`start of ${runId}`);
+  const slotIndex = freeSlotIndex();
+  const token = randomUUID();
+  const dir = join(ARTIFACTS, runId);
+  mkdirSync(logsDir(dir), { recursive: true });
+  writeFileSync(join(dir, "cancel-job.json"), JSON.stringify(job), { mode: 0o600 });
+  const proc = spawn(process.execPath, [CANCEL_PATH], {
+    detached: true,
+    stdio: ["ignore", "pipe", "pipe"],
+    windowsHide: true,
+    env: {
+      ...process.env,
+      CANCEL_RUN_ID: runId,
+      CANCEL_TOKEN: token,
+      SLOT_INDEX: String(slotIndex),
+      MANAGER_URL,
+      SLOT_HEADLESS: /^(0|false|no|off)$/i.test((process.env.FLEET_HEADLESS ?? "").trim()) ? "false" : "true",
+    },
+  });
+  const out = openLog(dir, "cancel");
+  tee(proc.stdout, out, `[cancel${slotIndex}]`);
+  tee(proc.stderr, out, `[cancel${slotIndex}!]`);
+  const state: CancelState = {
+    runId, slotIndex, token, pid: proc.pid ?? null, proc, startedAt: Date.now(), stepKey: "login", done: false,
+  };
+  proc.on("exit", (code, signal) => {
+    state.done = true;
+    log(`cancel run ${runId} (slot ${slotIndex}) exited (code=${code} signal=${signal})`);
+    setTimeout(() => {
+      if (cancels.get(runId) === state) cancels.delete(runId);
+    }, 60_000).unref();
+  });
+  proc.unref();
+  cancels.set(runId, state);
+  log(`started cancel run ${runId} in slot ${slotIndex} for row ${job.row_number}: ${job.order_ids.join(", ")} pid=${proc.pid}`);
+}
+
+/** Stops a cancel run: it closes its browser on the stop flag, else it is killed with its browser. */
+async function stopCancel(c: CancelState): Promise<void> {
+  if (!cancelAlive(c)) return;
+  try {
+    writeFileSync(join(ARTIFACTS, c.runId, "stop"), new Date().toISOString());
+  } catch {
+    // Killed below instead.
+  }
+  const until = Date.now() + RESET_GRACE_MS;
+  while (Date.now() < until && cancelAlive(c)) await new Promise((r) => setTimeout(r, 250));
+  if (cancelAlive(c) && c.pid) {
+    log(`cancel run ${c.runId} did not stop in time — killing it and its browser`);
+    await killTree(c.pid, await listProcesses().catch(() => []));
+  }
+  c.done = true;
+}
+
+/** Cancel runs left by an earlier manager: still running this folder's cancel-run.js? Keep counting them. */
+async function reattachCancels(): Promise<void> {
+  let dirs: string[] = [];
+  try {
+    dirs = readdirSync(ARTIFACTS).filter((d) => d.startsWith("cancel-"));
+  } catch {
+    return;
+  }
+  const ours = new Set(
+    fleetProcesses(await listProcesses().catch(() => []), fleetRoots())
+      .filter((p) => p.kind === "cancel")
+      .map((p) => p.pid),
+  );
+  for (const d of dirs) {
+    const file = join(ARTIFACTS, d, "cancel.json");
+    if (!existsSync(file) || cancels.has(d)) continue;
+    try {
+      const e = JSON.parse(readFileSync(file, "utf8")) as { runId: string; slotIndex: number; pid: number; token: string; startedAt: number };
+      if (!ours.has(e.pid)) {
+        rmSync(file, { force: true });
+        continue;
+      }
+      cancels.set(e.runId, {
+        runId: e.runId, slotIndex: e.slotIndex, token: e.token, pid: e.pid, proc: null,
+        startedAt: e.startedAt, stepKey: null, done: false,
+      });
+      log(`reattached cancel run ${e.runId} (slot ${e.slotIndex}, pid ${e.pid})`);
+    } catch {
+      // Unreadable: the run reports for itself; the sweep handles its browser.
+    }
+  }
+}
+
+/** Step reports from cancel runs, for the heartbeat's slot list. */
+app.post("/cancels/event", (req: Request, res: Response) => {
+  const body = (req.body ?? {}) as { token?: string; runId?: string; stepKey?: string; status?: string };
+  const c = body.runId ? cancels.get(body.runId) : undefined;
+  if (!c || body.token !== c.token) return res.status(401).json({ error: "bad token" });
+  if (typeof body.stepKey === "string") c.stepKey = body.stepKey;
+  return res.json({ ok: true });
+});
+
 const hooks: FleetHooks = {
   startPushedJob: async (run_id, job, stopAfter) => startPushedJob(run_id, job, stopAfter).runId,
+
+  startCancel: async (run_id, job) => startCancel(run_id, job),
 
   startJobs: async (instances) => {
     const started = await startInstances(instances);
     return started.map((s) => s.runId);
   },
 
-  resumeRun: async (run_id, from, stopAfter, unblocked) => {
+  resumeRun: async (run_id, from, stopAfter, unblocked, manual) => {
+    if (deploymentClosing || deploymentMaintenance()) throw new Error("Deployment in progress; resume is disabled");
     const s = liveSlotFor(run_id, "resume");
+    s.status = "BUSY"; // Account for the in-flight resume while deployment checks drain state.
     const query = [
       ...(from === undefined ? [] : [`from=${from}`]),
       ...(stopAfter === undefined ? [] : [`stop_after=${stopAfter}`]),
       ...(unblocked ? ["unblocked=1"] : []),
+      ...(manual ? ["manual=1"] : []),
     ].join("&");
     await slotCall(s, "/resume", query);
     s.status = "BUSY";
@@ -1338,6 +1531,8 @@ const hooks: FleetHooks = {
   },
 
   probeRun: async (run_id) => {
+    const c = cancels.get(run_id);
+    if (c) return { has_slot: cancelAlive(c), accepted: true, slot_status: cancelAlive(c) ? "BUSY" : "DONE", browser_alive: null, step_index: null };
     const s = slotByRun(run_id);
     const accepted = (() => {
       try {
@@ -1363,10 +1558,14 @@ const hooks: FleetHooks = {
   },
 
   cancelRun: async (run_id) => {
+    const c = cancels.get(run_id);
+    if (c) return stopCancel(c);
     await slotCall(liveSlotFor(run_id, "cancel"), "/cancel");
   },
 
   closeSession: async (run_id) => {
+    const c = cancels.get(run_id);
+    if (c) return stopCancel(c);
     await slotCall(liveSlotFor(run_id, "close_session"), "/cancel");
   },
 
@@ -1416,7 +1615,9 @@ const hooks: FleetHooks = {
     // slot runs session.stop() before exiting; killing it straight away cuts
     // that off, which loses the profile's cookie jar and never tells the
     // master the browser closed.
-    await Promise.all(live.map((s) => slotCall(s, "/cancel").catch(() => undefined)));
+    await Promise.all(live.map((s) => slotCall(s, "/cancel", "", RESET_GRACE_MS).catch(() => undefined)));
+    // Cancel runs are closed too: a reset leaves no browser open.
+    await Promise.all(liveCancels().map((c) => stopCancel(c).catch(() => undefined)));
     await Promise.all(
       live.map(async (s) => {
         if (!(await waitForExit(s, RESET_GRACE_MS))) {
@@ -1500,7 +1701,17 @@ const hooks: FleetHooks = {
       browser_idle_ms: s.browserIdleMs,
       tab_count: s.tabCount,
       stuck_for_ms: s.stuckSince === null ? null : Date.now() - s.stuckSince,
-    })),
+    })).concat(liveCancels().map((c) => ({
+      slot_index: c.slotIndex,
+      status: "busy" as const,
+      current_run_id: c.runId,
+      step_index: null,
+      step_key: c.stepKey,
+      browser_alive: null,
+      browser_idle_ms: null,
+      tab_count: null,
+      stuck_for_ms: null,
+    }))),
 
   workerCount: () => Math.max(0, advertisedWorkerCount),
 };
@@ -1596,6 +1807,8 @@ app.listen(PORT, "127.0.0.1", () => {
   log(`  start:   curl -X POST ${MANAGER_URL}/fleet/start`);
   log(`  status:  curl ${MANAGER_URL}/fleet/status`);
   void reattachSlots()
+    .then(() => reattachCancels())
+    .then(() => { managerReady = true; })
     .catch((err: unknown) => log(`reattach failed: ${(err as Error).message}`))
     .finally(() => {
       pruneArtifacts();
@@ -1608,7 +1821,7 @@ app.listen(PORT, "127.0.0.1", () => {
     });
 });
 
-process.once("SIGINT", () => {
+function shutdownManager(): void {
   void fleet?.close().catch(() => {});
   const live = [...slots.values()].filter(slotAlive);
   if (live.length > 0) {
@@ -1620,4 +1833,7 @@ process.once("SIGINT", () => {
     log(`  or restart the manager — it reattaches to these slots — and cancel the intended slots`);
   }
   process.exit(0);
-});
+}
+process.once("SIGINT", shutdownManager);
+process.once("SIGTERM", shutdownManager);
+process.on("message", (message) => { if (message === "shutdown") shutdownManager(); });

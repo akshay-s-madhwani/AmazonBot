@@ -21,3 +21,20 @@ export async function pause(reason = ""): Promise<void> {
 export async function shortPause(): Promise<void> {
   await sleep(rand(400, 850));
 }
+
+/**
+ * Checkout's pauses: never quicker than BOT_PACE 1. At 0.3 (0.3–0.6s waits)
+ * checkout raced its own page updates — the multi-address list read while
+ * Amazon was still redrawing it (2026-10-09). A slower pace still slows them.
+ */
+const STEADY = Math.max(1, PACE);
+
+export async function steadyPause(reason = ""): Promise<void> {
+  const ms = Math.floor((800 + Math.random() * 1200) * STEADY);
+  if (reason) console.log(`[bot] waiting ${(ms / 1000).toFixed(1)}s (${reason})`);
+  await sleep(ms);
+}
+
+export async function steadyShortPause(): Promise<void> {
+  await sleep(Math.floor((400 + Math.random() * 450) * STEADY));
+}

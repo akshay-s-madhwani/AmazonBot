@@ -32,6 +32,7 @@ timing-profiles/*
 # Google service-account key (PRIVATE KEY — never commit)
 fyers-trading-*.json
 *-service-account*.json
+timing-profiles/
 
 # Per-machine node identity. MUST NOT be committed: every node cloning the repo
 # would inherit the same id and start running each other's sheet rows.
@@ -52,3 +53,11 @@ bot/start.bat
 bot/browser-profiles/
 
 bot/.sheet-direct-ledger.json
+
+# Per-machine deployment credentials, journals, build downloads and backups.
+/deploy.env
+/.deploy/
+/deployment.json
+
+# Standalone installer: holds a live GitHub token.
+/install.bat

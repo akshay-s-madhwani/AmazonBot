@@ -4,8 +4,9 @@ import { join } from "node:path";
 import { chromium, type BrowserContext, type Page } from "./pw.js";
 import { loadAddress, loadConfig, loadDotEnv, loadProduct, parseRewardType, reloadDotEnv } from "./config.js";
 import { postEvent, type RunnerConfig, type StepResult } from "./protocol.js";
-import { LAST_STEP, LAST_STEP_INDEX, STEPS, UNBLOCKABLE_FROM, UNBLOCKABLE_UNTIL, stepAt, type StepContext } from "./steps.js";
+import { LAST_STEP, LAST_STEP_INDEX, STEPS, UNBLOCKABLE_FROM, UNBLOCKABLE_UNTIL, guardPaid, stepAt, type StepContext } from "./steps.js";
 import { openRewardTab } from "./reward.js";
+import { guardCheckoutModals } from "./checkout.js";
 import { describeForOperator } from "./failures.js";
 import type { SheetJob } from "./job-client.js";
 import { parseAccountProxy } from "./proxy.js";
@@ -13,6 +14,9 @@ import { STALL_EXIT_CODE, recoverFromStall, watchForStall } from "./stall.js";
 
 
 const STEP_SETTLE_MS = 350;
+
+/** From add_vouchers on, the Prime offer is closed before every click (checkout.ts guardCheckoutModals). */
+const GUARD_FROM = STEPS.findIndex((s) => s.key === "add_vouchers");
 const HEARTBEAT_MS = 5_000;
 
 function startHeartbeat(cfg: RunnerConfig, state: { index: number; key: string }): NodeJS.Timeout {
@@ -174,6 +178,8 @@ function ensureControlServer(cfg: RunnerConfig, live: { index: number }): Promis
       else cfg.stop_after = until;
       // Restated on every continue, like the checkpoint: only Remove blocks sets it.
       cfg.unblocked = url.searchParams.get("unblocked") === "1";
+      // So is a start step picked by hand (the Pay Now guard's one exception).
+      cfg.manual = url.searchParams.get("manual") === "1";
       reply(202, { ok: true });
       resume(Number.isInteger(from) && from >= 0 ? from : 0);
     });
@@ -440,6 +446,7 @@ async function main(): Promise<number> {
   }
 
   async function runFrom(from: number): Promise<"SUCCEEDED" | "FAILED"> {
+    from = guardPaid(from, cfg);
     for (let i = from; i < STEPS.length; i++) {
       const step = stepAt(i);
       if (!step) break;
@@ -455,8 +462,10 @@ async function main(): Promise<number> {
       });
 
       // A page stuck loading for 90 s: refresh it, and have the slot restart
-      // this step in a fresh runner (at most 3 times, the slot counts).
-      const stopWatch = watchForStall(context, (stall) => {
+      // this step in a fresh runner (at most 3 times, the slot counts). Never
+      // note_order_id: restarted, it could reach Pay Now again (user,
+      // 2026-10-11 — runs placed orders several times). It runs on and fails.
+      const stopWatch = step.key === "note_order_id" ? () => {} : watchForStall(context, (stall) => {
         void (async () => {
           const where = stall.url.slice(0, 100);
           const reason = `page stuck ${stall.state} for ${Math.round(stall.forMs / 1000)}s at ${where}`;
@@ -473,9 +482,18 @@ async function main(): Promise<number> {
         })();
       });
 
+      // This pass STARTS here (Run from, Resume, the jump after Pay Now):
+      // note_order_id only reads Your Orders. Reached from select_payment in
+      // the same pass (a checkpoint's Next included), it may press Pay Now.
+      ctx.visitOnly = i === from;
+
+      if (GUARD_FROM >= 0 && i >= GUARD_FROM) await guardCheckoutModals(page);
+
       let result: StepResult;
       try {
-        result = await withTimeout(step.run(page, ctx), step.timeoutMs, step.key).finally(stopWatch);
+        result = await withTimeout(step.run(page, ctx), step.timeoutMs, step.key).finally(() => {
+          stopWatch();
+        });
       } catch (err) {
         result = {
           status: "failed",

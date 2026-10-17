@@ -3,7 +3,8 @@ import { join } from "node:path";
 import type { PaymentSpec, TargetAddress } from "./config.js";
 import { checkoutAddressKey, sheetAddressKey } from "./address.js";
 export { checkoutAddressKey, sheetAddressKey } from "./address.js";
-import { pause, shortPause, sleep } from "./human.js";
+// Checkout keeps full-length pauses whatever BOT_PACE says (see steadyPause).
+import { steadyPause as pause, steadyShortPause as shortPause, sleep } from "./human.js";
 import { requireJobClient } from "./job-client.js";
 import { ordersByName, readOrderCards, readReviewShipments, reviewBasket, shipsTo, type BasketItem, type OrderCard } from "./purchase-evidence.js";
 import type { Locator, Page } from "./pw.js";
@@ -463,7 +464,7 @@ async function openAddressPicker(page: Page): Promise<CheckoutResult> {
   if (!shown) return { ok: false, reason: `no Change link for the delivery address at ${page.url()}` };
   await shortPause();
   await change.click({ timeout: NAV_TIMEOUT_MS });
-  await page.waitForURL(/\/address/, { timeout: NAV_TIMEOUT_MS }).catch(() => { });
+  await page.waitForURL(/\/address/, { timeout: NAV_TIMEOUT_MS, waitUntil: "domcontentloaded" }).catch(() => { });
   await pause("address list open");
   return /\/address/.test(page.url())
     ? { ok: true, detail: "address list open" }
@@ -477,7 +478,7 @@ async function openAddressPicker(page: Page): Promise<CheckoutResult> {
  * while it updates; a read in the middle saw only some of them and failed
  * "item 1 is not on the multi-address page" (2026-10-08).
  */
-export async function waitForRowsSettled(page: Page, budgetMs = 20_000): Promise<void> {
+export async function waitForRowsSettled(page: Page, budgetMs = 45_000): Promise<boolean> {
   const deadline = Date.now() + budgetMs;
   let last = "";
   while (Date.now() < deadline) {
@@ -488,62 +489,171 @@ export async function waitForRowsSettled(page: Page, budgetMs = 20_000): Promise
         return { busy, sig: `${rows.length}|${rows.map((r) => (r as HTMLElement).innerText.slice(0, 40)).join("|")}` };
       }, ITEMSELECT_ROW)
       .catch(() => ({ busy: true, sig: "" }));
-    if (!now.busy && now.sig !== "0|" && now.sig === last) return;
+    if (!now.busy && now.sig !== "0|" && now.sig === last) return true;
     last = now.busy ? "" : now.sig;
     await sleep(1000);
   }
-  console.log("[bot] the multi-address list did not settle — reading it as it is");
+  return false;
 }
 
-/** Rows on the multi-address page, in page order, with the product each belongs to. */
-async function readItemRows(page: Page): Promise<Array<{ item: string; asin: string | null; qty: number; key: string | null }>> {
-  return page.evaluate((rowSel) => {
+/**
+ * waitForRowsSettled, and when the list never settles, the page reloaded
+ * (twice at most): "Updating your order" can spin with no rows until the page
+ * is loaded again, while the change itself has gone through (2026-10-09).
+ * Amazon keeps the multi-address state server-side, so a reload loses nothing.
+ */
+async function settleRows(page: Page, budgetMs = 45_000): Promise<void> {
+  for (let reload = 1; !(await waitForRowsSettled(page, budgetMs)); reload++) {
+    if (reload > 2) {
+      console.log("[bot] the multi-address list did not settle — reading it as it is");
+      return;
+    }
+    console.log(`[bot] the multi-address list is stuck updating — reloading the page (${reload}/2)`);
+    await page.reload({ waitUntil: "domcontentloaded", timeout: NAV_TIMEOUT_MS }).catch(() => { });
+    // A reload that lands back on payment: its Change reopens the list.
+    if (!/\/itemselect/.test(page.url())) {
+      await pause("checkout reloaded");
+      const change = await multiAddressChange(page);
+      if (change) {
+        await shortPause();
+        await change.click({ timeout: NAV_TIMEOUT_MS }).catch(() => { });
+        await page.waitForURL(/itemselect/, { timeout: NAV_TIMEOUT_MS, waitUntil: "domcontentloaded" }).catch(() => { });
+      }
+    }
+    await page.locator(ITEMSELECT_ROW).first().waitFor({ timeout: NAV_TIMEOUT_MS }).catch(() => { });
+    await pause("multi-address page reloaded");
+  }
+}
+
+type RawRow = { item: string; lines: string[]; asins: string[]; qty: number; key: string | null };
+
+/**
+ * Rows on the multi-address page, in page order, with the product each belongs to.
+ *
+ * A row's product is the item card holding its own "Remove item" — the widest
+ * box around that link with no other item's in it. It used to be the first
+ * box up from the row whose text had a "₹", which after Amazon redrew the list
+ * (a split, an address picked) could be a box around BOTH products: the
+ * Santoor rows then read the free shampoo's ASIN and title, and the step
+ * failed "item 1 is not on the multi-address page" on a settled page that a
+ * fresh read matched fine (2026-10-08/09).
+ */
+export async function readItemRows(page: Page): Promise<RawRow[]> {
+  return page.evaluate(([rowSel, del]) => {
+    const shown = (e: Element) => e.getBoundingClientRect().width > 0;
+    const squash = (s: string) => s.replace(/\s+/g, " ").trim();
+    // Each item's "Remove item": Amazon's line-group delete, else a control labelled so; innermost only.
+    const all = [...document.querySelectorAll(`${del}, a, button, span[role=button]`)].filter(
+      (e) => shown(e) && (e.matches(del!) || /^remove item$/i.test(squash((e as HTMLElement).innerText ?? ""))),
+    );
+    const removes = all.filter((e) => !all.some((o) => o !== e && e.contains(o)));
+    const cards = removes.map((r) => {
+      let c: Element = r;
+      while (c.parentElement && c.parentElement !== document.body &&
+        !removes.some((o) => o !== r && c.parentElement!.contains(o))) c = c.parentElement;
+      return c;
+    });
+    const mid = (e: Element) => { const b = e.getBoundingClientRect(); return (b.top + b.bottom) / 2; };
+    /** The item card a row belongs to: the one card around it, else the one beside it on the page. */
+    const cardFor = (row: Element): Element | null => {
+      const around = cards.filter((c) => c.contains(row));
+      if (around.length > 0) return around[0]!;
+      let box: Element | null = row.parentElement;
+      while (box && box !== document.body && !removes.some((r) => box!.contains(r))) box = box.parentElement;
+      const inBox = box && box !== document.body ? cards.filter((c) => box!.contains(c)) : [];
+      if (inBox.length === 1) return inBox[0]!;
+      const pool = inBox.length ? inBox : cards;
+      if (pool.length === 0) return null;
+      // Rows sit to the right of their card: the card level with the row.
+      const y = mid(row);
+      const dist = (c: Element) => { const b = c.getBoundingClientRect(); return y < b.top ? b.top - y : y > b.bottom ? y - b.bottom : 0; };
+      return pool.reduce((best, c) => (dist(c) < dist(best) ? c : best));
+    };
+
     // Shown rows only: Remove item hides its group; the page drops it on Continue.
-    return [...document.querySelectorAll(rowSel)].filter((r) => r.getBoundingClientRect().width > 0).map((dd) => {
-      let card: Element | null = dd;
-      for (let i = 0; i < 12 && card && !card.querySelector('[data-a-selector="value"]'); i++) card = card.parentElement;
-      let product: Element | null = dd;
-      for (let i = 0; i < 14 && product && !/₹/.test((product as HTMLElement).innerText); i++) product = product.parentElement;
-      const select = card?.querySelector('select[name="line-item-address"]') as HTMLSelectElement | null;
+    return [...document.querySelectorAll(rowSel!)].filter(shown).map((dd) => {
+      let stepper: Element | null = dd;
+      for (let i = 0; i < 12 && stepper && !stepper.querySelector('[data-a-selector="value"]'); i++) stepper = stepper.parentElement;
+      let product: Element | null = cardFor(dd);
+      if (!product) {
+        // No "Remove item" on the page at all: the old way, up to the first price.
+        product = dd;
+        for (let i = 0; i < 14 && product && !/₹/.test((product as HTMLElement).innerText); i++) product = product.parentElement;
+      }
+      const select = stepper?.querySelector('select[name="line-item-address"]') as HTMLSelectElement | null;
       const chosen = select ? select.options[select.selectedIndex]?.text ?? "" : (dd as HTMLElement).innerText;
-      const link = product?.querySelector('a[href*="/dp/"], a[href*="/gp/product/"]')?.getAttribute("href") ?? "";
+      const links = [...(product?.querySelectorAll('a[href*="/dp/"], a[href*="/gp/product/"]') ?? [])];
+      const asins = new Set<string>();
+      for (const e of product?.querySelectorAll("[data-asin]") ?? []) {
+        const a = e.getAttribute("data-asin") ?? "";
+        if (/^[A-Z0-9]{10}$/i.test(a)) asins.add(a.toUpperCase());
+      }
+      for (const l of links) {
+        const a = l.getAttribute("href")?.match(/\/(?:dp|gp\/product)\/([A-Z0-9]{10})/i)?.[1];
+        if (a) asins.add(a.toUpperCase());
+      }
+      const titled = links.map((l) => squash((l as HTMLElement).innerText ?? "")).find((t) => t.length > 15);
+      // Long lines of the card, summary labels ("Marketplace Fee:") left out: with one
+      // item its card is the whole page, order summary first (2026-10-11).
+      const lines = ((product as HTMLElement | null)?.innerText ?? "").split("\n").map((l) => l.trim())
+        .filter((l) => l.length > 15 && !/:$/.test(l)).slice(0, 40);
       return {
-        item: ((product as HTMLElement | null)?.innerText ?? "").split("\n").map((l) => l.trim()).find((l) => l.length > 15) ?? "",
-        asin: product?.querySelector("[data-asin]")?.getAttribute("data-asin") ||
-          link.match(/\/(?:dp|gp\/product)\/([A-Z0-9]{10})/i)?.[1] || null,
-        qty: Number(card?.querySelector('[data-a-selector="value"]')?.textContent?.trim() ?? "1"),
+        item: titled ?? lines[0] ?? "",
+        lines,
+        asins: [...asins],
+        qty: Number(stepper?.querySelector('[data-a-selector="value"]')?.textContent?.trim() ?? "1"),
         chosen,
       };
     });
-  }, ITEMSELECT_ROW).then((rows) =>
-    rows.map((r) => ({ item: r.item, asin: r.asin, qty: r.qty, key: checkoutAddressKey(r.chosen) })),
+  }, [ITEMSELECT_ROW, LINE_GROUP_DELETE] as [string, string]).then((rows) =>
+    rows.map((r) => ({ item: r.item, lines: r.lines, asins: r.asins, qty: r.qty, key: checkoutAddressKey(r.chosen) })),
   );
 }
 
-/** Which basket item a multi-address row is: by ASIN, else by title prefix. -1 = none, or more than one. */
-export function matchBasketItem(row: { item: string; asin: string | null }, basket: BasketItem[]): number {
-  if (row.asin) {
-    const i = basket.findIndex((b) => b.sku.toUpperCase() === row.asin!.toUpperCase());
-    if (i >= 0) return i;
-  }
+/**
+ * Which basket item a multi-address row is: by the title its card shows,
+ * then — when no title or several match — by an ASIN in its card. Title
+ * first: a card can carry another product's ASIN (a free item drawn inside
+ * it), never another product's title. Last, any other line of its card
+ * that is one basket item's title (a card read too wide, "Marketplace Fee:"
+ * first, 2026-10-11). -1 = none, or more than one.
+ */
+export function matchBasketItem(row: { item: string; lines?: string[]; asins: string[] }, basket: BasketItem[]): number {
   const norm = (v: string) => v.toLowerCase().replace(/\.{3}|…/g, "").replace(/[^a-z0-9]/g, "");
-  const t = norm(row.item);
-  const hits = basket.flatMap((b, i) => {
-    const bt = norm(b.title);
-    const n = Math.min(t.length, bt.length, 40);
-    return n >= 10 && t.slice(0, n) === bt.slice(0, n) ? [i] : [];
-  });
-  return hits.length === 1 ? hits[0]! : -1;
+  const titledAs = (line: string) => {
+    const t = norm(line);
+    return basket.flatMap((b, i) => {
+      const bt = norm(b.title);
+      const n = Math.min(t.length, bt.length, 40);
+      return n >= 10 && t.slice(0, n) === bt.slice(0, n) ? [i] : [];
+    });
+  };
+  const byTitle = titledAs(row.item);
+  if (byTitle.length === 1) return byTitle[0]!;
+  const pool = byTitle.length > 1 ? byTitle : basket.map((_, i) => i);
+  const want = new Set(row.asins.map((a) => a.toUpperCase()));
+  const byAsin = pool.filter((i) => want.has(basket[i]!.sku.toUpperCase()));
+  if (byAsin.length === 1) return byAsin[0]!;
+  if (byTitle.length > 0) return -1;
+  const byLine = new Set((row.lines ?? []).flatMap(titledAs));
+  return byLine.size === 1 ? [...byLine][0]! : -1;
 }
 
 type ItemRow = { item: number; qty: number; key: string | null };
 
+/** The last raw read, printed when an item cannot be found on the page. */
+let lastRawRows: RawRow[] = [];
+
 /** readItemRows with each row as its basket index; a string names a row that matches no basket item. */
 async function readBasketRows(page: Page, basket: BasketItem[]): Promise<ItemRow[] | string> {
   const out: ItemRow[] = [];
-  for (const r of await readItemRows(page)) {
+  lastRawRows = await readItemRows(page);
+  for (const r of lastRawRows) {
     const item = matchBasketItem(r, basket);
-    if (item < 0) return `"${r.item.slice(0, 40)}" on the multi-address page is not a basket item`;
+    if (item < 0) {
+      console.log(`[bot] multi-address rows read: ${JSON.stringify(lastRawRows)}`);
+      return `"${r.item.slice(0, 40)}" on the multi-address page is not a basket item`;
+    }
     out.push({ item, qty: r.qty, key: r.key });
   }
   return out;
@@ -677,31 +787,61 @@ async function markRowControl(page: Page, row: number, what: "split" | "delete")
 const LINE_GROUP_DELETE = '[data-action="item-select-delete-linegroup-and-children"]';
 
 /**
- * Removes every item the multi-address page shows a red error on (an
- * a-alert-inline-error inside its rows) with that item's own "Remove item" —
- * the nearest box around the error holding exactly one. An error not inside
- * one item (a page-wide alert) is left alone. Returns what was removed.
+ * What marks one item as unbuyable on the multi-address page: its red line
+ * ("Sorry, the quantity you requested is no longer available…") or a
+ * "Quantity: 0" left in place of its stepper.
+ */
+const ITEM_PROBLEM =
+  /no longer available|quantity you requested|currently unavailable|out of stock|cannot be (?:shipped|delivered)|(?:isn't|is not) available|quantity:\s*0\b/i;
+
+/**
+ * Removes every item the multi-address page flags with that item's own
+ * "Remove item" — the nearest box around the flag holding exactly one. The
+ * flag is found by its text as well as Amazon's error classes: the classes
+ * alone missed a "no longer available" row (2026-10-09), which then blocked
+ * Continue. A flag not inside one item (the page-wide "There was a problem
+ * with some of the items" alert) is left alone. Returns what was removed.
  */
 async function removeFlaggedItems(page: Page): Promise<string[]> {
   const removed: string[] = [];
   for (let round = 0; round < 6; round++) {
     const hit = await page
-      .evaluate((del) => {
+      .evaluate(([del, problemSrc]) => {
+        const problem = new RegExp(problemSrc, "i");
         const squash = (t: string) => t.replace(/\s+/g, " ").trim();
         document.querySelectorAll("[data-bot-ctl]").forEach((e) => e.removeAttribute("data-bot-ctl"));
         const shown = (e: Element) => e.getBoundingClientRect().width > 0;
-        for (const alert of [...document.querySelectorAll(".a-alert-inline-error, .a-alert-error")].filter(shown)) {
-          let box: Element | null = alert.parentElement;
-          while (box && box !== document.body && box.querySelectorAll(del).length === 0) box = box.parentElement;
-          if (!box || box === document.body || box.querySelectorAll(del).length !== 1) continue;
-          const link = box.querySelector(`${del} a`) ?? box.querySelector(del);
-          if (!link || !shown(link)) continue;
+        const textOf = (e: Element) => squash((e as HTMLElement).innerText ?? "");
+        // Each item's "Remove item": Amazon's line-group delete, else a control labelled so.
+        const removeControls = (box: Element): Element[] => {
+          const all = [...box.querySelectorAll(`${del}, a, button, span[role=button], input[type=submit]`)].filter(
+            (e) => shown(e) && (e.matches(del) || /^remove item$/i.test(textOf(e) || (e as HTMLInputElement).value || "")),
+          );
+          return all.filter((e) => !all.some((o) => o !== e && o.contains(e)));
+        };
+        // Red alerts, plus the smallest elements whose own text names a problem.
+        const flags = [...document.querySelectorAll(".a-alert-inline-error, .a-alert-error, span, div, p")]
+          .filter(shown)
+          .filter((e) => {
+            const t = textOf(e);
+            if (!t || t.length > 300) return false;
+            if (e.matches(".a-alert-inline-error, .a-alert-error")) return true;
+            return problem.test(t) && ![...e.children].some((c) => problem.test(textOf(c)));
+          });
+        for (const flag of flags) {
+          let box: Element | null = flag.parentElement;
+          while (box && box !== document.body && removeControls(box).length === 0) box = box.parentElement;
+          if (!box || box === document.body) continue;
+          const controls = removeControls(box);
+          if (controls.length !== 1) continue;
+          const link = controls[0]!.querySelector("a") ?? controls[0]!;
+          if (!shown(link)) continue;
           link.setAttribute("data-bot-ctl", "1");
           const title = (box as HTMLElement).innerText.split("\n").map((l) => l.trim()).find((l) => l.length > 3) ?? "item";
-          return { title: title.slice(0, 60), error: squash((alert as HTMLElement).innerText).slice(0, 120) };
+          return { title: title.slice(0, 60), error: textOf(flag).slice(0, 120) };
         }
         return null;
-      }, LINE_GROUP_DELETE)
+      }, [LINE_GROUP_DELETE, ITEM_PROBLEM.source] as [string, string])
       .catch(() => null);
     if (!hit) break;
     console.log(`[bot] "${hit.title}" flagged: "${hit.error}" — removing it`);
@@ -738,7 +878,9 @@ async function pickRowAddress(page: Page, row: number, want: string, label: stri
     // The list prints "name line1, line2, ..." — same shape as the dropdown.
     if (checkoutAddressKey(text) === want) {
       await entries.nth(i).click({ timeout: NAV_TIMEOUT_MS });
-      await sleep(2500);
+      // Only lets the list close: the caller then waits, up to 20 s, for the
+      // page to change and settle before reading it. Was a fixed 2.5 s.
+      await sleep(800);
       return true;
     }
   }
@@ -772,7 +914,7 @@ async function selectMultipleAddresses(
     console.log("[bot] checkout already delivers to multiple addresses — reopening that page");
     await shortPause();
     await multiAddressChange(page).then((l) => l!.click({ timeout: NAV_TIMEOUT_MS }));
-    await page.waitForURL(/itemselect/, { timeout: NAV_TIMEOUT_MS }).catch(() => { });
+    await page.waitForURL(/itemselect/, { timeout: NAV_TIMEOUT_MS, waitUntil: "domcontentloaded" }).catch(() => { });
   } else {
     const open = await openAddressPicker(page);
     if (!open.ok) return open;
@@ -782,16 +924,16 @@ async function selectMultipleAddresses(
     if (!shown) return { ok: false, reason: "Multiple address button not found" };
     await shortPause();
     await multi.click({ timeout: NAV_TIMEOUT_MS });
-    await page.waitForURL(/itemselect/, { timeout: NAV_TIMEOUT_MS }).catch(() => { });
+    await page.waitForURL(/itemselect/, { timeout: NAV_TIMEOUT_MS, waitUntil: "domcontentloaded" }).catch(() => { });
   }
   await page.locator(ITEMSELECT_ROW).first().waitFor({ timeout: NAV_TIMEOUT_MS }).catch(() => { });
   await pause("multi-address page open");
-  await waitForRowsSettled(page);
+  await settleRows(page);
 
   // An item Amazon flags in red ("the quantity you requested is no longer
   // available", or anything else) is removed, whatever the message says.
   const flagged = await removeFlaggedItems(page);
-  if (flagged.length) await waitForRowsSettled(page);
+  if (flagged.length) await settleRows(page);
 
   let read = await readBasketRows(page, basket);
   if (typeof read === "string") return { ok: false, reason: read };
@@ -821,21 +963,27 @@ async function selectMultipleAddresses(
   if (unblocked) console.log(`[bot] blocks removed — per-address units fitted to the cart: ${JSON.stringify(shares)}`);
   const sig = (r: ItemRow[]) => JSON.stringify(r);
   const totalUnits = shares.flat().reduce((n, q) => n + q, 0);
-  let reread = false;
+  // Every change redraws the page, so a half-drawn read can come after any of
+  // them — not once per step: one look-again was spent on an early change and
+  // a later one failed outright (2026-10-09).
+  let rereads = 0;
   for (let guard = 0; guard < totalUnits * 2 + rows.length * 3 + 20; guard++) {
     const act = planRowAction(rows, wantKeys, shares);
-    if (typeof act === "string" && !reread) {
+    if (typeof act === "string" && rereads < 3) {
       // Most often the list was still drawing ("Updating your order"): look
       // again once it has settled before calling an item missing.
-      reread = true;
-      console.log(`[bot] ${act} — waiting for the page to settle and reading it again`);
-      await waitForRowsSettled(page, 30_000);
+      rereads++;
+      console.log(`[bot] ${act} — waiting for the page to settle and reading it again (${rereads}/3)`);
+      await settleRows(page);
       const again = await readBasketRows(page, basket);
       if (typeof again === "string") return { ok: false, reason: again };
       rows = again;
       continue;
     }
-    if (typeof act === "string") return { ok: false, reason: act };
+    if (typeof act === "string") {
+      console.log(`[bot] multi-address rows read: ${JSON.stringify(lastRawRows)}`);
+      return { ok: false, reason: act };
+    }
     if (!act) break;
     const r = rows[act.row]!;
     const name = `"${basket[r.item]!.title.slice(0, 40)}"`;
@@ -862,10 +1010,17 @@ async function selectMultipleAddresses(
       }
       await clickMarked(page);
     }
-    // The page redraws after every change; wait for it to show.
+    // The page redraws after every change: read it only once the redraw is
+    // over. A read under "Updating your order" saw no rows at all and failed
+    // "item 1 is not on the multi-address page" mid-split (2026-10-09).
     let now: ItemRow[] | string = rows;
-    for (const deadline = Date.now() + 15_000; Date.now() < deadline; ) {
+    // Give the redraw time to start before the first read. Fixed at the
+    // shortest the old random pause (0.8–2 s) ever was: the loop below waits
+    // for the change and the settle, the pause only covers the first instant.
+    await sleep(800);
+    for (const deadline = Date.now() + 20_000; Date.now() < deadline; ) {
       await sleep(600);
+      await settleRows(page);
       const got = await readBasketRows(page, basket).catch(() => null);
       if (got !== null) now = got;
       if (typeof now === "string" || sig(now) !== before) break;
@@ -887,7 +1042,7 @@ async function selectMultipleAddresses(
 
   await pause("before continuing to payment");
   await page.locator("#checkout-primary-continue-button-id input").first().click({ timeout: NAV_TIMEOUT_MS });
-  await page.waitForURL(/\/pay/, { timeout: NAV_TIMEOUT_MS }).catch(() => { });
+  await reachPayment(page);
   await pause("back at payment");
   const confirmed = await page
     .evaluate(() => /delivering to multiple addresses/i.test(document.body.innerText.slice(0, 8000)))
@@ -895,6 +1050,60 @@ async function selectMultipleAddresses(
   return confirmed
     ? { ok: true, detail: `delivering to ${targets.length} addresses` }
     : { ok: false, reason: `checkout does not show "Delivering to multiple addresses" (at ${page.url()})` };
+}
+
+/**
+ * The offers page's "No Thanks" is a link to .../prime/handler?action=decline
+ * (live, 2026-10-10) — not the a-button-popover button closePopoverByButton
+ * looks for, and the modal's × only hides the box, stranding checkout on
+ * /offers. Its address is opened directly — the same GET the click makes,
+ * whether the box shows or not. Never the Join button's form.
+ */
+export async function declinePrimeOffer(page: Page): Promise<boolean> {
+  const href = await page
+    .locator('a[href*="/prime/handler"][href*="action=decline"]')
+    .first()
+    .getAttribute("href", { timeout: 2_000 })
+    .catch(() => null);
+  if (!href) {
+    console.log("[bot] no Prime decline link on this page — closing the offer instead");
+    await dismissCheckoutModal(page);
+    return false;
+  }
+  // Opened, not clicked: a click is a Playwright action, and the before-click
+  // guard (guardCheckoutModals) would press No Thanks too, mid-click.
+  console.log('[bot] Prime offer: "No Thanks"');
+  await page.goto(new URL(href, page.url()).toString(), { waitUntil: "domcontentloaded", timeout: NAV_TIMEOUT_MS }).catch(() => { });
+  console.log(`[bot] Prime offer declined — now at ${page.url().slice(0, 110)}`);
+  return true;
+}
+
+/**
+ * After the address is set, checkout goes to payment — or, since 2026-10-10,
+ * first to an OFFERS page (.../checkout/p/.../offers?...) carrying the Prime
+ * upsell modal. Waiting for /pay alone sat silent there until the stuck rule
+ * fired, every run. On /offers the offer is declined (No Thanks moves checkout
+ * on; its × only closes the box), then /pay is waited for.
+ */
+async function reachPayment(page: Page): Promise<void> {
+  // Payment is /pay, or /spc (single-page checkout) where "No Thanks" on the offers page lands.
+  const atPay = (u: URL | string): boolean => /\/(pay|spc)(\?|\/|$)/.test(String(u));
+  const atOffers = (u: URL | string): boolean => /\/offers(\?|\/|$)/.test(String(u));
+  await page
+    .waitForURL((u) => atPay(u) || atOffers(u), { timeout: NAV_TIMEOUT_MS, waitUntil: "domcontentloaded" })
+    .catch(() => { });
+  for (let round = 1; round <= 3 && atOffers(page.url()); round++) {
+    console.log(`[bot] checkout stopped on the offers page — declining the Prime offer (${round}/3)`);
+    await declinePrimeOffer(page);
+    const moved = await page
+      .waitForURL((u) => atPay(u), { timeout: 15_000, waitUntil: "domcontentloaded" })
+      .then(() => true)
+      .catch(() => false);
+    if (moved) break;
+  }
+  if (!atPay(page.url())) console.log(`[bot] not on the payment page yet (${page.url().slice(0, 100)})`);
+  // The offer can also pop up over payment itself.
+  await dismissCheckoutModal(page);
 }
 
 /** One address: the payment page must already be delivering to it, else it is chosen from the list. */
@@ -928,9 +1137,18 @@ async function selectSingleAddress(page: Page, target: TargetAddress): Promise<C
   }, want);
   if (!picked) return { ok: false, reason: `delivery address "${target.fullName}" (${target.pincode}) is not in the checkout address list` };
   await shortPause();
-  const use = page.getByText("Deliver to this address", { exact: true }).filter({ visible: true }).first();
-  await use.click({ timeout: NAV_TIMEOUT_MS });
-  await page.waitForURL(/\/pay/, { timeout: NAV_TIMEOUT_MS }).catch(() => { });
+  // The button's own input, laid over its "Deliver to this address" text: a
+  // click on the text was taken by that input, and Playwright retried it
+  // until the stuck rule sent the run back, every single-address run (2026-10-11).
+  const use = page
+    .locator("span.a-button")
+    .filter({ hasText: /^\s*Deliver to this address\s*$/ })
+    .filter({ visible: true })
+    .locator("input.a-button-input, button")
+    .first();
+  if (await use.count()) await use.click({ timeout: NAV_TIMEOUT_MS });
+  else await page.getByText("Deliver to this address", { exact: true }).filter({ visible: true }).first().click({ timeout: NAV_TIMEOUT_MS, force: true });
+  await reachPayment(page);
   await pause("address selected");
   return { ok: true, detail: `delivering to ${target.fullName}` };
 }
@@ -943,6 +1161,8 @@ export async function runSelectAddresses(
   opts: { unblocked?: boolean } = {},
 ): Promise<CheckoutResult> {
   await pause("selecting delivery address");
+  // A rerun or resume can start on the offers page: past it first (reachPayment).
+  if (/\/offers(\?|\/|$)/.test(page.url())) await reachPayment(page);
   const at = await ensureAtCheckout(page);
   if (!at.ok) return at;
   // Remove blocks: the operator may have set the addresses by hand. Checkout
@@ -1217,6 +1437,51 @@ async function closePopoverByButton(page: Page): Promise<string | null> {
   return null;
 }
 
+/**
+ * THE PRIME OFFER, BEFORE EVERY CLICK (user, 2026-10-10): from add_vouchers
+ * on, the "Prime Shopping Edition — No Thanks / Join" modal can appear at any
+ * moment and take the next click — Pay Now's included. A Playwright locator
+ * handler runs before every click, fill and check on this page: when the
+ * offer is showing it is closed (its ×, else No Thanks) and the action goes on.
+ *
+ * Only a popover that names Prime: the multi-address dropdowns are popovers
+ * too and must stay open. Clicks made in page JS (dispatchEvent, el.click())
+ * are not blocked by an overlay and do not need it.
+ */
+const guarded = new WeakSet<Page>();
+
+export async function guardCheckoutModals(page: Page): Promise<void> {
+  if (guarded.has(page)) return;
+  guarded.add(page);
+  const offer = page
+    .locator('.a-popover:not(.a-popover-hidden), .a-popover-modal, [role="dialog"]')
+    .filter({ hasText: /prime shopping edition|join prime|amazon prime|prime membership/i })
+    .filter({ visible: true })
+    .first();
+  await page
+    .addLocatorHandler(offer, async () => {
+      if (/\/offers(\?|\/|$)/.test(page.url())) {
+        // The offers page: No Thanks (a decline link) is what moves checkout on.
+        console.log("[bot] Prime offer on the offers page — No Thanks before the click");
+        await declinePrimeOffer(page);
+        return;
+      }
+      const x = page
+        .locator('.a-popover:not(.a-popover-hidden) [data-action="a-popover-close"], .a-popover:not(.a-popover-hidden) .a-button-close, [role="dialog"] button[aria-label*="close" i]')
+        .filter({ visible: true })
+        .first();
+      if (await x.count()) {
+        console.log("[bot] Prime offer over checkout — closing it (×) before the click");
+        await x.click({ timeout: 5_000 }).catch(() => { });
+      }
+      if (await offer.isVisible().catch(() => false)) {
+        console.log("[bot] Prime offer still open — No Thanks");
+        await dismissCheckoutModal(page);
+      }
+    }, { noWaitAfter: true })
+    .catch((err: Error) => console.warn(`[bot] could not watch for the Prime offer: ${err.message.split("\n")[0]}`));
+}
+
 export async function dismissCheckoutModal(page: Page): Promise<void> {
   const quick = await closePopoverByButton(page);
   if (quick) {
@@ -1431,6 +1696,8 @@ async function stillOverlaid(page: Page): Promise<boolean> {
  */
 export async function runApplyPayment(page: Page, payment: PaymentSpec): Promise<CheckoutResult> {
   await pause("reviewing payment");
+  // A resume can land here still on the offers page (see reachPayment).
+  if (/\/offers(\?|\/|$)/.test(page.url())) await reachPayment(page);
   const at = await ensureAtCheckout(page);
   if (!at.ok) return at;
 
@@ -1878,8 +2145,10 @@ export async function runPlaceOrder(
 ): Promise<CheckoutResult> {
   const ledger = readLedger(artifactsDir);
   const prior = ledger.find((e) => e.key === idempotencyKey);
-  // Never clicks twice. A resume after the click moves on: the order ids are
-  // read next. Remove blocks presses again: Your Orders had nothing for it.
+  // ONE press per purchase: a press is recorded before it is made, and once
+  // recorded Pay Now is never pressed again by the bot — the order ids are
+  // read next. The "press again when Your Orders shows nothing yet" rule
+  // placed the same order several times (user, 2026-10-11).
   if (prior && !opts.unblocked) {
     return { ok: true, detail: `already submitted at ${prior.placed_at}; order ids are read next` };
   }
@@ -1925,21 +2194,21 @@ export async function runPlaceOrder(
     };
   }
 
-  // The basket may have shrunk since add_items (unavailable, removed by hand);
-  // it may not have grown or moved — see reviewBasket.
+  // The review against the basket only reports now: it never stops Pay Now
+  // (user, 2026-10-10 — it stopped a correct two-product order over a title
+  // printed as "POND&#39;S"). What it found is logged for the operator.
   const review = basket.length
     ? reviewBasket(basket, addresses, await readReviewShipments(page))
     : ({ ok: false, error: "no basket from add_items to check against" } as const);
   if (!review.ok) {
-    if (!opts.unblocked) return { ok: false, reason: `PRE-PURCHASE STOP: ${review.error}` };
-    console.warn(`[bot] blocks removed — pre-purchase check would stop here, pressing anyway: ${review.error}`);
+    console.warn(`[bot] pre-purchase check (not stopping): ${review.error}`);
   } else if (review.changes.length) {
     console.log(`[bot] basket changed since add_items (allowed): ${review.changes.join("; ")}`);
   }
   const shipping = review.ok ? review.shipping : addresses;
   const known = await knownOrderIds(page);
   if (prior) {
-    // Remove blocks, pressing again: the same purchase record, a fresh "before".
+    // Remove blocks pressing again on the same purchase record: a fresh "before".
     prior.known_orders = known;
     prior.ship_to = shipping.map((t) => t.fullName);
   } else {

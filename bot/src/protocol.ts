@@ -53,6 +53,12 @@ export interface RunnerConfig {
    * passed over — see UNBLOCKABLE_FROM in steps.ts.
    */
   unblocked?: boolean;
+  /**
+   * The operator picked this start step by hand (dashboard "Run from", the run
+   * page's restart from a step): the only start allowed to go back before
+   * note_order_id once Pay Now was pressed (runner.ts guardPaid).
+   */
+  manual?: boolean;
 }
 
 export async function postEvent(

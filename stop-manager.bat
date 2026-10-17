@@ -1,6 +1,8 @@
 @echo off
-rem Stops the slots, then the manager. Browsers stay open by design.
-curl -s -X POST http://127.0.0.1:7800/fleet/stop >nul 2>nul
-timeout /t 1 /nobreak >nul
-for /f "tokens=5" %%p in ('netstat -ano ^| findstr /r /c:":7800 .*LISTENING"') do taskkill /f /pid %%p
-pause
+if defined NVM_SYMLINK set "PATH=%NVM_SYMLINK%;%PATH%"
+cd /d "%~dp0"
+if not defined MANAGER_PORT set "MANAGER_PORT=7800"
+curl --fail --silent --show-error --max-time 15 -X POST http://127.0.0.1:%MANAGER_PORT%/fleet/stop >nul
+if errorlevel 1 echo [!] Could not stop slots cleanly; check the manager logs.
+call pm2 stop bot-manager || exit /b 1
+call pm2 save

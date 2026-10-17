@@ -126,9 +126,13 @@ mv -f "bot/.env.tmp" "bot/.env"
 echo "  [ok] MASTER_URL written to bot/.env"
 
 # ---- this machine's node id -> bot/.node-id -----------------------------------
-# Always asked; Enter takes the machine name. This is the bot id the machine
-# is approved as. A copied folder's approval for another id is discarded by
-# the bot at start, and an id already in use is rejected by the master.
+# Kept without asking when this machine is already approved as bot/.node-id
+# (scripts/approved-node-id.mjs). Otherwise asked; Enter takes the machine
+# name. A copied folder's approval for another id is discarded by the bot at
+# start, and an id already in use is rejected by the master.
+if NODE_ID_APPROVED="$(node scripts/approved-node-id.mjs 2>/dev/null)"; then
+  echo "  [ok] node id: $NODE_ID_APPROVED (already approved)"
+else
 [ -s "bot/.node-id" ] && echo "  current node id: $(tr -d '[:space:]' < bot/.node-id)"
 NODE_ID_DEFAULT="$(scutil --get LocalHostName 2>/dev/null || hostname -s)"
 NODE_ID_DEFAULT="$(printf '%s' "$NODE_ID_DEFAULT" | tr '[:upper:]' '[:lower:]')"
@@ -141,6 +145,7 @@ while :; do
 done
 printf '%s\n' "$NODE_ID_IN" > "bot/.node-id"
 echo "  [ok] node id: $NODE_ID_IN"
+fi
 
 # ---- install + build, in dependency order -------------------------------------
 build_pkg() {

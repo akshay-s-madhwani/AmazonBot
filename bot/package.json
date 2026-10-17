@@ -14,7 +14,11 @@
     "test:fleet": "npm run build && node dist/fleet.test.js",
     "test:safety": "npm run build && node --test dist/safety.test.js",
     "manager": "npm run build && node dist/manager.js",
-    "cleanup": "npm run build && node dist/cleanup.js"
+    "cleanup": "npm run build && node dist/cleanup.js",
+    "test:deployment": "npm run build && node --test dist/deployment/deploy.test.js",
+    "pm2:start": "cd .. && pm2 start ecosystem.config.cjs && pm2 save",
+    "pm2:stop": "cd .. && stop-manager.bat",
+    "deploy:webhook": "node dist/deployment/webhook.js"
   },
   "dependencies": {
     "@app/contracts": "file:../packages/contracts",
